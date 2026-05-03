@@ -572,7 +572,77 @@ async function startMic(onPcm, onLevel) {
       autoGainControl: true,
     },
   });
-  const audioContext = new AudioContext();
+
+  if (window.AudioWorkletNode) {
+    try {
+      return await startAudioWorkletMic(stream, onPcm, onLevel);
+    } catch (error) {
+      logEvent("mic.worklet.error", { message: error.message });
+    }
+  }
+
+  return startScriptProcessorMic(stream, onPcm, onLevel);
+}
+
+function createAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  return new AudioContextClass();
+}
+
+async function startAudioWorkletMic(stream, onPcm, onLevel) {
+  const audioContext = createAudioContext();
+  let source = null;
+  let processor = null;
+  let silentGain = null;
+
+  try {
+    await audioContext.audioWorklet.addModule("/webchat/assets/mic-worklet.js");
+    source = audioContext.createMediaStreamSource(stream);
+    processor = new AudioWorkletNode(audioContext, "aibrain-mic-capture", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: 1,
+      channelCountMode: "explicit",
+      outputChannelCount: [1],
+      processorOptions: { outputSampleRate: 16000, frameSampleCount: 320 },
+    });
+    silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+    processor.port.onmessage = (event) => {
+      if (event.data?.type !== "pcm" || !event.data.pcm) return;
+      onLevel(Number(event.data.level) || 0);
+      onPcm(new Uint8Array(event.data.pcm));
+    };
+    processor.port.onmessageerror = () => {
+      logEvent("mic.worklet.message_error", { message: "Unable to read worklet audio frame" });
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+    await audioContext.resume();
+  } catch (error) {
+    if (processor) processor.disconnect();
+    if (source) source.disconnect();
+    if (silentGain) silentGain.disconnect();
+    void audioContext.close();
+    throw error;
+  }
+
+  return {
+    stop() {
+      processor.port.onmessage = null;
+      processor.disconnect();
+      source.disconnect();
+      silentGain.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      void audioContext.close();
+      updateMeter(0);
+    },
+  };
+}
+
+function startScriptProcessorMic(stream, onPcm, onLevel) {
+  const audioContext = createAudioContext();
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   const silentGain = audioContext.createGain();

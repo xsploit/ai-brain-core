@@ -352,7 +352,7 @@ class SQLiteMemoryStore:
         where: list[str],
         params: list[Any],
         top_k: int,
-    ) -> list[sqlite3.Row] | None:
+    ) -> list[sqlite3.Row | dict[str, Any]] | None:
         if not self.sqlite_vec_enabled:
             return None
         try:
@@ -377,11 +377,11 @@ class SQLiteMemoryStore:
             sql += " AND " + " AND ".join(where)
             sql_params.extend(params)
         rows = conn.execute(sql, sql_params).fetchall()
-        decorated: list[sqlite3.Row] = []
+        decorated: list[dict[str, Any]] = []
         for row in rows:
             row_dict = dict(row)
             row_dict["vec_score"] = scores.get(row["vector_rowid"], 0.0)
-            decorated.append(_DictRow(row_dict))
+            decorated.append(row_dict)
         return decorated
 
     def _backfill_sqlite_vec(self, conn: sqlite3.Connection) -> None:
@@ -426,11 +426,6 @@ class SQLiteMemoryStore:
             if row and self.sqlite_vec_enabled:
                 conn.execute("DELETE FROM brain_memory_vec WHERE rowid = ?", (row["vector_rowid"],))
             return cursor.rowcount > 0
-
-
-class _DictRow(dict):
-    def keys(self):
-        return super().keys()
 
 
 def _metadata_matches(metadata: dict[str, Any], expected: dict[str, Any]) -> bool:

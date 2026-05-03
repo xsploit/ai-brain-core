@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from aibrain import (
@@ -84,9 +85,24 @@ def test_webchat_routes_are_served(tmp_path):
         assert "voiceSocket" in script.text
         assert "loadModels" in script.text
 
+        worklet = client.get("/webchat/assets/mic-worklet.js")
+        assert worklet.status_code == 200
+        assert "registerProcessor" in worklet.text
+        assert "aibrain-mic-capture" in worklet.text
+
         styles = client.get("/webchat/assets/styles.css")
         assert styles.status_code == 200
         assert ".app-shell" in styles.text
+
+
+def test_webchat_mic_prefers_audio_worklet_with_scriptprocessor_fallback():
+    script = Path("src/aibrain/webchat/app.js").read_text()
+
+    assert "AudioWorkletNode" in script
+    assert 'audioContext.audioWorklet.addModule("/webchat/assets/mic-worklet.js")' in script
+    assert "function startScriptProcessorMic" in script
+    assert "createScriptProcessor" in script
+    assert script.index("AudioWorkletNode") < script.index("createScriptProcessor")
 
 
 def test_models_endpoint_lists_chat_models(tmp_path):

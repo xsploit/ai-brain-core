@@ -4,6 +4,7 @@ import asyncio
 import pytest
 
 from aibrain import Brain, BrainConfig, Persona
+from aibrain.core import _CONTINUATION_PARAM_KEYS
 from aibrain.types import ThreadState
 
 
@@ -207,6 +208,22 @@ def test_update_thread_after_response_does_not_clobber_last_response_with_none(t
 
     assert state.last_response_id == "resp_existing"
     assert brain.thread_store.get("thread-state").last_response_id == "resp_existing"
+
+
+def test_continuation_params_preserve_supported_fields(tmp_path):
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=FakeOpenAI())
+    previous_params = {key: f"value:{key}" for key in _CONTINUATION_PARAM_KEYS}
+    previous_params["input"] = [{"role": "user", "content": "old"}]
+    previous_params["unsupported"] = "drop"
+    outputs = [{"type": "function_call_output", "call_id": "call_1", "output": '"ok"'}]
+
+    params = brain._continuation_params(previous_params, SimpleNamespace(id="resp_tool"), outputs)
+
+    for key in _CONTINUATION_PARAM_KEYS:
+        assert params[key] == previous_params[key]
+    assert params["input"] == outputs
+    assert params["previous_response_id"] == "resp_tool"
+    assert "unsupported" not in params
 
 
 @pytest.mark.asyncio

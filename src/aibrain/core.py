@@ -54,6 +54,33 @@ _HELD_THREAD_LOCKS: ContextVar[frozenset[str]] = ContextVar(
     default=frozenset(),
 )
 
+_CONTINUATION_PARAM_KEYS = frozenset(
+    {
+        "model",
+        "conversation",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "max_tool_calls",
+        "metadata",
+        "store",
+        "truncation",
+        "context_management",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "reasoning",
+        "service_tier",
+        "temperature",
+        "top_p",
+        "text",
+        "include",
+        "instructions",
+        "prompt",
+        "safety_identifier",
+        "user",
+    }
+)
+
 
 class _StreamQueueOverflow(RuntimeError):
     pass
@@ -1317,31 +1344,11 @@ class Brain:
         response: Any,
         outputs: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        keep = {
-            "model",
-            "conversation",
-            "tools",
-            "tool_choice",
-            "parallel_tool_calls",
-            "max_tool_calls",
-            "metadata",
-            "store",
-            "truncation",
-            "context_management",
-            "prompt_cache_key",
-            "prompt_cache_retention",
-            "reasoning",
-            "service_tier",
-            "temperature",
-            "top_p",
-            "text",
-            "include",
-            "instructions",
-            "prompt",
-            "safety_identifier",
-            "user",
+        params = {
+            key: value
+            for key, value in previous_params.items()
+            if key in _CONTINUATION_PARAM_KEYS
         }
-        params = {key: value for key, value in previous_params.items() if key in keep}
         params["input"] = outputs
         response_id = getattr(response, "id", None)
         if response_id:

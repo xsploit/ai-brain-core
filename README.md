@@ -5,7 +5,8 @@ Reusable Python brain for bots, avatars, desktop agents, voice apps, and local t
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)](https://www.python.org/)
 [![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20%2B%20Conversations-111111)](https://platform.openai.com/docs)
 [![FastAPI](https://img.shields.io/badge/FastAPI-HTTP%20%2B%20WebSocket-009688)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-87%20passing-2E7D32)](#development)
+[![CI](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml/badge.svg)](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml)
+[![Tests](https://img.shields.io/badge/tests-89%20passing-2E7D32)](#development)
 
 AI Brain Core is a framework layer around the OpenAI Responses and
 Conversations APIs. It gives you one importable "brain" that can be dropped into
@@ -204,6 +205,10 @@ Built-in test console:
 ```text
 http://127.0.0.1:8765/webchat
 ```
+
+The browser console records mic audio through `AudioWorklet` when available and
+falls back to `ScriptProcessor` only on older browsers. Both paths send the same
+binary `pcm_s16le`, 16 kHz mono frames to `/voice`.
 
 Endpoints:
 
@@ -415,10 +420,13 @@ uv run pytest -q -p no:cacheprovider
 uv run python -m compileall -q src tests examples
 ```
 
+GitHub Actions runs the pytest command on Windows with Python 3.11 through
+`uv sync --extra dev`.
+
 Current verification:
 
 ```text
-87 passed
+89 passed
 ```
 
 ## Project Shape

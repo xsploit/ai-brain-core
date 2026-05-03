@@ -163,20 +163,18 @@ async def test_memory_vec_score_skips_embedding_json_decode(tmp_path, monkeypatc
         store,
         "_search_rows_with_sqlite_vec",
         lambda *args, **kwargs: [
-            memory_module._DictRow(
-                {
-                    "id": "mem-1",
-                    "scope": "global",
-                    "thread_id": None,
-                    "persona_id": None,
-                    "content": "Vector scored",
-                    "metadata_json": "{}",
-                    "importance": 0.5,
-                    "embedding_json": "not json",
-                    "created_at": "now",
-                    "vec_score": 0.9,
-                }
-            )
+            {
+                "id": "mem-1",
+                "scope": "global",
+                "thread_id": None,
+                "persona_id": None,
+                "content": "Vector scored",
+                "metadata_json": "{}",
+                "importance": 0.5,
+                "embedding_json": "not json",
+                "created_at": "now",
+                "vec_score": 0.9,
+            }
         ],
     )
 
