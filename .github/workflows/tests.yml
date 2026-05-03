@@ -11,6 +11,24 @@ permissions:
 jobs:
   tests:
     runs-on: windows-latest
+    name: ${{ matrix.name }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            sync-args: --extra dev
+            test-command: uv run pytest -q -p no:cacheprovider
+          - name: vector
+            sync-args: --extra dev --extra vector
+            test-command: uv run pytest tests/test_memory.py -q -p no:cacheprovider
+          - name: stt
+            sync-args: --extra dev --extra stt
+            test-command: uv run pytest tests/test_stt.py -q -p no:cacheprovider
+          - name: all
+            sync-args: --extra dev --extra all
+            test-command: uv run pytest -q -p no:cacheprovider
 
     steps:
       - name: Check out repository
@@ -27,7 +45,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync ${{ matrix.sync-args }}
 
       - name: Run tests
-        run: uv run pytest -q -p no:cacheprovider
+        run: ${{ matrix.test-command }}

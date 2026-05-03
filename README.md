@@ -6,7 +6,7 @@ Reusable Python brain for bots, avatars, desktop agents, voice apps, and local t
 [![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20%2B%20Conversations-111111)](https://platform.openai.com/docs)
 [![FastAPI](https://img.shields.io/badge/FastAPI-HTTP%20%2B%20WebSocket-009688)](https://fastapi.tiangolo.com/)
 [![CI](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml/badge.svg)](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml)
-[![Tests](https://img.shields.io/badge/tests-89%20passing-2E7D32)](#development)
+[![Tests](https://img.shields.io/badge/tests-96%20passing-2E7D32)](#development)
 
 AI Brain Core is a framework layer around the OpenAI Responses and
 Conversations APIs. It gives you one importable "brain" that can be dropped into
@@ -25,7 +25,7 @@ zero.
 | OpenAI | Responses API, Conversations API, `previous_response_id`, prompt caching, compaction, structured output, vision input, streaming, WebSocket transport |
 | Agent loop | Python tool registry, function calling, parallel tool execution, max-step guard, streaming tool events |
 | State | SQLite thread store, per-thread turn locks, Discord/Twitch-friendly thread policies |
-| Memory | SQLite memory, optional `sqlite-vec`, Python cosine fallback, configurable memory policy |
+| Memory | SQLite memory, optional `sqlite-vec`, hash/OpenAI embeddings, Python cosine fallback, configurable memory policy |
 | Voice out | Piper executable, hot Piper process mode, Piper HTTP, ordered TTS playlist events |
 | Voice in | PCM/WAV/FLAC decode, Silero or energy VAD, faster-whisper STT provider |
 | Server | FastAPI HTTP routes, WebSocket `/stream`, `/brain`, `/tts`, `/voice`, built-in web test console |
@@ -420,13 +420,14 @@ uv run pytest -q -p no:cacheprovider
 uv run python -m compileall -q src tests examples
 ```
 
-GitHub Actions runs the pytest command on Windows with Python 3.11 through
-`uv sync --extra dev`.
+GitHub Actions runs Windows/Python 3.11 coverage for the core suite, the
+`vector` extra, the `stt` extra, and the full `all` extra. Embeddings are core
+package behavior and are covered by the base test suite.
 
 Current verification:
 
 ```text
-89 passed
+96 passed
 ```
 
 ## Project Shape
