@@ -94,7 +94,7 @@ class TTSConfig(BaseModel):
     min_chunk_chars: int = 6
     comma_chunk_chars: int = 48
     process_idle_timeout: float = Field(
-        default_factory=lambda: _env_float("PIPER_PROCESS_IDLE_TIMEOUT", 0.45)
+        default_factory=lambda: _env_float("PIPER_PROCESS_IDLE_TIMEOUT", 0.15)
     )
     process_first_chunk_timeout: float = 10.0
     process_pool_max: int = Field(default_factory=lambda: _env_int("PIPER_PROCESS_POOL_MAX", 4))

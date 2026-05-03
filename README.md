@@ -204,6 +204,10 @@ lists voices from `AIBRAIN_TTS_VOICE_ROOTS` and `AIBRAIN_TTS_MANIFESTS`.
 Voice discovery is cached between requests; pass `refresh=true` to the endpoint
 after adding or changing voice files. For bots that switch between many voices,
 cap the hot Piper process pool with `PIPER_PROCESS_POOL_MAX`.
+Persistent Piper raw streaming uses `PIPER_PROCESS_IDLE_TIMEOUT` to detect when
+one text segment is done. The default is `0.15`, which was faster in local tests
+without dropping audio; if a specific voice cuts off words, raise it toward
+`0.25` or `0.45`.
 
 Terminal smoke test with streaming text and immediate TTS playback:
 
