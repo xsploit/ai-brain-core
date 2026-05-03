@@ -11,6 +11,8 @@ AI Brain Core is a framework layer around the OpenAI Responses and
 Conversations APIs. It gives you one importable "brain" that can be dropped into
 a Discord bot, Twitch bot, VRM app, web chat, desktop assistant, or voice loop.
 
+Repository: https://github.com/xsploit/ai-brain-core
+
 The core goal is simple: keep the AI state, memory, tools, streaming, and voice
 pipeline in one reusable Python package so every new bot does not start from
 zero.
@@ -54,7 +56,7 @@ uv run aibrain bench --transport both --rounds 5 --fast --tts --env-file .env
 ## Quickstart
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/xsploit/ai-brain-core.git
 cd ai-brain-core
 .\scripts\setup.ps1
 .\scripts\run-server.ps1
@@ -63,7 +65,7 @@ cd ai-brain-core
 Linux/macOS:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/xsploit/ai-brain-core.git
 cd ai-brain-core
 ./scripts/setup.sh
 ./scripts/run-server.sh
