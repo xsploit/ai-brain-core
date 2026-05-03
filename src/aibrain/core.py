@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -45,6 +48,16 @@ from .tts import BaseTTSProvider, SentenceChunker, TTSAudio, create_tts_provider
 from .types import BrainEvent, BrainResponse, MemoryRecord, ThreadState, ToolContext
 
 
+_HELD_THREAD_LOCKS: ContextVar[frozenset[str]] = ContextVar(
+    "aibrain_held_thread_locks",
+    default=frozenset(),
+)
+
+
+class _StreamQueueOverflow(RuntimeError):
+    pass
+
+
 class Brain:
     def __init__(
         self,
@@ -79,6 +92,8 @@ class Brain:
         self.stt = stt_provider or create_stt_provider(self.config.stt_config)
         self.vad = vad_detector
         self.tts = tts_provider or create_tts_provider(self.config.tts_config)
+        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._thread_locks_guard = asyncio.Lock()
         if self.config.auto_memory_tools:
             self._register_memory_tools()
             self._register_context_tools()
@@ -98,6 +113,7 @@ class Brain:
             self._openai = OpenAIGateway(
                 self.client,
                 stream_transport=self.config.openai_stream_transport,
+                websocket_pool_size=self.config.openai_ws_pool_size,
             )
         return self._openai
 
@@ -126,6 +142,53 @@ class Brain:
             await self.stt.warmup()
         if tts:
             await self.tts.warmup(**(tts_options or {}))
+
+    @asynccontextmanager
+    async def _thread_turn(
+        self,
+        thread_id: str | None,
+        response_options: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+    ):
+        lock_id = self._thread_turn_lock_id(thread_id, response_options, force=force)
+        if lock_id is None:
+            yield
+            return
+        held = _HELD_THREAD_LOCKS.get()
+        if lock_id in held:
+            yield
+            return
+        lock = await self._get_thread_lock(lock_id)
+        async with lock:
+            token = _HELD_THREAD_LOCKS.set(held | {lock_id})
+            try:
+                yield
+            finally:
+                _HELD_THREAD_LOCKS.reset(token)
+
+    def _thread_turn_lock_id(
+        self,
+        thread_id: str | None,
+        response_options: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+    ) -> str | None:
+        if not thread_id:
+            return None
+        if self.config.state_mode == "stateless" and not force:
+            return None
+        if response_options and response_options.get("stateless") and not force:
+            return None
+        return thread_id
+
+    async def _get_thread_lock(self, thread_id: str) -> asyncio.Lock:
+        async with self._thread_locks_guard:
+            lock = self._thread_locks.get(thread_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._thread_locks[thread_id] = lock
+            return lock
 
     def _resolve_persona(self, persona: Persona | dict[str, Any] | None) -> Persona:
         if persona is None:
@@ -218,21 +281,22 @@ class Brain:
         metadata: dict[str, Any] | None = None,
         create_remote: bool = False,
     ) -> ThreadState:
-        resolved = self._resolve_persona(persona)
-        if thread_id:
-            existing = self.thread_store.get(thread_id)
-            if existing:
-                return existing
-        conversation_id = None
-        if create_remote and self.config.state_mode == "conversation":
-            conversation = await self.openai.create_conversation(metadata=metadata or {})
-            conversation_id = getattr(conversation, "id", None)
-        return self.thread_store.create(
-            persona_id=resolved.id,
-            thread_id=thread_id,
-            openai_conversation_id=conversation_id,
-            metadata=metadata,
-        )
+        async with self._thread_turn(thread_id, force=True):
+            resolved = self._resolve_persona(persona)
+            if thread_id:
+                existing = self.thread_store.get(thread_id)
+                if existing:
+                    return existing
+            conversation_id = None
+            if create_remote and self.config.state_mode == "conversation":
+                conversation = await self.openai.create_conversation(metadata=metadata or {})
+                conversation_id = getattr(conversation, "id", None)
+            return self.thread_store.create(
+                persona_id=resolved.id,
+                thread_id=thread_id,
+                openai_conversation_id=conversation_id,
+                metadata=metadata,
+            )
 
     async def ask(
         self,
@@ -248,25 +312,26 @@ class Brain:
         max_agent_steps: int | None = None,
         **response_options: Any,
     ) -> BrainResponse:
-        params, state, resolved, memory_hits = await self._build_response_params(
-            text,
-            thread_id=thread_id,
-            persona=persona,
-            images=images,
-            files=files,
-            use_memory=use_memory,
-            tool_names=tool_names,
-            openai_tools=openai_tools,
-            response_options=response_options,
-        )
-        context = ToolContext(brain=self, thread=state, persona_id=resolved.id)
-        return await self._run_agent_loop(
-            params,
-            state=state,
-            context=context,
-            memory_hits=memory_hits,
-            max_agent_steps=max_agent_steps or self.config.max_agent_steps,
-        )
+        async with self._thread_turn(thread_id, response_options):
+            params, state, resolved, memory_hits = await self._build_response_params(
+                text,
+                thread_id=thread_id,
+                persona=persona,
+                images=images,
+                files=files,
+                use_memory=use_memory,
+                tool_names=tool_names,
+                openai_tools=openai_tools,
+                response_options=response_options,
+            )
+            context = ToolContext(brain=self, thread=state, persona_id=resolved.id)
+            return await self._run_agent_loop(
+                params,
+                state=state,
+                context=context,
+                memory_hits=memory_hits,
+                max_agent_steps=max_agent_steps or self.config.max_agent_steps,
+            )
 
     async def vision(
         self,
@@ -303,35 +368,65 @@ class Brain:
                     }
                 },
             )
-        params, state, _, memory_hits = await self._build_response_params(
-            text,
-            thread_id=thread_id,
-            persona=persona,
-            images=images,
-            files=files,
-            use_memory=response_options.pop("use_memory", True),
-            tool_names=response_options.pop("tool_names", None),
-            openai_tools=response_options.pop("openai_tools", None),
-            response_options=response_options,
-        )
-        if output_model is not None:
-            response = await self.openai.parse_response(text_format=output_model, **params)
-        else:
-            response = await self.openai.create_response(**params)
-        self._update_thread_after_response(state, response)
-        parsed = getattr(response, "output_parsed", None)
-        return BrainResponse(
-            text=self._extract_text(response),
-            response_id=getattr(response, "id", None),
-            conversation_id=self._extract_conversation_id(response, state),
-            thread_id=state.thread_id if state else None,
-            parsed=parsed,
-            raw_response=response,
-            usage=getattr(response, "usage", None),
-            memory_hits=memory_hits,
-        )
+        async with self._thread_turn(thread_id, response_options):
+            params, state, _, memory_hits = await self._build_response_params(
+                text,
+                thread_id=thread_id,
+                persona=persona,
+                images=images,
+                files=files,
+                use_memory=response_options.pop("use_memory", True),
+                tool_names=response_options.pop("tool_names", None),
+                openai_tools=response_options.pop("openai_tools", None),
+                response_options=response_options,
+            )
+            if output_model is not None:
+                response = await self.openai.parse_response(text_format=output_model, **params)
+            else:
+                response = await self.openai.create_response(**params)
+            self._update_thread_after_response(state, response)
+            parsed = getattr(response, "output_parsed", None)
+            return BrainResponse(
+                text=self._extract_text(response),
+                response_id=getattr(response, "id", None),
+                conversation_id=self._extract_conversation_id(response, state),
+                thread_id=state.thread_id if state else None,
+                parsed=parsed,
+                raw_response=response,
+                usage=getattr(response, "usage", None),
+                memory_hits=memory_hits,
+            )
 
     async def stream(
+        self,
+        text: str,
+        *,
+        thread_id: str | None = None,
+        persona: Persona | dict[str, Any] | None = None,
+        images: list[ImageInput | dict[str, Any] | str] | None = None,
+        files: list[FileInput | dict[str, Any] | str] | None = None,
+        use_memory: bool | MemoryPolicy | dict[str, Any] = True,
+        tool_names: Sequence[str] | None = None,
+        openai_tools: list[dict[str, Any]] | None = None,
+        max_agent_steps: int | None = None,
+        **response_options: Any,
+    ) -> AsyncIterator[BrainEvent]:
+        async with self._thread_turn(thread_id, response_options):
+            async for event in self._stream_unlocked(
+                text,
+                thread_id=thread_id,
+                persona=persona,
+                images=images,
+                files=files,
+                use_memory=use_memory,
+                tool_names=tool_names,
+                openai_tools=openai_tools,
+                max_agent_steps=max_agent_steps,
+                **response_options,
+            ):
+                yield event
+
+    async def _stream_unlocked(
         self,
         text: str,
         *,
@@ -547,8 +642,10 @@ class Brain:
         control_events: deque[Any] = deque()
         tts_events: deque[Any] = deque()
         event_condition = asyncio.Condition()
-        text_queue: asyncio.Queue[Any] = asyncio.Queue()
+        max_pending_events = max(1, self.config.stream_event_queue_max)
+        text_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=max_pending_events)
         producer_done = False
+        queue_overflowed = False
 
         def is_tts_event(item: Any) -> bool:
             return (
@@ -558,7 +655,23 @@ class Brain:
             )
 
         async def put_event(item: Any) -> None:
+            nonlocal producer_done, queue_overflowed
             async with event_condition:
+                if len(control_events) + len(tts_events) >= max_pending_events:
+                    if not queue_overflowed:
+                        queue_overflowed = True
+                        control_events.append(
+                            BrainEvent(
+                                "error",
+                                {
+                                    "message": "Stream event queue overflowed",
+                                    "stage": "stream",
+                                },
+                            )
+                        )
+                    producer_done = True
+                    event_condition.notify_all()
+                    raise _StreamQueueOverflow("Stream event queue overflowed")
                 target = tts_events if is_tts_event(item) else control_events
                 target.append(item)
                 event_condition.notify()
@@ -613,10 +726,16 @@ class Brain:
                         {"playback_id": playback_id, "segments": segment_count},
                     )
                 )
+            except _StreamQueueOverflow:
+                return
             finally:
                 nonlocal producer_done
                 if not tts_worker.done():
                     tts_worker.cancel()
+                    try:
+                        await tts_worker
+                    except asyncio.CancelledError:
+                        pass
                 async with event_condition:
                     producer_done = True
                     event_condition.notify_all()
@@ -647,6 +766,10 @@ class Brain:
         finally:
             if not producer.done():
                 producer.cancel()
+                try:
+                    await producer
+                except asyncio.CancelledError:
+                    pass
 
     async def _tts_events(
         self,
@@ -825,43 +948,44 @@ class Brain:
         if heartbeat_config.run_probability < 1 and random.random() > heartbeat_config.run_probability:
             return HeartbeatResult(skipped=True, reason="random-chance")
 
-        resolved = self._resolve_persona(persona)
-        state = await self._ensure_thread(thread_id, resolved)
-        task_state = {}
-        if state and isinstance(state.metadata.get(heartbeat_config.task_state_key), dict):
-            task_state = state.metadata[heartbeat_config.task_state_key]
-        heartbeat = load_heartbeat_file(
-            heartbeat_config.heartbeat_path,
-            task_state=task_state,
-            skip_empty_file=heartbeat_config.skip_empty_file,
-        )
-        if heartbeat.skipped_reason:
-            return HeartbeatResult(
-                skipped=True,
-                reason=heartbeat.skipped_reason,
-                heartbeat=heartbeat,
+        async with self._thread_turn(thread_id, response_options, force=True):
+            resolved = self._resolve_persona(persona)
+            state = await self._ensure_thread(thread_id, resolved)
+            task_state = {}
+            if state and isinstance(state.metadata.get(heartbeat_config.task_state_key), dict):
+                task_state = state.metadata[heartbeat_config.task_state_key]
+            heartbeat = load_heartbeat_file(
+                heartbeat_config.heartbeat_path,
+                task_state=task_state,
+                skip_empty_file=heartbeat_config.skip_empty_file,
             )
+            if heartbeat.skipped_reason:
+                return HeartbeatResult(
+                    skipped=True,
+                    reason=heartbeat.skipped_reason,
+                    heartbeat=heartbeat,
+                )
 
-        response_options.setdefault("use_memory", not heartbeat_config.light_context)
-        if heartbeat_config.isolated_session:
-            response_options.setdefault("stateless", True)
-        decision = await self.autonomy_tick(
-            thread_id=thread_id,
-            persona=resolved,
-            context=context or {},
-            actions=actions,
-            config=heartbeat_config,
-            heartbeat=heartbeat,
-            **response_options,
-        )
-        if state and heartbeat.due_tasks:
-            now = datetime.now(timezone.utc).isoformat()
-            updated_task_state = dict(task_state)
-            for task in heartbeat.due_tasks:
-                updated_task_state[task.name] = now
-            state.metadata[heartbeat_config.task_state_key] = updated_task_state
-            self.thread_store.upsert(state)
-        return HeartbeatResult(decision=decision, heartbeat=heartbeat)
+            response_options.setdefault("use_memory", not heartbeat_config.light_context)
+            if heartbeat_config.isolated_session:
+                response_options.setdefault("stateless", True)
+            decision = await self.autonomy_tick(
+                thread_id=thread_id,
+                persona=resolved,
+                context=context or {},
+                actions=actions,
+                config=heartbeat_config,
+                heartbeat=heartbeat,
+                **response_options,
+            )
+            if state and heartbeat.due_tasks:
+                now = datetime.now(timezone.utc).isoformat()
+                updated_task_state = dict(task_state)
+                for task in heartbeat.due_tasks:
+                    updated_task_state[task.name] = now
+                state.metadata[heartbeat_config.task_state_key] = updated_task_state
+                self.thread_store.upsert(state)
+            return HeartbeatResult(decision=decision, heartbeat=heartbeat)
 
     def autonomy_loop(
         self,

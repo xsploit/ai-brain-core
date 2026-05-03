@@ -95,3 +95,20 @@ def test_json_event_to_namespace_recurses():
     assert event.type == "response.completed"
     assert event.response.id == "resp_1"
     assert event.response.output[0].type == "message"
+
+
+@pytest.mark.asyncio
+async def test_gateway_websocket_pool_skips_busy_slot():
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=2,
+    )
+
+    await gateway._responses_ws_locks[0].acquire()
+    try:
+        slot = await gateway._next_responses_websocket_slot()
+    finally:
+        gateway._responses_ws_locks[0].release()
+
+    assert slot == 1

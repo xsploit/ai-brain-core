@@ -134,8 +134,12 @@ class ToolRegistry:
             arguments = dict(arguments_json)
         if "context" in inspect.signature(tool.func).parameters:
             arguments["context"] = context
+
         async def run() -> Any:
-            result = tool.func(**arguments)
+            if inspect.iscoroutinefunction(tool.func):
+                result = await tool.func(**arguments)
+            else:
+                result = await asyncio.to_thread(tool.func, **arguments)
             if isinstance(result, Awaitable):
                 return await result
             if inspect.iscoroutine(result):

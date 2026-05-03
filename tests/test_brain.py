@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import asyncio
 import pytest
 
 from aibrain import Brain, BrainConfig, Persona
@@ -110,3 +111,24 @@ async def test_tool_loop_continues_with_function_output(tmp_path):
     assert response.tool_results[0]["output"] == "pong"
     assert client.responses.calls[1]["previous_response_id"] == "resp_tool"
     assert client.responses.calls[1]["input"][0]["type"] == "function_call_output"
+
+
+@pytest.mark.asyncio
+async def test_same_thread_turns_serialize_remote_conversation_creation(tmp_path):
+    client = FakeOpenAI()
+
+    async def create_conversation(**kwargs):
+        client.conversations.calls.append(kwargs)
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(id="conv_shared")
+
+    client.conversations.create = create_conversation
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+
+    responses = await asyncio.gather(
+        brain.ask("one", thread_id="shared", tool_names=[]),
+        brain.ask("two", thread_id="shared", tool_names=[]),
+    )
+
+    assert len(client.conversations.calls) == 1
+    assert [response.conversation_id for response in responses] == ["conv_shared", "conv_shared"]

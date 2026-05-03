@@ -1,6 +1,7 @@
 import pytest
 
 from aibrain.embeddings import HashEmbeddingProvider
+from aibrain import memory as memory_module
 from aibrain.memory import SQLiteMemoryStore
 from aibrain.policy import MemoryPolicy
 from aibrain.types import ThreadState
@@ -64,3 +65,26 @@ async def test_memory_policy_reuses_one_query_embedding_across_scopes(tmp_path):
 
     assert len(records) == 3
     assert provider.calls == calls_after_writes + 1
+
+
+@pytest.mark.asyncio
+async def test_memory_fallback_search_runs_off_event_loop(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(memory_module.asyncio, "to_thread", fake_to_thread)
+    store = SQLiteMemoryStore(
+        tmp_path / "brain.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=64),
+        dimensions=64,
+    )
+    await store.remember("Fallback memory", scope="global")
+    monkeypatch.setattr(store, "_search_rows_with_sqlite_vec", lambda *args, **kwargs: None)
+
+    results = await store.search("Fallback", top_k=1)
+
+    assert results
+    assert calls == ["_search_fallback_sync"]

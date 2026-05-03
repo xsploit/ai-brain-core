@@ -61,6 +61,20 @@ $env:AIBRAIN_OPENAI_STREAM_TRANSPORT="websocket"
 uv run aibrain chat --tts --stats --env-file .env
 ```
 
+Server mode uses a small Responses WebSocket pool so one long stream does not
+block every other client:
+
+```powershell
+$env:AIBRAIN_OPENAI_WS_POOL_SIZE="4"
+$env:AIBRAIN_STREAM_EVENT_QUEUE_MAX="256"
+$env:AIBRAIN_MODELS_CACHE_TTL_SECONDS="300"
+```
+
+Stateful turns for the same `thread_id` are serialized so concurrent Discord or
+Twitch events do not split a channel across duplicate OpenAI conversations.
+`cancel` messages on `/stream`, `/brain`, and `/voice` cancel active work instead
+of only acknowledging the button click.
+
 If `sqlite-vec` is unavailable on your machine, memory still works with the built-in fallback.
 
 Set your OpenAI key:

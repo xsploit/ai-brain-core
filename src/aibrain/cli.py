@@ -260,6 +260,8 @@ def _chat_config_kwargs(args: argparse.Namespace) -> dict[str, object]:
     model = args.model or (FAST_CHAT_MODEL if args.fast else None)
     if model:
         kwargs["default_model"] = model
+    if args.fast:
+        kwargs["openai_ws_pool_size"] = 1
     return kwargs
 
 

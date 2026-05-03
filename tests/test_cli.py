@@ -23,6 +23,7 @@ def test_fast_chat_preset_uses_low_latency_defaults():
 
     assert config_kwargs["openai_stream_transport"] == "websocket"
     assert config_kwargs["default_model"] == FAST_CHAT_MODEL
+    assert config_kwargs["openai_ws_pool_size"] == 1
     assert brain_options["stateless"] is True
     assert brain_options["tool_names"] == []
 

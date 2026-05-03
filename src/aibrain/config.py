@@ -31,6 +31,15 @@ class BrainConfig(BaseModel):
     openai_stream_transport: Literal["http", "websocket"] = Field(
         default_factory=lambda: os.environ.get("AIBRAIN_OPENAI_STREAM_TRANSPORT", "http")  # type: ignore[arg-type]
     )
+    openai_ws_pool_size: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_OPENAI_WS_POOL_SIZE", 4)
+    )
+    stream_event_queue_max: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_STREAM_EVENT_QUEUE_MAX", 256)
+    )
+    models_cache_ttl_seconds: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_MODELS_CACHE_TTL_SECONDS", 300)
+    )
     state_mode: Literal["conversation", "previous_response_id", "stateless"] = "conversation"
     store: bool | None = True
     truncation: Literal["auto", "disabled"] | None = "auto"
@@ -58,3 +67,13 @@ class BrainConfig(BaseModel):
 def _default_env_file() -> Path | None:
     value = os.environ.get("AIBRAIN_ENV_FILE")
     return Path(value) if value else None
+
+
+def _env_int(name: str, fallback: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return fallback
+    try:
+        return int(value)
+    except ValueError:
+        return fallback

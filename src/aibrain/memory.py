@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -184,10 +185,15 @@ class SQLiteMemoryStore:
                 top_k,
             )
             if rows is None:
-                sql = "SELECT * FROM brain_memories"
-                if where:
-                    sql += " WHERE " + " AND ".join(where)
-                rows = conn.execute(sql, params).fetchall()
+                return await asyncio.to_thread(
+                    self._search_fallback_sync,
+                    query_embedding,
+                    where,
+                    params,
+                    metadata_filter,
+                    top_k,
+                    min_score,
+                )
 
         scored: list[MemoryRecord] = []
         for row in rows:
@@ -220,6 +226,46 @@ class SQLiteMemoryStore:
 
     async def embed_query(self, query: str) -> list[float]:
         return await self.embedding_provider.embed(query)
+
+    def _search_fallback_sync(
+        self,
+        query_embedding: list[float],
+        where: list[str],
+        params: list[Any],
+        metadata_filter: dict[str, Any] | None,
+        top_k: int,
+        min_score: float,
+    ) -> list[MemoryRecord]:
+        with self._connect() as conn:
+            sql = "SELECT * FROM brain_memories"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            rows = conn.execute(sql, params).fetchall()
+        scored: list[MemoryRecord] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if metadata_filter and not _metadata_matches(metadata, metadata_filter):
+                continue
+            embedding = json.loads(row["embedding_json"])
+            semantic_score = cosine_similarity(query_embedding, embedding)
+            score = semantic_score * (0.5 + float(row["importance"]))
+            if score < min_score:
+                continue
+            scored.append(
+                MemoryRecord(
+                    id=row["id"],
+                    scope=row["scope"],
+                    thread_id=row["thread_id"],
+                    persona_id=row["persona_id"],
+                    content=row["content"],
+                    metadata=metadata,
+                    importance=float(row["importance"]),
+                    score=score,
+                    created_at=row["created_at"],
+                )
+            )
+        scored.sort(key=lambda record: record.score, reverse=True)
+        return scored[:top_k]
 
     def _search_rows_with_sqlite_vec(
         self,

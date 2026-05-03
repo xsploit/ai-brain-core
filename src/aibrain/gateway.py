@@ -19,11 +19,15 @@ class OpenAIGateway:
         client: Any,
         *,
         stream_transport: Literal["http", "websocket"] = "http",
+        websocket_pool_size: int = 4,
     ):
         self.client = client
         self.stream_transport = stream_transport
-        self._responses_ws: Any | None = None
-        self._responses_ws_lock = asyncio.Lock()
+        self.websocket_pool_size = max(1, websocket_pool_size)
+        self._responses_ws_pool: list[Any | None] = [None] * self.websocket_pool_size
+        self._responses_ws_locks = [asyncio.Lock() for _ in range(self.websocket_pool_size)]
+        self._responses_ws_cursor = 0
+        self._responses_ws_cursor_lock = asyncio.Lock()
 
     async def create_response(self, **params: Any) -> Any:
         return await self.client.responses.create(**params)
@@ -38,19 +42,20 @@ class OpenAIGateway:
         return self.client.responses.stream(**params)
 
     async def close(self) -> None:
-        websocket = self._responses_ws
-        self._responses_ws = None
-        if websocket is not None:
+        websockets = [websocket for websocket in self._responses_ws_pool if websocket is not None]
+        self._responses_ws_pool = [None] * self.websocket_pool_size
+        for websocket in websockets:
             await websocket.close()
 
     async def warmup(self) -> None:
         if self.stream_transport == "websocket":
-            async with self._responses_ws_lock:
-                await self._ensure_responses_websocket()
+            async with self._responses_ws_locks[0]:
+                await self._ensure_responses_websocket(0)
 
     async def _stream_response_websocket(self, params: dict[str, Any]) -> Any:
-        async with self._responses_ws_lock:
-            websocket = await self._ensure_responses_websocket()
+        slot = await self._next_responses_websocket_slot()
+        async with self._responses_ws_locks[slot]:
+            websocket = await self._ensure_responses_websocket(slot)
             payload = dict(params)
             payload.pop("stream", None)
             payload.pop("background", None)
@@ -64,17 +69,31 @@ class OpenAIGateway:
                 if event_type in {"response.completed", "response.failed", "response.cancelled", "error"}:
                     break
 
-    async def _ensure_responses_websocket(self) -> Any:
-        if self._responses_ws is not None:
-            return self._responses_ws
+    async def _next_responses_websocket_slot(self) -> int:
+        async with self._responses_ws_cursor_lock:
+            start = self._responses_ws_cursor
+            for offset in range(self.websocket_pool_size):
+                slot = (start + offset) % self.websocket_pool_size
+                if not self._responses_ws_locks[slot].locked():
+                    self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
+                    return slot
+            slot = start
+            self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
+            return slot
+
+    async def _ensure_responses_websocket(self, slot: int) -> Any:
+        websocket = self._responses_ws_pool[slot]
+        if websocket is not None:
+            return websocket
         import websockets
 
-        self._responses_ws = await websockets.connect(
+        websocket = await websockets.connect(
             _responses_websocket_url(self.client),
             additional_headers=_websocket_headers(self.client),
             max_size=None,
         )
-        return self._responses_ws
+        self._responses_ws_pool[slot] = websocket
+        return websocket
 
     async def parse_response(self, *, text_format: type[Any], **params: Any) -> Any:
         return await self.client.responses.parse(text_format=text_format, **params)

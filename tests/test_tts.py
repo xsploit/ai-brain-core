@@ -182,6 +182,36 @@ class FakePiperProcess(PiperProcessTTS):
         )
 
 
+class ConcurrentFakePiperProcess(PiperProcessTTS):
+    def __init__(self):
+        super().__init__(TTSConfig(provider="null"))
+        self.active = 0
+        self.max_active = 0
+        self.entered = asyncio.Event()
+        self.concurrent = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        runtime_config = config or self.config
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.entered.set()
+        if self.active >= 2:
+            self.concurrent.set()
+        await self.release.wait()
+        try:
+            yield TTSChunk(
+                audio=text.encode(),
+                sample_rate=runtime_config.resolved_sample_rate(),
+                index=start_index,
+                final=True,
+                text=text,
+                voice=str(runtime_config.piper_model_path) if runtime_config.piper_model_path else None,
+            )
+        finally:
+            self.active -= 1
+
+
 @pytest.mark.asyncio
 async def test_piper_process_stream_splits_multi_sentence_text():
     provider = FakePiperProcess()
@@ -190,6 +220,36 @@ async def test_piper_process_stream_splits_multi_sentence_text():
 
     assert provider.segments == ["One sentence.", "Two sentence."]
     assert [chunk.index for chunk in chunks] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_piper_process_locks_per_voice(tmp_path):
+    first_model = tmp_path / "first.onnx"
+    first_config = tmp_path / "first.onnx.json"
+    second_model = tmp_path / "second.onnx"
+    second_config = tmp_path / "second.onnx.json"
+    for model, config in [(first_model, first_config), (second_model, second_config)]:
+        model.write_bytes(b"model")
+        config.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    provider = ConcurrentFakePiperProcess()
+
+    async def collect(text, model, config):
+        return [
+            chunk
+            async for chunk in provider.stream(
+                text,
+                voice={"path": model, "config": config},
+            )
+        ]
+
+    first = asyncio.create_task(collect("one", first_model, first_config))
+    await asyncio.wait_for(provider.entered.wait(), timeout=1)
+    second = asyncio.create_task(collect("two", second_model, second_config))
+    await asyncio.wait_for(provider.concurrent.wait(), timeout=1)
+    provider.release.set()
+    await asyncio.gather(first, second)
+
+    assert provider.max_active == 2
 
 
 def test_tts_config_for_voice_resolves_requested_voice(tmp_path, monkeypatch):
@@ -394,3 +454,28 @@ async def test_stream_with_tts_does_not_starve_audio_behind_text_burst(tmp_path)
     )
 
     assert text_before_audio <= 9
+
+
+@pytest.mark.asyncio
+async def test_stream_with_tts_reports_queue_overflow(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", stream_event_queue_max=2),
+        client=BurstAfterFirstSentenceClient(),
+        tts_provider=FakeTTS(TTSConfig(provider="null")),
+    )
+
+    events = []
+    async for event in brain.stream_with_tts(
+        "burst",
+        thread_id="thread-overflow",
+        tool_names=[],
+    ):
+        events.append(event)
+        await asyncio.sleep(0.01)
+        if event.type == "error":
+            break
+
+    assert any(
+        event.type == "error" and "overflowed" in event.data.get("message", "")
+        for event in events
+    )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -102,6 +104,8 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
 
     app = FastAPI(title="AI Brain Core", version="0.1.0", lifespan=lifespan)
     app.state.brain = brain_instance
+    app.state.models_cache = {"expires_at": 0.0, "ids": None}
+    app.state.tts_voice_cache = None
     webchat_dir = Path(__file__).with_name("webchat")
 
     if webchat_dir.exists():
@@ -125,7 +129,11 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
 
     @app.get("/models")
     async def models() -> list[dict[str, Any]]:
-        model_ids = await _list_openai_models(app.state.brain)
+        model_ids = await _list_openai_models(
+            app.state.brain,
+            cache=app.state.models_cache,
+            ttl_seconds=app.state.brain.config.models_cache_ttl_seconds,
+        )
         default_model = app.state.brain.config.default_model
         if default_model not in model_ids:
             model_ids.insert(0, default_model)
@@ -222,10 +230,14 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         return result.model_dump()
 
     @app.get("/tts/voices")
-    async def tts_voices() -> list[dict[str, Any]]:
+    async def tts_voices(refresh: bool = False) -> list[dict[str, Any]]:
         from .tts import discover_piper_voices
 
-        return [voice.model_dump() for voice in discover_piper_voices()]
+        if refresh or app.state.tts_voice_cache is None:
+            app.state.tts_voice_cache = [
+                voice.model_dump() for voice in discover_piper_voices()
+            ]
+        return list(app.state.tts_voice_cache)
 
     @app.websocket("/stream")
     async def stream(websocket: WebSocket) -> None:
@@ -254,7 +266,15 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
     return app
 
 
-async def _list_openai_models(brain: Brain) -> list[str]:
+async def _list_openai_models(
+    brain: Brain,
+    *,
+    cache: dict[str, Any] | None = None,
+    ttl_seconds: int = 300,
+) -> list[str]:
+    now = time.monotonic()
+    if cache is not None and cache.get("ids") is not None and cache.get("expires_at", 0) > now:
+        return list(cache["ids"])
     try:
         result = await brain.client.models.list()
         ids = sorted(
@@ -264,9 +284,13 @@ async def _list_openai_models(brain: Brain) -> list[str]:
                 if _is_chat_model(str(getattr(model, "id", "")))
             }
         )
-        return ids or list(FALLBACK_MODELS)
+        model_ids = ids or list(FALLBACK_MODELS)
     except Exception:
-        return list(FALLBACK_MODELS)
+        model_ids = list(FALLBACK_MODELS)
+    if cache is not None:
+        cache["ids"] = list(model_ids)
+        cache["expires_at"] = now + max(0, ttl_seconds)
+    return model_ids
 
 
 def _is_chat_model(model_id: str) -> bool:
@@ -275,14 +299,28 @@ def _is_chat_model(model_id: str) -> bool:
 
 async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool) -> None:
     await websocket.accept()
+    send_lock = asyncio.Lock()
+    active_task: asyncio.Task[None] | None = None
     try:
         while True:
             payload = await websocket.receive_json()
             message_type = payload.get("type", "ask")
             if message_type == "cancel":
-                await websocket.send_json({"type": "cancelled"})
+                active_task = await _cancel_task(
+                    active_task,
+                    websocket,
+                    send_lock,
+                    notify=True,
+                )
                 continue
             if message_type == "heartbeat":
+                if active_task is not None and not active_task.done():
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": "Cannot run heartbeat while a turn is active"},
+                    )
+                    continue
                 request = HeartbeatRequest.model_validate(payload)
                 result = await brain.heartbeat_tick(
                     thread_id=request.thread_id,
@@ -293,58 +331,57 @@ async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool
                     **request.options,
                 )
                 event_type = "heartbeat.skipped" if result.skipped else "heartbeat.decision"
-                await websocket.send_json({"type": event_type, **result.model_dump()})
+                await _safe_send_json(websocket, send_lock, {"type": event_type, **result.model_dump()})
                 continue
             if message_type != "ask":
-                await websocket.send_json(
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
                     {"type": "error", "message": f"Unsupported message type: {message_type}"}
                 )
                 continue
+            active_task = await _cancel_task(active_task, websocket, send_lock, notify=False)
             request = AskRequest.model_validate(payload)
-            event_stream = (
-                brain.stream_with_tts(
-                    request.text,
-                    thread_id=request.thread_id,
-                    persona=request.persona,
-                    images=request.images,
-                    use_memory=request.use_memory,
-                    tool_names=request.tool_names,
-                    tts_options=request.tts_options,
-                    **request.options,
-                )
-                if request.tts or default_tts
-                else brain.stream(
-                    request.text,
-                    thread_id=request.thread_id,
-                    persona=request.persona,
-                    images=request.images,
-                    use_memory=request.use_memory,
-                    tool_names=request.tool_names,
-                    **request.options,
-                )
+            active_task = asyncio.create_task(
+                _send_brain_turn(brain, websocket, send_lock, request, default_tts=default_tts)
             )
-            async for event in event_stream:
-                await websocket.send_json(event.model_dump())
     except WebSocketDisconnect:
+        await _cancel_task(active_task, websocket, send_lock, notify=False)
         return
 
 
 async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
     await websocket.accept()
+    send_lock = asyncio.Lock()
     session: VoiceStartRequest | None = None
     buffer = None
+    active_task: asyncio.Task[None] | None = None
     try:
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
+                await _cancel_task(active_task, websocket, send_lock, notify=False)
                 return
             if message.get("bytes") is not None:
                 if session is None or buffer is None:
-                    await websocket.send_json(
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
                         {"type": "error", "message": "audio.start is required before binary audio"}
                     )
                     continue
-                await _handle_voice_audio(brain, websocket, session, buffer, message["bytes"])
+                result = await _handle_voice_audio(websocket, send_lock, buffer, message["bytes"])
+                if result.speech_started and active_task is not None and not active_task.done():
+                    active_task = await _cancel_task(active_task, websocket, send_lock, notify=True)
+                if result.utterance_audio:
+                    active_task = await _start_voice_turn(
+                        brain,
+                        websocket,
+                        send_lock,
+                        session,
+                        result.utterance_audio,
+                        active_task,
+                    )
                 continue
             text = message.get("text")
             if text is None:
@@ -352,9 +389,12 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
             payload = json.loads(text)
             message_type = payload.get("type", "audio.chunk")
             if message_type == "audio.start":
+                active_task = await _cancel_task(active_task, websocket, send_lock, notify=False)
                 session = VoiceStartRequest.model_validate(payload)
                 if session.encoding != "pcm_s16le":
-                    await websocket.send_json(
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
                         {
                             "type": "error",
                             "message": "Streaming voice v1 expects pcm_s16le audio",
@@ -369,7 +409,9 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
                     channels=session.channels,
                     encoding=session.encoding,
                 )
-                await websocket.send_json(
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
                     {
                         "type": "audio.started",
                         "sample_rate": session.sample_rate,
@@ -381,50 +423,171 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
             if message_type == "audio.cancel":
                 if buffer is not None:
                     buffer.reset()
-                await websocket.send_json({"type": "cancelled"})
+                active_task = await _cancel_task(active_task, websocket, send_lock, notify=True)
                 continue
             if session is None or buffer is None:
-                await websocket.send_json(
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
                     {"type": "error", "message": "audio.start is required before audio chunks"}
                 )
                 continue
             if message_type == "audio.stop":
                 result = buffer.flush()
                 if result.speech_ended:
-                    await websocket.send_json({"type": "vad.speech.end", "discarded": result.discarded})
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "vad.speech.end", "discarded": result.discarded},
+                    )
                 if result.utterance_audio:
-                    await _run_voice_turn(brain, websocket, session, result.utterance_audio)
+                    active_task = await _start_voice_turn(
+                        brain,
+                        websocket,
+                        send_lock,
+                        session,
+                        result.utterance_audio,
+                        active_task,
+                    )
                 continue
             if message_type == "audio.chunk":
                 audio = base64.b64decode(payload.get("audio", ""))
-                await _handle_voice_audio(brain, websocket, session, buffer, audio)
+                result = await _handle_voice_audio(websocket, send_lock, buffer, audio)
+                if result.speech_started and active_task is not None and not active_task.done():
+                    active_task = await _cancel_task(active_task, websocket, send_lock, notify=True)
+                if result.utterance_audio:
+                    active_task = await _start_voice_turn(
+                        brain,
+                        websocket,
+                        send_lock,
+                        session,
+                        result.utterance_audio,
+                        active_task,
+                    )
                 continue
-            await websocket.send_json(
+            await _safe_send_json(
+                websocket,
+                send_lock,
                 {"type": "error", "message": f"Unsupported voice message type: {message_type}"}
             )
     except WebSocketDisconnect:
+        await _cancel_task(active_task, websocket, send_lock, notify=False)
         return
 
 
-async def _handle_voice_audio(
+async def _safe_send_json(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    payload: dict[str, Any],
+) -> None:
+    async with send_lock:
+        await websocket.send_json(payload)
+
+
+async def _cancel_task(
+    task: asyncio.Task[None] | None,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    *,
+    notify: bool,
+) -> asyncio.Task[None] | None:
+    if task is not None:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        else:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                if notify:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": str(exc)},
+                    )
+    if notify:
+        await _safe_send_json(websocket, send_lock, {"type": "cancelled"})
+    return None
+
+
+async def _send_brain_turn(
     brain: Brain,
     websocket: WebSocket,
-    session: VoiceStartRequest,
+    send_lock: asyncio.Lock,
+    request: AskRequest,
+    *,
+    default_tts: bool,
+) -> None:
+    event_stream = (
+        brain.stream_with_tts(
+            request.text,
+            thread_id=request.thread_id,
+            persona=request.persona,
+            images=request.images,
+            use_memory=request.use_memory,
+            tool_names=request.tool_names,
+            tts_options=request.tts_options,
+            **request.options,
+        )
+        if request.tts or default_tts
+        else brain.stream(
+            request.text,
+            thread_id=request.thread_id,
+            persona=request.persona,
+            images=request.images,
+            use_memory=request.use_memory,
+            tool_names=request.tool_names,
+            **request.options,
+        )
+    )
+    try:
+        async for event in event_stream:
+            await _safe_send_json(websocket, send_lock, event.model_dump())
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _safe_send_json(websocket, send_lock, {"type": "error", "message": str(exc)})
+
+
+async def _handle_voice_audio(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
     buffer: Any,
     audio: bytes,
-) -> None:
+) -> Any:
     result = buffer.push(audio)
     if result.speech_started:
-        await websocket.send_json({"type": "vad.speech.start"})
+        await _safe_send_json(websocket, send_lock, {"type": "vad.speech.start"})
     if result.speech_ended:
-        await websocket.send_json({"type": "vad.speech.end", "discarded": result.discarded})
-    if result.utterance_audio:
-        await _run_voice_turn(brain, websocket, session, result.utterance_audio)
+        await _safe_send_json(
+            websocket,
+            send_lock,
+            {"type": "vad.speech.end", "discarded": result.discarded},
+        )
+    return result
+
+
+async def _start_voice_turn(
+    brain: Brain,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session: VoiceStartRequest,
+    audio: bytes,
+    active_task: asyncio.Task[None] | None,
+) -> asyncio.Task[None]:
+    await _cancel_task(active_task, websocket, send_lock, notify=False)
+    return asyncio.create_task(_run_voice_turn(brain, websocket, send_lock, session, audio))
 
 
 async def _run_voice_turn(
     brain: Brain,
     websocket: WebSocket,
+    send_lock: asyncio.Lock,
     session: VoiceStartRequest,
     audio: bytes,
 ) -> None:
@@ -435,15 +598,20 @@ async def _run_voice_turn(
         "language": session.language,
         **session.stt_options,
     }
-    async for event in brain.voice_stream(
-        audio,
-        thread_id=session.thread_id,
-        persona=session.persona,
-        tts=session.tts,
-        stt_options=stt_options,
-        tts_options=session.tts_options,
-        use_memory=session.use_memory,
-        tool_names=session.tool_names,
-        **session.options,
-    ):
-        await websocket.send_json(event.model_dump())
+    try:
+        async for event in brain.voice_stream(
+            audio,
+            thread_id=session.thread_id,
+            persona=session.persona,
+            tts=session.tts,
+            stt_options=stt_options,
+            tts_options=session.tts_options,
+            use_memory=session.use_memory,
+            tool_names=session.tool_names,
+            **session.options,
+        ):
+            await _safe_send_json(websocket, send_lock, event.model_dump())
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _safe_send_json(websocket, send_lock, {"type": "error", "message": str(exc)})

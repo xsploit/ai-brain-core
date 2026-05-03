@@ -234,11 +234,14 @@ class PiperProcessTTS(PiperExecutableTTS):
     def __init__(self, config: TTSConfig | None = None):
         super().__init__(config)
         self._processes: dict[tuple[Any, ...], asyncio.subprocess.Process] = {}
-        self._lock = asyncio.Lock()
+        self._locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
 
     async def stream(self, text: str, **options: Any) -> AsyncIterator[TTSChunk]:
         runtime_config = tts_config_for_voice(self.config, options.get("voice"))
-        async with self._lock:
+        key = tts_config_process_key(runtime_config)
+        lock = await self._process_lock(key)
+        async with lock:
             try:
                 index = 0
                 for segment in split_tts_text(text, runtime_config):
@@ -250,9 +253,17 @@ class PiperProcessTTS(PiperExecutableTTS):
                         yield chunk
                         index = chunk.index + 1
             except Exception:
-                await self.close()
+                await self._close_process(key)
                 async for chunk in super().stream(text, **options):
                     yield chunk
+
+    async def _process_lock(self, key: tuple[Any, ...]) -> asyncio.Lock:
+        async with self._locks_guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
 
     async def _stream_process(
         self,
@@ -326,7 +337,20 @@ class PiperProcessTTS(PiperExecutableTTS):
 
     async def warmup(self, **options: Any) -> None:
         runtime_config = tts_config_for_voice(self.config, options.get("voice"))
-        await self._ensure_process(runtime_config)
+        key = tts_config_process_key(runtime_config)
+        lock = await self._process_lock(key)
+        async with lock:
+            await self._ensure_process(runtime_config)
+
+    async def _close_process(self, key: tuple[Any, ...]) -> None:
+        process = self._processes.pop(key, None)
+        if process is None or process.returncode is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            process.kill()
 
     async def close(self) -> None:
         processes = list(self._processes.values())
