@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-brain-core"
+version = "0.1.0"
+description = "Reusable Python AI brain built on OpenAI Responses, Conversations, tools, memory, and streaming adapters."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=2.21.0",
+    "pydantic>=2.7",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "tzdata>=2025.2",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+audio = ["sounddevice>=0.5.1"]
+vector = ["sqlite-vec>=0.1.6"]
+stt = [
+    "faster-whisper>=1.2.1",
+    "silero-vad[onnx-cpu]>=6.2.1",
+    "soundfile>=0.13.1",
+    "numpy>=1.26",
+    "sounddevice>=0.5.1",
+]
+all = [
+    "sqlite-vec>=0.1.6",
+    "faster-whisper>=1.2.1",
+    "silero-vad[onnx-cpu]>=6.2.1",
+    "soundfile>=0.13.1",
+    "numpy>=1.26",
+    "sounddevice>=0.5.1",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+aibrain = "aibrain.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aibrain = ["webchat/*.html", "webchat/*.css", "webchat/*.js"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+testpaths = ["tests"]

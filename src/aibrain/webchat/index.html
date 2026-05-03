@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Brain Core Console</title>
+    <link rel="stylesheet" href="/webchat/assets/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="rail">
+        <div class="brand">
+          <div class="brand-mark">AI</div>
+          <div>
+            <div class="brand-title">Brain Core</div>
+            <div id="healthStatus" class="status-pill">checking</div>
+          </div>
+        </div>
+        <nav class="tabs" aria-label="Console views">
+          <button class="tab active" data-tab="chat">Chat</button>
+          <button class="tab" data-tab="voice">Voice</button>
+          <button class="tab" data-tab="stt">STT</button>
+          <button class="tab" data-tab="tts">TTS</button>
+          <button class="tab" data-tab="heartbeat">Heartbeat</button>
+          <button class="tab" data-tab="events">Events</button>
+        </nav>
+        <div class="rail-footer">
+          <label class="field">
+            <span>Thread</span>
+            <input id="threadId" value="webchat:default" />
+          </label>
+          <button id="newThreadButton" class="secondary-button" type="button">New Thread</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="panel main-panel active" data-panel="chat">
+          <header class="panel-header">
+            <div>
+              <h1>Chat</h1>
+              <div id="chatStatus" class="muted">idle</div>
+            </div>
+            <div class="toolbar">
+              <button id="clearChatButton" class="secondary-button" type="button">Clear</button>
+              <button id="stopChatButton" class="secondary-button danger" type="button">Stop</button>
+            </div>
+          </header>
+
+          <div id="messages" class="messages" aria-live="polite"></div>
+
+          <form id="chatForm" class="composer">
+            <textarea id="chatInput" rows="3" placeholder="Message"></textarea>
+            <div class="composer-actions">
+              <label class="inline-control">
+                <input id="streamMode" type="checkbox" checked />
+                <span>Stream</span>
+              </label>
+              <label class="inline-control">
+                <input id="ttsMode" type="checkbox" />
+                <span>TTS</span>
+              </label>
+              <label class="inline-control">
+                <input id="memoryMode" type="checkbox" checked />
+                <span>Memory</span>
+              </label>
+              <button class="primary-button" type="submit">Send</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel main-panel" data-panel="voice">
+          <header class="panel-header">
+            <div>
+              <h1>Voice</h1>
+              <div id="voiceStatus" class="muted">idle</div>
+            </div>
+            <div class="toolbar">
+              <button id="voiceStartButton" class="primary-button" type="button">Start</button>
+              <button id="voiceStopButton" class="secondary-button" type="button">Stop</button>
+              <button id="voiceCancelButton" class="secondary-button danger" type="button">Cancel</button>
+            </div>
+          </header>
+          <div class="voice-grid">
+            <div class="meter-panel">
+              <canvas id="voiceMeter" width="640" height="180"></canvas>
+              <div class="meter-labels">
+                <span>Mic</span>
+                <span id="voiceLevel">0%</span>
+              </div>
+            </div>
+            <div class="settings-grid compact">
+              <label class="field">
+                <span>VAD</span>
+                <select id="voiceVad">
+                  <option value="silero">silero</option>
+                  <option value="energy">energy</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Threshold</span>
+                <input id="voiceThreshold" type="number" value="0.5" step="0.05" min="0" max="1" />
+              </label>
+              <label class="field">
+                <span>End Silence ms</span>
+                <input id="voiceSilence" type="number" value="700" step="50" min="100" />
+              </label>
+              <label class="inline-control block">
+                <input id="voiceTtsMode" type="checkbox" checked />
+                <span>TTS</span>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel main-panel" data-panel="stt">
+          <header class="panel-header">
+            <div>
+              <h1>STT</h1>
+              <div id="sttStatus" class="muted">idle</div>
+            </div>
+            <div class="toolbar">
+              <button id="sttRecordButton" class="primary-button" type="button">Record</button>
+              <button id="sttStopButton" class="secondary-button" type="button">Stop</button>
+            </div>
+          </header>
+          <div class="settings-grid">
+            <label class="field">
+              <span>Audio File</span>
+              <input id="sttFile" type="file" accept=".wav,.flac,audio/wav,audio/flac" />
+            </label>
+            <label class="field">
+              <span>Format</span>
+              <select id="sttFormat">
+                <option value="wav">wav</option>
+                <option value="flac">flac</option>
+                <option value="pcm_s16le">pcm_s16le</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Language</span>
+              <input id="sttLanguage" placeholder="auto" />
+            </label>
+            <button id="sttFileButton" class="primary-button aligned" type="button">Transcribe</button>
+          </div>
+          <pre id="sttOutput" class="json-output"></pre>
+        </section>
+
+        <section class="panel main-panel" data-panel="tts">
+          <header class="panel-header">
+            <div>
+              <h1>TTS</h1>
+              <div id="ttsStatus" class="muted">idle</div>
+            </div>
+            <button id="refreshVoicesButton" class="secondary-button" type="button">Voices</button>
+          </header>
+          <div class="settings-grid">
+            <label class="field wide">
+              <span>Text</span>
+              <textarea id="ttsText" rows="4">Testing the Piper voice pipeline.</textarea>
+            </label>
+            <label class="field">
+              <span>Voice</span>
+              <select id="voiceSelect"></select>
+            </label>
+            <button id="ttsButton" class="primary-button aligned" type="button">Speak</button>
+          </div>
+        </section>
+
+        <section class="panel main-panel" data-panel="heartbeat">
+          <header class="panel-header">
+            <div>
+              <h1>Heartbeat</h1>
+              <div id="heartbeatStatus" class="muted">idle</div>
+            </div>
+            <button id="heartbeatButton" class="primary-button" type="button">Run</button>
+          </header>
+          <div class="settings-grid">
+            <label class="field">
+              <span>Action</span>
+              <input id="heartbeatAction" value="message" />
+            </label>
+            <label class="field">
+              <span>Probability</span>
+              <input id="heartbeatProbability" type="number" value="1" min="0" max="1" step="0.05" />
+            </label>
+            <label class="field wide">
+              <span>Context JSON</span>
+              <textarea id="heartbeatContext" rows="7">{"surface":"webchat","recent_activity":"manual test"}</textarea>
+            </label>
+          </div>
+          <pre id="heartbeatOutput" class="json-output"></pre>
+        </section>
+
+        <section class="panel main-panel" data-panel="events">
+          <header class="panel-header">
+            <div>
+              <h1>Events</h1>
+              <div class="muted">latest first</div>
+            </div>
+            <button id="clearEventsButton" class="secondary-button" type="button">Clear</button>
+          </header>
+          <div id="eventLog" class="event-log"></div>
+        </section>
+      </main>
+
+      <aside class="inspector">
+        <section class="panel">
+          <h2>Persona</h2>
+          <label class="field">
+            <span>ID</span>
+            <input id="personaId" value="webchat" />
+          </label>
+          <label class="field">
+            <span>Name</span>
+            <input id="personaName" value="Webchat" />
+          </label>
+          <label class="field">
+            <span>Model</span>
+            <div class="inline-field">
+              <select id="personaModel"></select>
+              <button id="refreshModelsButton" class="secondary-button icon-button" type="button" title="Refresh models">↻</button>
+            </div>
+          </label>
+          <label class="field">
+            <span>Instructions</span>
+            <textarea id="personaInstructions" rows="5">You are testing AI Brain Core. Be concise and call tools when useful.</textarea>
+          </label>
+        </section>
+
+        <section class="panel">
+          <h2>Vision</h2>
+          <label class="field">
+            <span>Image URL</span>
+            <input id="imageUrl" placeholder="https://..." />
+          </label>
+          <label class="field">
+            <span>Image File</span>
+            <input id="imageFile" type="file" accept="image/*" />
+          </label>
+          <label class="field">
+            <span>Detail</span>
+            <select id="imageDetail">
+              <option value="auto">auto</option>
+              <option value="low">low</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+        </section>
+
+        <section class="panel">
+          <h2>Options</h2>
+          <label class="field">
+            <span>Tools</span>
+            <input id="toolNames" placeholder="remember,search_memory" />
+          </label>
+          <label class="field">
+            <span>Response JSON</span>
+            <textarea id="responseOptions" rows="8">{}</textarea>
+          </label>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="/webchat/assets/app.js?v=20260502-fair-stream"></script>
+  </body>
+</html>
