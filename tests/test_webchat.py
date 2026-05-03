@@ -156,6 +156,44 @@ def test_stream_websocket_cancel_stops_active_turn(tmp_path):
             assert ws.receive_json()["type"] == "cancelled"
 
 
+def test_stream_websocket_rejects_non_object_payload(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/stream") as ws:
+            ws.send_json(["bad"])
+            event = ws.receive_json()
+
+    assert event["type"] == "error"
+    assert "JSON object" in event["message"]
+
+
+def test_stream_websocket_rejects_invalid_ask_without_closing(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/stream") as ws:
+            ws.send_json({"type": "ask", "thread_id": "missing-text"})
+            first = ws.receive_json()
+            ws.send_json({"type": "unknown"})
+            second = ws.receive_json()
+
+    assert first["type"] == "error"
+    assert "Invalid ask payload" in first["message"]
+    assert second["type"] == "error"
+    assert "Unsupported message type" in second["message"]
+
+
 def test_tts_websocket_can_send_binary_audio_frames(tmp_path):
     brain = Brain(
         BrainConfig(database_path=tmp_path / "brain.sqlite3"),
@@ -182,3 +220,37 @@ def test_tts_websocket_can_send_binary_audio_frames(tmp_path):
             assert ws.receive_bytes() == b"pcm-audio"
             assert ws.receive_json()["type"] == "tts.done"
             assert ws.receive_json()["type"] == "tts.playlist.done"
+
+
+def test_tts_websocket_rejects_non_object_payload(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=FakeTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/tts") as ws:
+            ws.send_json(["bad"])
+            event = ws.receive_json()
+
+    assert event["type"] == "error"
+    assert "JSON object" in event["message"]
+
+
+def test_voice_websocket_rejects_non_object_text_payload(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice") as ws:
+            ws.send_text("[]")
+            event = ws.receive_json()
+
+    assert event["type"] == "error"
+    assert "JSON object" in event["message"]

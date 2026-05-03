@@ -10,6 +10,7 @@ import threading
 import wave
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -388,13 +389,9 @@ class PiperProcessTTS(PiperExecutableTTS):
 
     async def _close_process(self, key: tuple[Any, ...]) -> None:
         process = self._processes.pop(key, None)
-        if process is None or process.returncode is not None:
+        if process is None:
             return
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            process.kill()
+        await _terminate_process(process)
 
     async def _evict_process_pool(self, *, keep_key: tuple[Any, ...]) -> None:
         max_processes = self.config.process_pool_max
@@ -421,14 +418,10 @@ class PiperProcessTTS(PiperExecutableTTS):
         processes = list(self._processes.values())
         self._processes.clear()
         self._locks.clear()
-        for process in processes:
-            if process.returncode is not None:
-                continue
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                process.kill()
+        await asyncio.gather(
+            *(_terminate_process(process) for process in processes),
+            return_exceptions=True,
+        )
 
 
 class PiperHttpTTS(BaseTTSProvider):
@@ -448,6 +441,18 @@ class PiperHttpTTS(BaseTTSProvider):
                 text=text,
                 voice=options.get("voice"),
             )
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        process.kill()
+        with suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=2)
 
 
 class SentenceChunker:

@@ -116,17 +116,24 @@ class OpenAIGateway:
 
     async def _acquire_responses_websocket_slot(self) -> int:
         await self._responses_ws_slot_sem.acquire()
-        async with self._responses_ws_cursor_lock:
-            start = self._responses_ws_cursor
-            for offset in range(self.websocket_pool_size):
-                slot = (start + offset) % self.websocket_pool_size
-                lock = self._responses_ws_locks[slot]
-                if not lock.locked():
-                    await lock.acquire()
-                    self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
-                    return slot
-        self._responses_ws_slot_sem.release()
-        raise RuntimeError("No free responses websocket slot despite semaphore admit")
+        acquired_lock: asyncio.Lock | None = None
+        try:
+            async with self._responses_ws_cursor_lock:
+                start = self._responses_ws_cursor
+                for offset in range(self.websocket_pool_size):
+                    slot = (start + offset) % self.websocket_pool_size
+                    lock = self._responses_ws_locks[slot]
+                    if not lock.locked():
+                        await lock.acquire()
+                        acquired_lock = lock
+                        self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
+                        return slot
+            raise RuntimeError("No free responses websocket slot despite semaphore admit")
+        except BaseException:
+            if acquired_lock is not None and acquired_lock.locked():
+                acquired_lock.release()
+            self._responses_ws_slot_sem.release()
+            raise
 
     async def _ensure_responses_websocket(self, slot: int) -> Any:
         websocket = self._responses_ws_pool[slot]

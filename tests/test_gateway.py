@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -176,6 +177,33 @@ async def test_gateway_websocket_slot_reservation_locks_selected_slot():
     finally:
         gateway._responses_ws_locks[1].release()
         gateway._responses_ws_slot_sem.release()
+
+
+@pytest.mark.asyncio
+async def test_gateway_slot_acquire_releases_semaphore_when_cancelled():
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+
+    await gateway._responses_ws_cursor_lock.acquire()
+    task = asyncio.create_task(gateway._acquire_responses_websocket_slot())
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if getattr(gateway._responses_ws_slot_sem, "_value", None) == 0:
+            break
+    assert getattr(gateway._responses_ws_slot_sem, "_value", None) == 0
+
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        gateway._responses_ws_cursor_lock.release()
+
+    await asyncio.wait_for(gateway._responses_ws_slot_sem.acquire(), timeout=1)
+    gateway._responses_ws_slot_sem.release()
 
 
 @pytest.mark.asyncio

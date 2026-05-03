@@ -427,6 +427,34 @@ async def test_piper_process_pool_evicts_old_idle_process():
     assert new_key in provider._processes
 
 
+@pytest.mark.asyncio
+async def test_piper_process_close_terminates_processes_concurrently():
+    provider = PiperProcessTTS(TTSConfig(provider="null"))
+    active = 0
+    max_active = 0
+    lock = asyncio.Lock()
+
+    class ObservedProcess(FakeProcess):
+        async def wait(self):
+            nonlocal active, max_active
+            async with lock:
+                active += 1
+                max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            async with lock:
+                active -= 1
+            return self.returncode
+
+    provider._processes[("first",)] = ObservedProcess()
+    provider._processes[("second",)] = ObservedProcess()
+
+    await provider.close()
+
+    assert max_active == 2
+    assert provider._processes == {}
+    assert provider._locks == {}
+
+
 def test_tts_config_for_voice_resolves_requested_voice(tmp_path, monkeypatch):
     model = tmp_path / "voice.onnx"
     config_path = tmp_path / "voice.onnx.json"

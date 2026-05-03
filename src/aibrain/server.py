@@ -11,7 +11,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .autonomy import AutonomyAction, HeartbeatConfig
 from .config import BrainConfig, Persona
@@ -254,7 +254,22 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         try:
             while True:
                 payload = await websocket.receive_json()
-                request = TTSRequest.model_validate(payload)
+                if not isinstance(payload, dict):
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": "Expected a JSON object payload"},
+                    )
+                    continue
+                try:
+                    request = TTSRequest.model_validate(payload)
+                except ValidationError as exc:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": f"Invalid TTS payload: {exc.errors()[0]['msg']}"},
+                    )
+                    continue
                 async for event in app.state.brain.tts_stream(request.text, **request.options):
                     await _safe_send_event(
                         websocket,
@@ -323,6 +338,13 @@ async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool
     try:
         while True:
             payload = await websocket.receive_json()
+            if not isinstance(payload, dict):
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "message": "Expected a JSON object payload"},
+                )
+                continue
             message_type = payload.get("type", "ask")
             if message_type == "cancel":
                 active_task = await _cancel_task(
@@ -340,7 +362,15 @@ async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool
                         {"type": "error", "message": "Cannot run heartbeat while a turn is active"},
                     )
                     continue
-                request = HeartbeatRequest.model_validate(payload)
+                try:
+                    request = HeartbeatRequest.model_validate(payload)
+                except ValidationError as exc:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": f"Invalid heartbeat payload: {exc.errors()[0]['msg']}"},
+                    )
+                    continue
                 result = await brain.heartbeat_tick(
                     thread_id=request.thread_id,
                     persona=request.persona,
@@ -359,8 +389,16 @@ async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool
                     {"type": "error", "message": f"Unsupported message type: {message_type}"}
                 )
                 continue
+            try:
+                request = AskRequest.model_validate(payload)
+            except ValidationError as exc:
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "message": f"Invalid ask payload: {exc.errors()[0]['msg']}"},
+                )
+                continue
             active_task = await _cancel_task(active_task, websocket, send_lock, notify=False)
-            request = AskRequest.model_validate(payload)
             active_task = asyncio.create_task(
                 _send_brain_turn(brain, websocket, send_lock, request, default_tts=default_tts)
             )
@@ -405,11 +443,34 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
             text = message.get("text")
             if text is None:
                 continue
-            payload = json.loads(text)
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "message": "Invalid JSON payload"},
+                )
+                continue
+            if not isinstance(payload, dict):
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "message": "Expected a JSON object payload"},
+                )
+                continue
             message_type = payload.get("type", "audio.chunk")
             if message_type == "audio.start":
                 active_task = await _cancel_task(active_task, websocket, send_lock, notify=False)
-                session = VoiceStartRequest.model_validate(payload)
+                try:
+                    session = VoiceStartRequest.model_validate(payload)
+                except ValidationError as exc:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": f"Invalid audio.start payload: {exc.errors()[0]['msg']}"},
+                    )
+                    continue
                 if session.encoding != "pcm_s16le":
                     await _safe_send_json(
                         websocket,
@@ -470,7 +531,15 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
                     )
                 continue
             if message_type == "audio.chunk":
-                audio = base64.b64decode(payload.get("audio", ""))
+                try:
+                    audio = base64.b64decode(payload.get("audio", ""), validate=True)
+                except Exception:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": "Invalid base64 audio payload"},
+                    )
+                    continue
                 result = await _handle_voice_audio(websocket, send_lock, buffer, audio)
                 if result.speech_started and active_task is not None and not active_task.done():
                     active_task = await _cancel_task(active_task, websocket, send_lock, notify=True)
