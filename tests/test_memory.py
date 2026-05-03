@@ -59,7 +59,7 @@ async def test_memory_policy_reuses_one_query_embedding_across_scopes(tmp_path):
 
     records = await MemoryPolicy(top_k=3).retrieve(
         store,
-        "Find notes",
+        "Find note",
         thread=ThreadState(thread_id="thread-1", persona_id="riko"),
         persona_id="riko",
     )
