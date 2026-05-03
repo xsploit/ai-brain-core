@@ -111,7 +111,9 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
     app = FastAPI(title="AI Brain Core", version="0.1.0", lifespan=lifespan)
     app.state.brain = brain_instance
     app.state.models_cache = {"expires_at": 0.0, "ids": None}
+    app.state.models_cache_lock = asyncio.Lock()
     app.state.tts_voice_cache = None
+    app.state.tts_voice_lock = asyncio.Lock()
     webchat_dir = Path(__file__).with_name("webchat")
 
     if webchat_dir.exists():
@@ -138,6 +140,7 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         model_ids = await _list_openai_models(
             app.state.brain,
             cache=app.state.models_cache,
+            cache_lock=app.state.models_cache_lock,
             ttl_seconds=app.state.brain.config.models_cache_ttl_seconds,
         )
         default_model = app.state.brain.config.default_model
@@ -170,27 +173,18 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
 
     @app.post("/ask")
     async def ask(request: AskRequest) -> dict[str, Any]:
+        response = await app.state.brain.ask(
+            request.text,
+            thread_id=request.thread_id,
+            persona=request.persona,
+            images=request.images,
+            use_memory=request.use_memory,
+            tool_names=request.tool_names,
+            **request.options,
+        )
         if request.tts:
-            response = await app.state.brain.ask(
-                request.text,
-                thread_id=request.thread_id,
-                persona=request.persona,
-                images=request.images,
-                use_memory=request.use_memory,
-                tool_names=request.tool_names,
-                **request.options,
-            )
             audio = await app.state.brain.speak(response.text, **request.tts_options)
         else:
-            response = await app.state.brain.ask(
-                request.text,
-                thread_id=request.thread_id,
-                persona=request.persona,
-                images=request.images,
-                use_memory=request.use_memory,
-                tool_names=request.tool_names,
-                **request.options,
-            )
             audio = None
         return {
             "text": response.text,
@@ -240,9 +234,10 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         from .tts import discover_piper_voices
 
         if refresh or app.state.tts_voice_cache is None:
-            app.state.tts_voice_cache = [
-                voice.model_dump() for voice in discover_piper_voices()
-            ]
+            async with app.state.tts_voice_lock:
+                if refresh or app.state.tts_voice_cache is None:
+                    voices = await asyncio.to_thread(discover_piper_voices)
+                    app.state.tts_voice_cache = [voice.model_dump() for voice in voices]
         return list(app.state.tts_voice_cache)
 
     @app.websocket("/stream")
@@ -282,11 +277,20 @@ async def _list_openai_models(
     brain: Brain,
     *,
     cache: dict[str, Any] | None = None,
+    cache_lock: asyncio.Lock | None = None,
     ttl_seconds: int = 300,
 ) -> list[str]:
     now = time.monotonic()
     if cache is not None and cache.get("ids") is not None and cache.get("expires_at", 0) > now:
         return list(cache["ids"])
+    if cache_lock is not None:
+        async with cache_lock:
+            return await _list_openai_models(
+                brain,
+                cache=cache,
+                cache_lock=None,
+                ttl_seconds=ttl_seconds,
+            )
     try:
         result = await brain.client.models.list()
         ids = sorted(

@@ -138,14 +138,27 @@ class SQLiteThreadStore:
         openai_conversation_id: str | None = None,
         last_response_id: str | None = None,
     ) -> ThreadState:
+        now = utc_now()
+        sets = ["updated_at = ?"]
+        params: list[Any] = [now]
+        if openai_conversation_id is not None:
+            sets.append("openai_conversation_id = ?")
+            params.append(openai_conversation_id)
+        if last_response_id is not None:
+            sets.append("last_response_id = ?")
+            params.append(last_response_id)
+        params.append(thread_id)
+        with self._lock:
+            conn = self._connect()
+            cursor = conn.execute(
+                f"UPDATE brain_threads SET {', '.join(sets)} WHERE thread_id = ?",
+                params,
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown thread_id: {thread_id}")
         state = self.get(thread_id)
         if state is None:
             raise KeyError(f"Unknown thread_id: {thread_id}")
-        if openai_conversation_id is not None:
-            state.openai_conversation_id = openai_conversation_id
-        if last_response_id is not None:
-            state.last_response_id = last_response_id
-        self.upsert(state)
         return state
 
     def list(self, limit: int = 100) -> list[ThreadState]:

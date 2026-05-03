@@ -36,6 +36,7 @@ class SQLiteMemoryStore:
         self.embedding_provider = embedding_provider or HashEmbeddingProvider(dimensions)
         self.dimensions = dimensions
         self.sqlite_vec_enabled = False
+        self._vec_backfilled = False
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.RLock()
         self._init()
@@ -110,6 +111,7 @@ class SQLiteMemoryStore:
         with self._lock:
             conn = self._conn
             self._conn = None
+            self._vec_backfilled = False
             if conn is not None:
                 conn.close()
 
@@ -199,6 +201,8 @@ class SQLiteMemoryStore:
                     "INSERT INTO brain_memory_vec(rowid, embedding) VALUES (?, ?)",
                     (vector_rowid, json.dumps(embedding)),
                 )
+            else:
+                self._vec_backfilled = False
 
     async def search(
         self,
@@ -381,12 +385,14 @@ class SQLiteMemoryStore:
         return decorated
 
     def _backfill_sqlite_vec(self, conn: sqlite3.Connection) -> None:
-        if not self.sqlite_vec_enabled:
+        if not self.sqlite_vec_enabled or self._vec_backfilled:
             return
         rows = conn.execute(
             """
-            SELECT id, vector_rowid, embedding_json
-            FROM brain_memories
+            SELECT m.id, m.vector_rowid, m.embedding_json
+            FROM brain_memories m
+            LEFT JOIN brain_memory_vec v ON v.rowid = m.vector_rowid
+            WHERE m.vector_rowid IS NULL OR v.rowid IS NULL
             """
         ).fetchall()
         for row in rows:
@@ -407,6 +413,7 @@ class SQLiteMemoryStore:
                 "INSERT OR IGNORE INTO brain_memory_vec(rowid, embedding) VALUES (?, ?)",
                 (vector_rowid, row["embedding_json"]),
             )
+        self._vec_backfilled = True
 
     def forget(self, memory_id: str) -> bool:
         with self._lock:

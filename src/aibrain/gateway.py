@@ -27,6 +27,7 @@ class OpenAIGateway:
         self.websocket_pool_size = max(1, websocket_pool_size)
         self._responses_ws_pool: list[Any | None] = [None] * self.websocket_pool_size
         self._responses_ws_locks = [asyncio.Lock() for _ in range(self.websocket_pool_size)]
+        self._responses_ws_slot_sem = asyncio.Semaphore(self.websocket_pool_size)
         self._responses_ws_cursor = 0
         self._responses_ws_cursor_lock = asyncio.Lock()
 
@@ -48,8 +49,12 @@ class OpenAIGateway:
 
     async def warmup(self) -> None:
         if self.stream_transport == "websocket":
-            async with self._responses_ws_locks[0]:
-                await self._ensure_responses_websocket(0)
+            slot = await self._acquire_responses_websocket_slot()
+            try:
+                await self._ensure_responses_websocket(slot)
+            finally:
+                self._responses_ws_locks[slot].release()
+                self._responses_ws_slot_sem.release()
 
     async def _stream_response_websocket(self, params: dict[str, Any]) -> Any:
         slot = await self._acquire_responses_websocket_slot()
@@ -59,6 +64,7 @@ class OpenAIGateway:
         payload.pop("background", None)
         payload["type"] = "response.create"
         started = False
+        drained = False
         last_error: Exception | None = None
         try:
             for attempt in range(2):
@@ -69,7 +75,6 @@ class OpenAIGateway:
                         raw = await websocket.recv()
                         event = _json_event_to_namespace(json.loads(raw))
                         started = True
-                        yield event
                         event_type = getattr(event, "type", "")
                         if event_type in {
                             "response.completed",
@@ -77,6 +82,9 @@ class OpenAIGateway:
                             "response.cancelled",
                             "error",
                         }:
+                            drained = True
+                        yield event
+                        if drained:
                             return
                 except asyncio.CancelledError:
                     raise
@@ -89,7 +97,10 @@ class OpenAIGateway:
             if last_error is not None:
                 raise last_error
         finally:
+            if not drained:
+                await self._close_responses_websocket_slot(slot)
             lock.release()
+            self._responses_ws_slot_sem.release()
 
     async def _next_responses_websocket_slot(self) -> int:
         async with self._responses_ws_cursor_lock:
@@ -104,7 +115,7 @@ class OpenAIGateway:
             return slot
 
     async def _acquire_responses_websocket_slot(self) -> int:
-        wait_slot: int | None = None
+        await self._responses_ws_slot_sem.acquire()
         async with self._responses_ws_cursor_lock:
             start = self._responses_ws_cursor
             for offset in range(self.websocket_pool_size):
@@ -114,10 +125,8 @@ class OpenAIGateway:
                     await lock.acquire()
                     self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
                     return slot
-            wait_slot = start
-            self._responses_ws_cursor = (wait_slot + 1) % self.websocket_pool_size
-        await self._responses_ws_locks[wait_slot].acquire()
-        return wait_slot
+        self._responses_ws_slot_sem.release()
+        raise RuntimeError("No free responses websocket slot despite semaphore admit")
 
     async def _ensure_responses_websocket(self, slot: int) -> Any:
         websocket = self._responses_ws_pool[slot]

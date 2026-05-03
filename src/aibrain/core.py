@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import threading
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -77,6 +78,8 @@ class Brain:
         load_env_file(self.config.env_file)
         self._client = client
         self._openai = openai_gateway
+        self._client_lock = threading.Lock()
+        self._openai_lock = threading.Lock()
         self.thread_store = thread_store or SQLiteThreadStore(self.config.database_path)
         provider = embedding_provider or default_embedding_provider(
             self._get_client,
@@ -100,7 +103,9 @@ class Brain:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            self._client = AsyncOpenAI()
+            with self._client_lock:
+                if self._client is None:
+                    self._client = AsyncOpenAI()
         return self._client
 
     @property
@@ -110,11 +115,13 @@ class Brain:
     @property
     def openai(self) -> OpenAIGateway:
         if self._openai is None:
-            self._openai = OpenAIGateway(
-                self.client,
-                stream_transport=self.config.openai_stream_transport,
-                websocket_pool_size=self.config.openai_ws_pool_size,
-            )
+            with self._openai_lock:
+                if self._openai is None:
+                    self._openai = OpenAIGateway(
+                        self.client,
+                        stream_transport=self.config.openai_stream_transport,
+                        websocket_pool_size=self.config.openai_ws_pool_size,
+                    )
         return self._openai
 
     async def close(self) -> None:
@@ -971,7 +978,8 @@ class Brain:
             task_state = {}
             if state and isinstance(state.metadata.get(heartbeat_config.task_state_key), dict):
                 task_state = state.metadata[heartbeat_config.task_state_key]
-            heartbeat = load_heartbeat_file(
+            heartbeat = await asyncio.to_thread(
+                load_heartbeat_file,
                 heartbeat_config.heartbeat_path,
                 task_state=task_state,
                 skip_empty_file=heartbeat_config.skip_empty_file,
@@ -1365,7 +1373,7 @@ class Brain:
             return
         conversation_id = self._extract_conversation_id(response, state)
         response_id = getattr(response, "id", None)
-        self.thread_store.update_remote_ids(
+        updated_state = self.thread_store.update_remote_ids(
             state.thread_id,
             openai_conversation_id=conversation_id,
             last_response_id=response_id,
@@ -1373,6 +1381,7 @@ class Brain:
         state.openai_conversation_id = conversation_id
         if response_id is not None:
             state.last_response_id = response_id
+        state.updated_at = updated_state.updated_at
 
     def _normalize_stream_event(self, event: Any) -> BrainEvent | None:
         event_type = getattr(event, "type", "")

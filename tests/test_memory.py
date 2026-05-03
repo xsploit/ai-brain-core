@@ -197,3 +197,73 @@ def test_thread_store_reuses_connection_and_closes(tmp_path):
 
     store.close()
     assert store._conn is None
+
+
+def test_thread_store_update_remote_ids_uses_column_update(tmp_path, monkeypatch):
+    store = SQLiteThreadStore(tmp_path / "brain.sqlite3")
+    store.create("persona", thread_id="thread-ids", metadata={"keep": True})
+
+    def fail_upsert(state):
+        raise AssertionError("update_remote_ids should not rewrite the whole thread row")
+
+    monkeypatch.setattr(store, "upsert", fail_upsert)
+
+    updated = store.update_remote_ids(
+        "thread-ids",
+        openai_conversation_id="conv_1",
+        last_response_id="resp_1",
+    )
+    stored = store.get("thread-ids")
+
+    assert updated.openai_conversation_id == "conv_1"
+    assert updated.last_response_id == "resp_1"
+    assert stored is not None
+    assert stored.metadata == {"keep": True}
+
+
+def test_memory_vec_backfill_targets_missing_vector_rows(tmp_path):
+    store = SQLiteMemoryStore(
+        tmp_path / "brain.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=1),
+        dimensions=1,
+    )
+    conn = store._connect()
+    conn.execute("CREATE TABLE IF NOT EXISTS brain_memory_vec(rowid INTEGER PRIMARY KEY, embedding TEXT)")
+    conn.execute(
+        """
+        INSERT INTO brain_memories (
+            id, vector_rowid, scope, content, metadata_json, importance,
+            embedding_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("has-vector", 7, "global", "already indexed", "{}", 0.5, "[0.1]", "now", "now"),
+    )
+    conn.execute(
+        "INSERT INTO brain_memory_vec(rowid, embedding) VALUES (?, ?)",
+        (7, "[0.1]"),
+    )
+    conn.execute(
+        """
+        INSERT INTO brain_memories (
+            id, vector_rowid, scope, content, metadata_json, importance,
+            embedding_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("needs-vector", None, "global", "needs index", "{}", 0.5, "[0.2]", "now", "now"),
+    )
+    store.sqlite_vec_enabled = True
+
+    store._backfill_sqlite_vec(conn)
+
+    rows = conn.execute("SELECT rowid FROM brain_memory_vec ORDER BY rowid").fetchall()
+    missing = conn.execute(
+        "SELECT vector_rowid FROM brain_memories WHERE id = ?",
+        ("needs-vector",),
+    ).fetchone()
+
+    assert len(rows) == 2
+    assert 7 in {row["rowid"] for row in rows}
+    assert missing["vector_rowid"] is not None
+    assert store._vec_backfilled is True

@@ -175,6 +175,7 @@ async def test_gateway_websocket_slot_reservation_locks_selected_slot():
         assert gateway._responses_ws_locks[1].locked()
     finally:
         gateway._responses_ws_locks[1].release()
+        gateway._responses_ws_slot_sem.release()
 
 
 @pytest.mark.asyncio
@@ -262,3 +263,32 @@ async def test_gateway_does_not_retry_after_stream_started(monkeypatch):
     with pytest.raises(RuntimeError, match="drop"):
         await anext(stream)
     assert second.sent == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_closes_websocket_when_stream_is_abandoned(monkeypatch):
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+    socket = FakeWebSocket(
+        recv_items=[
+            '{"type":"response.output_text.delta","delta":"hi"}',
+            '{"type":"response.completed","response":{"id":"resp_1","output":[]}}',
+        ]
+    )
+
+    async def connect():
+        return socket
+
+    monkeypatch.setattr(gateway, "_connect_responses_websocket", connect)
+
+    stream = gateway._stream_response_websocket({"model": "gpt"})
+    event = await anext(stream)
+    assert event.type == "response.output_text.delta"
+
+    await stream.aclose()
+
+    assert socket.close_calls == 1
+    assert gateway._responses_ws_pool[0] is None
