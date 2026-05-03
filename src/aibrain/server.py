@@ -253,7 +253,15 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         send_lock = asyncio.Lock()
         try:
             while True:
-                payload = await websocket.receive_json()
+                try:
+                    payload = await websocket.receive_json()
+                except json.JSONDecodeError:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "message": "Invalid JSON payload"},
+                    )
+                    continue
                 if not isinstance(payload, dict):
                     await _safe_send_json(
                         websocket,
@@ -337,7 +345,15 @@ async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool
     active_task: asyncio.Task[None] | None = None
     try:
         while True:
-            payload = await websocket.receive_json()
+            try:
+                payload = await websocket.receive_json()
+            except json.JSONDecodeError:
+                await _safe_send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "message": "Invalid JSON payload"},
+                )
+                continue
             if not isinstance(payload, dict):
                 await _safe_send_json(
                     websocket,
