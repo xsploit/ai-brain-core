@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -128,6 +129,10 @@ def test_split_tts_text_keeps_sentence_chunks():
     ]
 
 
+def test_split_tts_text_returns_no_chunks_for_empty_text():
+    assert split_tts_text("   ", TTSConfig(provider="null")) == []
+
+
 def test_piper_env_overrides(monkeypatch):
     config = TTSConfig(
         piper_executable_path="C:/piper/piper.exe",
@@ -157,9 +162,76 @@ def test_default_piper_config_matches_explicit_model_env(tmp_path, monkeypatch):
     assert config.resolved_sample_rate() == 22050
 
 
+def test_tts_defaults_do_not_use_user_specific_paths(monkeypatch):
+    for name in [
+        "PIPER_EXE",
+        "PIPER_MODEL",
+        "PIPER_CONFIG",
+        "PIPER_ESPEAK_DATA",
+        "AIBRAIN_TTS_VOICE_ROOTS",
+        "AIBRAIN_TTS_MANIFESTS",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(tts_module.shutil, "which", lambda name: None)
+
+    config = TTSConfig(provider="null")
+
+    assert config.piper_executable_path is None
+    assert config.piper_model_path is None
+    assert config.piper_config_path is None
+    assert config.piper_espeak_data_path is None
+
+
+def test_tts_provider_env_controls_enabled(monkeypatch):
+    monkeypatch.setenv("AIBRAIN_TTS_PROVIDER", "null")
+    config = TTSConfig()
+    assert config.provider == "null"
+    assert config.enabled is False
+
+    monkeypatch.delenv("AIBRAIN_TTS_PROVIDER", raising=False)
+    monkeypatch.setenv("TTS_PROVIDER", "none")
+    legacy = TTSConfig()
+    assert legacy.provider == "null"
+    assert legacy.enabled is False
+
+
 def test_piper_idle_timeout_env_override(monkeypatch):
     monkeypatch.setenv("PIPER_PROCESS_IDLE_TIMEOUT", "0.7")
     assert TTSConfig(provider="null").process_idle_timeout == 0.7
+
+
+def test_discover_piper_voices_uses_env_roots_and_manifests(tmp_path, monkeypatch):
+    manifest_model = tmp_path / "manifest_voice.onnx"
+    manifest_config = tmp_path / "manifest_voice.onnx.json"
+    manifest_model.write_bytes(b"model")
+    manifest_config.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "slug": "manifest",
+                    "label": "Manifest",
+                    "onnx": str(manifest_model),
+                    "config": str(manifest_config),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    root = tmp_path / "voices"
+    root.mkdir()
+    rooted_model = root / "rooted.onnx"
+    rooted_config = root / "rooted.onnx.json"
+    rooted_model.write_bytes(b"model")
+    rooted_config.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    monkeypatch.setenv("AIBRAIN_TTS_MANIFESTS", str(manifest))
+    monkeypatch.setenv("AIBRAIN_TTS_VOICE_ROOTS", str(root))
+
+    voices = tts_module.discover_piper_voices()
+    slugs = {voice.slug for voice in voices}
+
+    assert {"manifest", "rooted"} <= slugs
 
 
 class FakePiperProcess(PiperProcessTTS):
@@ -180,6 +252,26 @@ class FakePiperProcess(PiperProcessTTS):
             text=text,
             voice=str(runtime_config.piper_model_path) if runtime_config.piper_model_path else None,
         )
+
+
+class PartialFailurePiperProcess(PiperProcessTTS):
+    def __init__(self):
+        super().__init__(TTSConfig(provider="null"))
+        self.fallback_calls = 0
+
+    async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        yield TTSChunk(
+            audio=b"partial",
+            sample_rate=22050,
+            index=start_index,
+            final=False,
+            text=text,
+        )
+        raise RuntimeError("process failed after audio")
+
+    async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
+        self.fallback_calls += 1
+        return b"fallback"
 
 
 class ConcurrentFakePiperProcess(PiperProcessTTS):
@@ -220,6 +312,18 @@ async def test_piper_process_stream_splits_multi_sentence_text():
 
     assert provider.segments == ["One sentence.", "Two sentence."]
     assert [chunk.index for chunk in chunks] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_piper_process_does_not_fallback_after_partial_audio():
+    provider = PartialFailurePiperProcess()
+    stream = provider.stream("One sentence.")
+
+    first = await anext(stream)
+    assert first.audio == b"partial"
+    with pytest.raises(RuntimeError, match="process failed"):
+        await anext(stream)
+    assert provider.fallback_calls == 0
 
 
 @pytest.mark.asyncio

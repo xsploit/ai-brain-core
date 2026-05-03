@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -35,12 +36,25 @@ class SQLiteMemoryStore:
         self.embedding_provider = embedding_provider or HashEmbeddingProvider(dimensions)
         self.dimensions = dimensions
         self.sqlite_vec_enabled = False
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        with self._lock:
+            if self._conn is None:
+                conn = sqlite3.connect(
+                    self.path,
+                    check_same_thread=False,
+                    isolation_level=None,
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                self._try_load_sqlite_vec(conn)
+                self._conn = conn
+            return self._conn
 
     def _try_load_sqlite_vec(self, conn: sqlite3.Connection) -> None:
         try:
@@ -53,8 +67,8 @@ class SQLiteMemoryStore:
             self.sqlite_vec_enabled = False
 
     def _init(self) -> None:
-        with self._connect() as conn:
-            self._try_load_sqlite_vec(conn)
+        with self._lock:
+            conn = self._connect()
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS brain_memories (
@@ -92,6 +106,13 @@ class SQLiteMemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_memories_persona ON brain_memories(persona_id)"
             )
 
+    def close(self) -> None:
+        with self._lock:
+            conn = self._conn
+            self._conn = None
+            if conn is not None:
+                conn.close()
+
     async def remember(
         self,
         content: str,
@@ -104,10 +125,47 @@ class SQLiteMemoryStore:
     ) -> MemoryRecord:
         now = utc_now()
         memory_id = str(uuid4())
-        vector_rowid = uuid4().int & 0x7FFFFFFFFFFFFFFF
+        vector_rowid = uuid4().int & 0x7FFFFFFFFFFFFFFF if self.sqlite_vec_enabled else None
         embedding = await self.embedding_provider.embed(content)
-        with self._connect() as conn:
-            self._try_load_sqlite_vec(conn)
+        await asyncio.to_thread(
+            self._remember_sync,
+            memory_id,
+            vector_rowid,
+            scope,
+            thread_id,
+            persona_id,
+            content,
+            metadata or {},
+            importance,
+            embedding,
+            now,
+        )
+        return MemoryRecord(
+            id=memory_id,
+            scope=scope,
+            thread_id=thread_id,
+            persona_id=persona_id,
+            content=content,
+            metadata=metadata or {},
+            importance=importance,
+            created_at=now,
+        )
+
+    def _remember_sync(
+        self,
+        memory_id: str,
+        vector_rowid: int | None,
+        scope: str,
+        thread_id: str | None,
+        persona_id: str | None,
+        content: str,
+        metadata: dict[str, Any],
+        importance: float,
+        embedding: list[float],
+        now: str,
+    ) -> None:
+        with self._lock:
+            conn = self._connect()
             conn.execute(
                 """
                 INSERT INTO brain_memories (
@@ -123,7 +181,7 @@ class SQLiteMemoryStore:
                     thread_id,
                     persona_id,
                     content,
-                    json.dumps(metadata or {}),
+                    json.dumps(metadata),
                     importance,
                     json.dumps(embedding),
                     now,
@@ -131,20 +189,16 @@ class SQLiteMemoryStore:
                 ),
             )
             if self.sqlite_vec_enabled:
+                if vector_rowid is None:
+                    vector_rowid = uuid4().int & 0x7FFFFFFFFFFFFFFF
+                    conn.execute(
+                        "UPDATE brain_memories SET vector_rowid = ? WHERE id = ?",
+                        (vector_rowid, memory_id),
+                    )
                 conn.execute(
                     "INSERT INTO brain_memory_vec(rowid, embedding) VALUES (?, ?)",
                     (vector_rowid, json.dumps(embedding)),
                 )
-        return MemoryRecord(
-            id=memory_id,
-            scope=scope,
-            thread_id=thread_id,
-            persona_id=persona_id,
-            content=content,
-            metadata=metadata or {},
-            importance=importance,
-            created_at=now,
-        )
 
     async def search(
         self,
@@ -175,8 +229,29 @@ class SQLiteMemoryStore:
         if persona_id is not None:
             where.append("(persona_id = ? OR persona_id IS NULL)")
             params.append(persona_id)
-        with self._connect() as conn:
-            self._try_load_sqlite_vec(conn)
+        return await asyncio.to_thread(
+            self._search_sync,
+            query_embedding,
+            where,
+            params,
+            metadata_filter,
+            top_k,
+            min_score,
+        )
+
+    def _search_sync(
+        self,
+        query_embedding: list[float],
+        where: list[str],
+        params: list[Any],
+        metadata_filter: dict[str, Any] | None,
+        top_k: int,
+        min_score: float,
+    ) -> list[MemoryRecord]:
+        with self._lock:
+            conn = self._connect()
+            if self.sqlite_vec_enabled:
+                self._backfill_sqlite_vec(conn)
             rows = self._search_rows_with_sqlite_vec(
                 conn,
                 query_embedding,
@@ -185,8 +260,7 @@ class SQLiteMemoryStore:
                 top_k,
             )
             if rows is None:
-                return await asyncio.to_thread(
-                    self._search_fallback_sync,
+                return self._search_fallback_sync(
                     query_embedding,
                     where,
                     params,
@@ -194,17 +268,16 @@ class SQLiteMemoryStore:
                     top_k,
                     min_score,
                 )
-
         scored: list[MemoryRecord] = []
         for row in rows:
             metadata = json.loads(row["metadata_json"] or "{}")
             if metadata_filter and not _metadata_matches(metadata, metadata_filter):
                 continue
-            embedding = json.loads(row["embedding_json"])
-            semantic_score = row["vec_score"] if "vec_score" in row.keys() else cosine_similarity(
-                query_embedding,
-                embedding,
-            )
+            if "vec_score" in row.keys():
+                semantic_score = row["vec_score"]
+            else:
+                embedding = json.loads(row["embedding_json"])
+                semantic_score = cosine_similarity(query_embedding, embedding)
             score = semantic_score * (0.5 + float(row["importance"]))
             if score < min_score:
                 continue
@@ -236,7 +309,8 @@ class SQLiteMemoryStore:
         top_k: int,
         min_score: float,
     ) -> list[MemoryRecord]:
-        with self._connect() as conn:
+        with self._lock:
+            conn = self._connect()
             sql = "SELECT * FROM brain_memories"
             if where:
                 sql += " WHERE " + " AND ".join(where)
@@ -306,9 +380,37 @@ class SQLiteMemoryStore:
             decorated.append(_DictRow(row_dict))
         return decorated
 
+    def _backfill_sqlite_vec(self, conn: sqlite3.Connection) -> None:
+        if not self.sqlite_vec_enabled:
+            return
+        rows = conn.execute(
+            """
+            SELECT id, vector_rowid, embedding_json
+            FROM brain_memories
+            """
+        ).fetchall()
+        for row in rows:
+            vector_rowid = row["vector_rowid"]
+            if vector_rowid is None:
+                vector_rowid = uuid4().int & 0x7FFFFFFFFFFFFFFF
+                conn.execute(
+                    "UPDATE brain_memories SET vector_rowid = ? WHERE id = ?",
+                    (vector_rowid, row["id"]),
+                )
+            exists = conn.execute(
+                "SELECT rowid FROM brain_memory_vec WHERE rowid = ?",
+                (vector_rowid,),
+            ).fetchone()
+            if exists:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO brain_memory_vec(rowid, embedding) VALUES (?, ?)",
+                (vector_rowid, row["embedding_json"]),
+            )
+
     def forget(self, memory_id: str) -> bool:
-        with self._connect() as conn:
-            self._try_load_sqlite_vec(conn)
+        with self._lock:
+            conn = self._connect()
             row = conn.execute(
                 "SELECT vector_rowid FROM brain_memories WHERE id = ?",
                 (memory_id,),

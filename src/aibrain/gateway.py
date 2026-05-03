@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -42,10 +43,8 @@ class OpenAIGateway:
         return self.client.responses.stream(**params)
 
     async def close(self) -> None:
-        websockets = [websocket for websocket in self._responses_ws_pool if websocket is not None]
-        self._responses_ws_pool = [None] * self.websocket_pool_size
-        for websocket in websockets:
-            await websocket.close()
+        for slot in range(self.websocket_pool_size):
+            await self._close_responses_websocket_slot(slot)
 
     async def warmup(self) -> None:
         if self.stream_transport == "websocket":
@@ -53,21 +52,44 @@ class OpenAIGateway:
                 await self._ensure_responses_websocket(0)
 
     async def _stream_response_websocket(self, params: dict[str, Any]) -> Any:
-        slot = await self._next_responses_websocket_slot()
-        async with self._responses_ws_locks[slot]:
-            websocket = await self._ensure_responses_websocket(slot)
-            payload = dict(params)
-            payload.pop("stream", None)
-            payload.pop("background", None)
-            payload["type"] = "response.create"
-            await websocket.send(json.dumps(payload))
-            while True:
-                raw = await websocket.recv()
-                event = _json_event_to_namespace(json.loads(raw))
-                yield event
-                event_type = getattr(event, "type", "")
-                if event_type in {"response.completed", "response.failed", "response.cancelled", "error"}:
-                    break
+        slot = await self._acquire_responses_websocket_slot()
+        lock = self._responses_ws_locks[slot]
+        payload = dict(params)
+        payload.pop("stream", None)
+        payload.pop("background", None)
+        payload["type"] = "response.create"
+        started = False
+        last_error: Exception | None = None
+        try:
+            for attempt in range(2):
+                try:
+                    websocket = await self._ensure_responses_websocket(slot)
+                    await websocket.send(json.dumps(payload))
+                    while True:
+                        raw = await websocket.recv()
+                        event = _json_event_to_namespace(json.loads(raw))
+                        started = True
+                        yield event
+                        event_type = getattr(event, "type", "")
+                        if event_type in {
+                            "response.completed",
+                            "response.failed",
+                            "response.cancelled",
+                            "error",
+                        }:
+                            return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    await self._close_responses_websocket_slot(slot)
+                    if started or attempt:
+                        raise
+                    continue
+            if last_error is not None:
+                raise last_error
+        finally:
+            lock.release()
 
     async def _next_responses_websocket_slot(self) -> int:
         async with self._responses_ws_cursor_lock:
@@ -81,19 +103,52 @@ class OpenAIGateway:
             self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
             return slot
 
+    async def _acquire_responses_websocket_slot(self) -> int:
+        wait_slot: int | None = None
+        async with self._responses_ws_cursor_lock:
+            start = self._responses_ws_cursor
+            for offset in range(self.websocket_pool_size):
+                slot = (start + offset) % self.websocket_pool_size
+                lock = self._responses_ws_locks[slot]
+                if not lock.locked():
+                    await lock.acquire()
+                    self._responses_ws_cursor = (slot + 1) % self.websocket_pool_size
+                    return slot
+            wait_slot = start
+            self._responses_ws_cursor = (wait_slot + 1) % self.websocket_pool_size
+        await self._responses_ws_locks[wait_slot].acquire()
+        return wait_slot
+
     async def _ensure_responses_websocket(self, slot: int) -> Any:
         websocket = self._responses_ws_pool[slot]
-        if websocket is not None:
+        if _websocket_is_open(websocket):
             return websocket
+        await self._close_responses_websocket_slot(slot)
+        websocket = await self._connect_responses_websocket()
+        self._responses_ws_pool[slot] = websocket
+        return websocket
+
+    async def _connect_responses_websocket(self) -> Any:
         import websockets
 
-        websocket = await websockets.connect(
+        return await websockets.connect(
             _responses_websocket_url(self.client),
             additional_headers=_websocket_headers(self.client),
             max_size=None,
         )
-        self._responses_ws_pool[slot] = websocket
-        return websocket
+
+    async def _close_responses_websocket_slot(self, slot: int) -> None:
+        websocket = self._responses_ws_pool[slot]
+        self._responses_ws_pool[slot] = None
+        if websocket is None:
+            return
+        close = getattr(websocket, "close", None)
+        if close is None:
+            return
+        result = close()
+        if hasattr(result, "__await__"):
+            with suppress(Exception):
+                await result
 
     async def parse_response(self, *, text_format: type[Any], **params: Any) -> Any:
         return await self.client.responses.parse(text_format=text_format, **params)
@@ -183,6 +238,20 @@ def _websocket_headers(client: Any) -> dict[str, str]:
     if api_key and "Authorization" not in headers:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+def _websocket_is_open(websocket: Any | None) -> bool:
+    if websocket is None:
+        return False
+    if getattr(websocket, "closed", False):
+        return False
+    if getattr(websocket, "close_code", None) is not None:
+        return False
+    state = getattr(websocket, "state", None)
+    state_name = str(getattr(state, "name", state)).lower()
+    if state_name in {"closing", "closed"}:
+        return False
+    return True
 
 
 def _json_event_to_namespace(value: Any) -> Any:

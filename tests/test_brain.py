@@ -4,6 +4,7 @@ import asyncio
 import pytest
 
 from aibrain import Brain, BrainConfig, Persona
+from aibrain.types import ThreadState
 
 
 class FakeConversations:
@@ -28,6 +29,44 @@ class FakeResponses:
             conversation=kwargs.get("conversation"),
             usage=None,
         )
+
+
+class FakeStreamResponses:
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class Stream:
+            async def __aiter__(self_inner):
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(
+                        id=f"resp_stream_{len(self.calls)}",
+                        output=[
+                            SimpleNamespace(
+                                type="function_call",
+                                name="slow_a",
+                                call_id="call_a",
+                                arguments="{}",
+                            ),
+                            SimpleNamespace(
+                                type="function_call",
+                                name="slow_b",
+                                call_id="call_b",
+                                arguments="{}",
+                            ),
+                        ]
+                        if len(self.calls) == 1
+                        else [],
+                        output_text="" if len(self.calls) == 1 else "done",
+                        conversation=kwargs.get("conversation"),
+                        usage=None,
+                    ),
+                )
+
+        return Stream()
 
 
 class FakeOpenAI:
@@ -132,3 +171,188 @@ async def test_same_thread_turns_serialize_remote_conversation_creation(tmp_path
 
     assert len(client.conversations.calls) == 1
     assert [response.conversation_id for response in responses] == ["conv_shared", "conv_shared"]
+
+
+def test_update_thread_after_response_does_not_clobber_last_response_with_none(tmp_path):
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=FakeOpenAI())
+    state = ThreadState(
+        thread_id="thread-state",
+        persona_id="persona",
+        openai_conversation_id="conv_existing",
+        last_response_id="resp_existing",
+    )
+    brain.thread_store.upsert(state)
+
+    brain._update_thread_after_response(
+        state,
+        SimpleNamespace(id=None, conversation=None),
+    )
+
+    assert state.last_response_id == "resp_existing"
+    assert brain.thread_store.get("thread-state").last_response_id == "resp_existing"
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_run_concurrently_and_preserve_output_order(tmp_path):
+    client = FakeOpenAI()
+
+    async def create(**kwargs):
+        client.responses.calls.append(kwargs)
+        if len(client.responses.calls) == 1:
+            return SimpleNamespace(
+                id="resp_tools",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="slow_a",
+                        call_id="call_a",
+                        arguments="{}",
+                    ),
+                    SimpleNamespace(
+                        type="function_call",
+                        name="slow_b",
+                        call_id="call_b",
+                        arguments="{}",
+                    ),
+                ],
+                output_text="",
+                conversation=kwargs.get("conversation"),
+                usage=None,
+            )
+        return SimpleNamespace(
+            id="resp_final",
+            output=[],
+            output_text="done",
+            conversation=kwargs.get("conversation"),
+            usage=None,
+        )
+
+    client.responses.create = create
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    active = 0
+    max_active = 0
+    lock = asyncio.Lock()
+
+    async def run_tool(name):
+        nonlocal active, max_active
+        async with lock:
+            active += 1
+            max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        async with lock:
+            active -= 1
+        return name
+
+    @brain.tools.register
+    async def slow_a() -> str:
+        return await run_tool("a")
+
+    @brain.tools.register
+    async def slow_b() -> str:
+        return await run_tool("b")
+
+    response = await brain.ask(
+        "call both",
+        thread_id="thread-parallel-tools",
+        tool_names=["slow_a", "slow_b"],
+    )
+
+    assert response.text == "done"
+    assert max_active == 2
+    assert [item["call_id"] for item in response.tool_results] == ["call_a", "call_b"]
+    assert [item["call_id"] for item in client.responses.calls[1]["input"]] == [
+        "call_a",
+        "call_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_calls_emit_calls_before_parallel_results(tmp_path):
+    client = FakeOpenAI()
+    client.responses = FakeStreamResponses()
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+
+    @brain.tools.register
+    async def slow_a() -> str:
+        await asyncio.sleep(0.02)
+        return "a"
+
+    @brain.tools.register
+    async def slow_b() -> str:
+        await asyncio.sleep(0.01)
+        return "b"
+
+    events = [
+        event
+        async for event in brain.stream(
+            "call both",
+            thread_id="thread-stream-tools",
+            tool_names=["slow_a", "slow_b"],
+        )
+    ]
+    event_types = [event.type for event in events]
+
+    first_result = event_types.index("tool.result")
+    assert event_types[:first_result].count("tool.call") == 2
+    assert [item["call_id"] for item in client.responses.calls[1]["input"]] == [
+        "call_a",
+        "call_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_failure_does_not_cancel_other_tool(tmp_path):
+    client = FakeOpenAI()
+
+    async def create(**kwargs):
+        client.responses.calls.append(kwargs)
+        if len(client.responses.calls) == 1:
+            return SimpleNamespace(
+                id="resp_tools",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="fail_tool",
+                        call_id="call_fail",
+                        arguments="{}",
+                    ),
+                    SimpleNamespace(
+                        type="function_call",
+                        name="ok_tool",
+                        call_id="call_ok",
+                        arguments="{}",
+                    ),
+                ],
+                output_text="",
+                conversation=kwargs.get("conversation"),
+                usage=None,
+            )
+        return SimpleNamespace(
+            id="resp_final",
+            output=[],
+            output_text="done",
+            conversation=kwargs.get("conversation"),
+            usage=None,
+        )
+
+    client.responses.create = create
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+
+    @brain.tools.register
+    async def fail_tool() -> str:
+        raise RuntimeError("boom")
+
+    @brain.tools.register
+    async def ok_tool() -> str:
+        await asyncio.sleep(0.01)
+        return "ok"
+
+    response = await brain.ask(
+        "call both",
+        thread_id="thread-tool-failure",
+        tool_names=["fail_tool", "ok_tool"],
+    )
+
+    by_call_id = {item["call_id"]: item for item in response.tool_results}
+    assert by_call_id["call_fail"]["ok"] is False
+    assert by_call_id["call_ok"]["ok"] is True

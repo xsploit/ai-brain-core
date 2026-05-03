@@ -68,7 +68,7 @@ class STTResult(BaseModel):
 
 @dataclass(slots=True)
 class AudioData:
-    samples: list[float]
+    samples: Any
     sample_rate: int
     channels: int = 1
     encoding: str = "float32"
@@ -228,6 +228,9 @@ class BaseVAD:
     ) -> bool:
         raise NotImplementedError
 
+    async def warmup(self) -> None:
+        return None
+
 
 class NoVAD(BaseVAD):
     def is_speech(
@@ -258,9 +261,14 @@ class EnergyVAD(BaseVAD):
             sample_rate=sample_rate,
             channels=channels,
         ).samples
-        if not samples:
+        if len(samples) == 0:
             return False
-        rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+        try:
+            import numpy as np
+
+            rms = float(np.sqrt(np.mean(np.asarray(samples, dtype=np.float32) ** 2)))
+        except ImportError:
+            rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
         return rms >= self.config.threshold
 
 
@@ -296,6 +304,9 @@ class SileroVAD(BaseVAD):
             threshold=self.config.threshold,
         )
         return bool(timestamps)
+
+    async def warmup(self) -> None:
+        await asyncio.to_thread(self._ensure_model)
 
     def _ensure_model(self) -> tuple[Any, Any]:
         if self._model is not None and self._get_speech_timestamps is not None:
@@ -363,6 +374,9 @@ class UtteranceBuffer:
         if self._in_speech and self._should_end():
             return self._finalize(speech_detected=detected, started=started)
         return VADFrameResult(speech_detected=detected, speech_started=started)
+
+    async def push_async(self, audio: bytes) -> VADFrameResult:
+        return await asyncio.to_thread(self.push, audio)
 
     def flush(self) -> VADFrameResult:
         if not self._in_speech:
@@ -490,14 +504,24 @@ def decode_with_soundfile(audio: bytes, *, format: str | None = None) -> AudioDa
         mono = data[:, 0]
     else:
         mono = data.mean(axis=1)
-    return AudioData(samples=[float(value) for value in mono], sample_rate=int(sample_rate), channels=1)
+    return AudioData(samples=mono, sample_rate=int(sample_rate), channels=1)
 
 
-def pcm_s16le_to_float32(audio: bytes, *, channels: int = 1) -> list[float]:
+def pcm_s16le_to_float32(audio: bytes, *, channels: int = 1) -> Any:
     if not audio:
         return []
     if len(audio) % 2:
         audio = audio[:-1]
+    try:
+        import numpy as np
+
+        values = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+        if channels > 1:
+            frame_count = len(values) // channels
+            values = values[: frame_count * channels].reshape(frame_count, channels).mean(axis=1)
+        return np.clip(values / 32768.0, -1.0, 1.0)
+    except ImportError:
+        pass
     values = array("h")
     values.frombytes(audio)
     if sys.byteorder != "little":
@@ -522,12 +546,20 @@ def audio_to_numpy(audio: AudioData) -> Any:
     return np.asarray(audio.samples, dtype=np.float32)
 
 
-def resample_linear(samples: list[float], source_rate: int, target_rate: int) -> list[float]:
-    if source_rate <= 0 or target_rate <= 0 or source_rate == target_rate or not samples:
+def resample_linear(samples: Any, source_rate: int, target_rate: int) -> Any:
+    if source_rate <= 0 or target_rate <= 0 or source_rate == target_rate or len(samples) == 0:
         return samples
     target_len = max(1, int(round(len(samples) * target_rate / source_rate)))
     if target_len == 1:
         return [samples[0]]
+    try:
+        import numpy as np
+
+        source = np.asarray(samples, dtype=np.float32)
+        positions = np.linspace(0, len(source) - 1, target_len)
+        return np.interp(positions, np.arange(len(source)), source).astype(np.float32)
+    except ImportError:
+        pass
     scale = (len(samples) - 1) / (target_len - 1)
     output = []
     for index in range(target_len):

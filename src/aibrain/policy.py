@@ -62,26 +62,25 @@ class MemoryPolicy(BaseModel):
         query_embedding: list[float] | None = None
         if hasattr(memory_store, "embed_query"):
             query_embedding = await memory_store.embed_query(query)
-        for scope in self.scopes:
-            thread_id = thread.thread_id if thread and scope == "thread" else None
-            scope_persona_id = persona_id if scope in {"thread", "persona"} else None
-            search_kwargs = {
-                "top_k": per_scope,
-                "min_score": self.min_score,
-                "scope": scope,
-                "thread_id": thread_id,
-                "persona_id": scope_persona_id,
-                "metadata_filter": self.metadata_filter,
-            }
-            if query_embedding is not None:
-                search_kwargs["query_embedding"] = query_embedding
-            try:
-                results = await memory_store.search(query, **search_kwargs)
-            except TypeError:
-                search_kwargs.pop("query_embedding", None)
-                results = await memory_store.search(query, **search_kwargs)
-            for record in results:
-                collected[record.id] = record
+        search_kwargs = {
+            "top_k": per_scope * max(1, len(self.scopes)),
+            "min_score": self.min_score,
+            "scope": list(self.scopes),
+            "thread_id": thread.thread_id if thread and "thread" in self.scopes else None,
+            "persona_id": persona_id
+            if any(scope in {"thread", "persona"} for scope in self.scopes)
+            else None,
+            "metadata_filter": self.metadata_filter,
+        }
+        if query_embedding is not None:
+            search_kwargs["query_embedding"] = query_embedding
+        try:
+            results = await memory_store.search(query, **search_kwargs)
+        except TypeError:
+            search_kwargs.pop("query_embedding", None)
+            results = await memory_store.search(query, **search_kwargs)
+        for record in results:
+            collected[record.id] = record
         records = sorted(collected.values(), key=lambda record: record.score, reverse=True)
         return records[: self.top_k]
 

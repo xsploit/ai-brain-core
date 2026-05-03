@@ -6,7 +6,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse
@@ -19,6 +19,9 @@ from .core import Brain
 from .inputs import ImageInput
 from .policy import MemoryPolicy
 from .stt import AudioEncoding, VADConfig, decode_audio_base64
+
+
+AudioTransport = Literal["json_base64", "binary"]
 
 
 class ThreadRequest(BaseModel):
@@ -37,12 +40,14 @@ class AskRequest(BaseModel):
     tool_names: list[str] | None = None
     tts: bool = False
     tts_options: dict[str, Any] = Field(default_factory=dict)
+    audio_transport: AudioTransport = "json_base64"
     options: dict[str, Any] = Field(default_factory=dict)
 
 
 class TTSRequest(BaseModel):
     text: str
     options: dict[str, Any] = Field(default_factory=dict)
+    audio_transport: AudioTransport = "json_base64"
 
 
 class STTRequest(BaseModel):
@@ -68,6 +73,7 @@ class VoiceStartRequest(BaseModel):
     vad: VADConfig | dict[str, Any] | None = None
     stt_options: dict[str, Any] = Field(default_factory=dict)
     tts_options: dict[str, Any] = Field(default_factory=dict)
+    audio_transport: AudioTransport = "json_base64"
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -206,7 +212,7 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
 
     @app.post("/stt")
     async def stt(request: STTRequest) -> dict[str, Any]:
-        audio = decode_audio_base64(request.audio)
+        audio = await asyncio.to_thread(decode_audio_base64, request.audio)
         result = await app.state.brain.transcribe(
             audio,
             format=request.format,
@@ -246,12 +252,18 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
     @app.websocket("/tts")
     async def tts_socket(websocket: WebSocket) -> None:
         await websocket.accept()
+        send_lock = asyncio.Lock()
         try:
             while True:
                 payload = await websocket.receive_json()
                 request = TTSRequest.model_validate(payload)
                 async for event in app.state.brain.tts_stream(request.text, **request.options):
-                    await websocket.send_json(event.model_dump())
+                    await _safe_send_event(
+                        websocket,
+                        send_lock,
+                        event.model_dump(),
+                        audio_transport=request.audio_transport,
+                    )
         except WebSocketDisconnect:
             return
 
@@ -484,6 +496,28 @@ async def _safe_send_json(
         await websocket.send_json(payload)
 
 
+async def _safe_send_event(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    payload: dict[str, Any],
+    *,
+    audio_transport: AudioTransport = "json_base64",
+) -> None:
+    if payload.get("type") != "tts.audio" or audio_transport != "binary":
+        if payload.get("type") == "tts.audio":
+            payload = {**payload, "audio_transport": "json_base64"}
+        await _safe_send_json(websocket, send_lock, payload)
+        return
+
+    audio_b64 = payload.pop("audio", "")
+    audio = base64.b64decode(audio_b64) if audio_b64 else b""
+    payload.update({"audio_transport": "binary", "binary_bytes": len(audio)})
+    async with send_lock:
+        await websocket.send_json(payload)
+        if audio:
+            await websocket.send_bytes(audio)
+
+
 async def _cancel_task(
     task: asyncio.Task[None] | None,
     websocket: WebSocket,
@@ -547,7 +581,12 @@ async def _send_brain_turn(
     )
     try:
         async for event in event_stream:
-            await _safe_send_json(websocket, send_lock, event.model_dump())
+            await _safe_send_event(
+                websocket,
+                send_lock,
+                event.model_dump(),
+                audio_transport=request.audio_transport,
+            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -560,7 +599,10 @@ async def _handle_voice_audio(
     buffer: Any,
     audio: bytes,
 ) -> Any:
-    result = buffer.push(audio)
+    if hasattr(buffer, "push_async"):
+        result = await buffer.push_async(audio)
+    else:
+        result = await asyncio.to_thread(buffer.push, audio)
     if result.speech_started:
         await _safe_send_json(websocket, send_lock, {"type": "vad.speech.start"})
     if result.speech_ended:
@@ -610,7 +652,12 @@ async def _run_voice_turn(
             tool_names=session.tool_names,
             **session.options,
         ):
-            await _safe_send_json(websocket, send_lock, event.model_dump())
+            await _safe_send_event(
+                websocket,
+                send_lock,
+                event.model_dump(),
+                audio_transport=session.audio_transport,
+            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:

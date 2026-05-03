@@ -22,6 +22,8 @@ class BrainTool:
     parameters: JsonDict
     strict: bool = False
     timeout_seconds: float | None = None
+    accepts_context: bool = False
+    is_coroutine_function: bool = False
 
     def schema(self) -> JsonDict:
         return {
@@ -63,12 +65,16 @@ def _annotation_to_schema(annotation: Any) -> JsonDict:
     return {"type": "string"}
 
 
-def _parameters_from_function(func: Callable[..., Any]) -> JsonDict:
-    signature = inspect.signature(func)
+def _parameters_from_signature(signature: inspect.Signature) -> JsonDict:
     properties: JsonDict = {}
     required: list[str] = []
     for name, parameter in signature.parameters.items():
         if name == "context":
+            continue
+        if parameter.kind in {
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }:
             continue
         properties[name] = _annotation_to_schema(parameter.annotation)
         if parameter.default is inspect.Signature.empty:
@@ -98,13 +104,16 @@ class ToolRegistry:
         def decorator(target: Callable[..., Any]) -> Callable[..., Any]:
             tool_name = name or target.__name__
             doc = inspect.getdoc(target) or ""
+            signature = inspect.signature(target)
             self._tools[tool_name] = BrainTool(
                 name=tool_name,
                 description=description or doc or tool_name,
                 func=target,
-                parameters=parameters or _parameters_from_function(target),
+                parameters=parameters or _parameters_from_signature(signature),
                 strict=strict,
                 timeout_seconds=timeout_seconds,
+                accepts_context="context" in signature.parameters,
+                is_coroutine_function=inspect.iscoroutinefunction(target),
             )
             return target
 
@@ -132,11 +141,11 @@ class ToolRegistry:
             arguments = json.loads(arguments_json or "{}")
         else:
             arguments = dict(arguments_json)
-        if "context" in inspect.signature(tool.func).parameters:
-            arguments["context"] = context
+        if tool.accepts_context:
+            arguments.setdefault("context", context)
 
         async def run() -> Any:
-            if inspect.iscoroutinefunction(tool.func):
+            if tool.is_coroutine_function:
                 result = await tool.func(**arguments)
             else:
                 result = await asyncio.to_thread(tool.func, **arguments)

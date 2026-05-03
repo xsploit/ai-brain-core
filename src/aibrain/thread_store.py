@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,15 +19,27 @@ class SQLiteThreadStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        if self._conn is None:
+            conn = sqlite3.connect(
+                self.path,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn = conn
+        return self._conn
 
     def _init(self) -> None:
-        with self._connect() as conn:
+        with self._lock:
+            conn = self._connect()
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS brain_threads (
@@ -40,6 +53,13 @@ class SQLiteThreadStore:
                 )
                 """
             )
+
+    def close(self) -> None:
+        with self._lock:
+            conn = self._conn
+            self._conn = None
+            if conn is not None:
+                conn.close()
 
     def create(
         self,
@@ -61,7 +81,8 @@ class SQLiteThreadStore:
         return state
 
     def get(self, thread_id: str) -> ThreadState | None:
-        with self._connect() as conn:
+        with self._lock:
+            conn = self._connect()
             row = conn.execute(
                 "SELECT * FROM brain_threads WHERE thread_id = ?",
                 (thread_id,),
@@ -83,7 +104,8 @@ class SQLiteThreadStore:
         state.updated_at = now
         if state.created_at is None:
             state.created_at = now
-        with self._connect() as conn:
+        with self._lock:
+            conn = self._connect()
             conn.execute(
                 """
                 INSERT INTO brain_threads (
@@ -127,7 +149,8 @@ class SQLiteThreadStore:
         return state
 
     def list(self, limit: int = 100) -> list[ThreadState]:
-        with self._connect() as conn:
+        with self._lock:
+            conn = self._connect()
             rows = conn.execute(
                 "SELECT * FROM brain_threads ORDER BY updated_at DESC LIMIT ?",
                 (limit,),

@@ -21,7 +21,8 @@ from aibrain import (
     VADConfig,
 )
 from aibrain.server import create_app
-from aibrain.stt import decode_wav_bytes, pcm_s16le_to_float32
+from aibrain import stt as stt_module
+from aibrain.stt import decode_wav_bytes, pcm_s16le_to_float32, resample_linear
 
 
 def pcm(samples: list[int]) -> bytes:
@@ -51,6 +52,17 @@ class FakeSTT(BaseSTTProvider):
 class FakeTTS(BaseTTSProvider):
     async def stream(self, text: str, **options):
         yield TTSChunk(audio=b"audio:" + text.encode(), sample_rate=16000, final=True)
+
+
+class FakeVAD:
+    def __init__(self):
+        self.warmed = False
+
+    async def warmup(self):
+        self.warmed = True
+
+    def is_speech(self, audio: bytes, **kwargs):
+        return False
 
 
 class FakeStreamResponses:
@@ -99,6 +111,16 @@ def test_pcm_and_wav_decode():
     assert len(wav.samples) == 2
 
 
+def test_pcm_decode_and_resample_numpy_fast_path_matches_shape():
+    decoded = pcm_s16le_to_float32(pcm([0, 16384, -16384, 32767]), channels=1)
+    assert len(decoded) == 4
+    assert abs(float(decoded[1]) - 0.5) < 0.01
+
+    resampled = resample_linear(decoded, 16000, 8000)
+    assert len(resampled) == 2
+    assert abs(float(resampled[0])) < 0.01
+
+
 def test_utterance_buffer_vad_endpointing():
     config = VADConfig(
         provider="energy",
@@ -116,6 +138,40 @@ def test_utterance_buffer_vad_endpointing():
     second = buffer.push(pcm([0] * 1600))
     assert second.speech_ended
     assert second.utterance_audio is not None
+
+
+@pytest.mark.asyncio
+async def test_utterance_buffer_push_async_offloads_vad(monkeypatch):
+    calls = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(stt_module.asyncio, "to_thread", fake_to_thread)
+    buffer = UtteranceBuffer(
+        vad=EnergyVAD(VADConfig(provider="energy", threshold=0.01)),
+        sample_rate=16000,
+    )
+
+    await buffer.push_async(pcm([0] * 1600))
+
+    assert calls == ["push"]
+
+
+@pytest.mark.asyncio
+async def test_brain_warmup_warms_existing_vad(tmp_path):
+    vad = FakeVAD()
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=FakeSTT(),
+        vad_detector=vad,
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+
+    await brain.warmup(stt=True, tts=False)
+
+    assert vad.warmed is True
 
 
 @pytest.mark.asyncio

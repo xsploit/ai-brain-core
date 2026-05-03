@@ -86,8 +86,8 @@ $env:OPENAI_API_KEY="sk-..."
 Or point the brain at an existing `.env` file:
 
 ```powershell
-$env:AIBRAIN_ENV_FILE="C:\Users\SUBSECT\Documents\GitHub\dvb\.env"
-uv run aibrain serve --env-file "C:\Users\SUBSECT\Documents\GitHub\dvb\.env"
+$env:AIBRAIN_ENV_FILE="C:\path\to\.env"
+uv run aibrain serve --env-file "C:\path\to\.env"
 ```
 
 ## Minimal Usage
@@ -187,24 +187,19 @@ randomizes whether a scheduled tick wakes the model at all.
 
 ## Piper TTS
 
-By default the brain looks for:
-
-```text
-C:\Users\SUBSECT\Documents\GitHub\dvb\piper\piper.exe
-D:\TextyMcSpeechy\tts_dojo\...\tts_voices\...
-```
-
-Override with env vars:
+Configure Piper with env vars:
 
 ```powershell
 $env:AIBRAIN_TTS_VOICE="riko_fish_s2_200_rvc_32k_2259"
 $env:PIPER_EXE="C:\path\to\piper.exe"
 $env:PIPER_MODEL="C:\path\to\voice.onnx"
 $env:PIPER_CONFIG="C:\path\to\voice.onnx.json"
+$env:AIBRAIN_TTS_VOICE_ROOTS="D:\voices;D:\more-voices"
+$env:AIBRAIN_TTS_MANIFESTS="D:\voices\manifest.json"
 ```
 
-The runtime keeps the Piper executable/model process hot for the default voice.
-`GET /tts/voices` lists discovered Piper voices.
+The runtime keeps Piper processes hot per selected voice. `GET /tts/voices`
+lists voices from `AIBRAIN_TTS_VOICE_ROOTS` and `AIBRAIN_TTS_MANIFESTS`.
 
 Terminal smoke test with streaming text and immediate TTS playback:
 
@@ -226,6 +221,12 @@ first-audio latency without framework features adding work before the stream.
 
 Use `--audio-player none` to measure backend first-text/first-audio timing
 without local playback, or `--voice <slug>` to select a discovered Piper voice.
+
+Compare Responses HTTP/SSE and WebSocket latency:
+
+```powershell
+uv run aibrain bench --transport both --rounds 5 --fast --tts --env-file .env
+```
 
 Use text + audio streaming:
 
@@ -323,6 +324,8 @@ message with `"type": "heartbeat"` to `/brain` or `/stream`.
 Use `POST /stt` for base64 PCM/WAV/FLAC transcription. Use `/voice` for
 `audio.start` + binary PCM frames + `audio.stop`; finalized utterances emit
 `stt.final`, LLM streaming events, and ordered `tts.*` playlist events.
+For TTS output, clients can request `"audio_transport": "binary"` on `/brain`,
+`/stream`, `/tts`, or `/voice`; JSON/base64 remains the default.
 
 Send:
 

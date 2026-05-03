@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import uvicorn
@@ -149,6 +151,165 @@ async def tts(args: argparse.Namespace) -> None:
         await brain.close()
 
 
+@dataclass(slots=True)
+class BenchmarkTurn:
+    transport: str
+    round: int
+    prompt: str
+    first_text_ms: int | None = None
+    last_text_ms: int | None = None
+    response_done_ms: int | None = None
+    first_audio_ms: int | None = None
+    tts_done_ms: int | None = None
+    playback_done_ms: int | None = None
+    text_chunks: int = 0
+    audio_frames: int = 0
+    audio_bytes: int = 0
+
+
+async def bench(args: argparse.Namespace) -> None:
+    if not args.prompt:
+        args.prompt = ["hey"]
+    transports = ["http", "websocket"] if args.transport == "both" else [args.transport]
+    all_stats: list[BenchmarkTurn] = []
+    for transport in transports:
+        config_kwargs = _benchmark_config_kwargs(args, transport)
+        brain = Brain(BrainConfig(**config_kwargs))
+        audio_worker: AudioPlaybackWorker | None = None
+        tts_options = {"voice": args.voice} if args.voice else {}
+        try:
+            if args.tts and args.audio_player != "none":
+                player = create_audio_player(args.audio_player)
+                audio_worker = AudioPlaybackWorker(player)
+                await audio_worker.start()
+            await brain.warmup(openai=True, tts=args.tts, tts_options=tts_options)
+            for round_index in range(args.rounds):
+                prompt = args.prompt[round_index % len(args.prompt)]
+                stats = await _run_benchmark_turn(
+                    brain,
+                    prompt,
+                    transport=transport,
+                    round_index=round_index + 1,
+                    args=args,
+                    audio_worker=audio_worker,
+                    tts_options=tts_options,
+                )
+                all_stats.append(stats)
+                if not args.json:
+                    print(_format_benchmark_turn(stats), flush=True)
+        finally:
+            if audio_worker is not None:
+                await audio_worker.close()
+            await brain.close()
+    if args.json:
+        print(json.dumps([asdict(item) for item in all_stats], indent=2))
+
+
+async def _run_benchmark_turn(
+    brain: Brain,
+    prompt: str,
+    *,
+    transport: str,
+    round_index: int,
+    args: argparse.Namespace,
+    audio_worker: AudioPlaybackWorker | None,
+    tts_options: dict[str, Any],
+) -> BenchmarkTurn:
+    started_at = time.perf_counter()
+    stats = BenchmarkTurn(transport=transport, round=round_index, prompt=prompt)
+    audio_bytes_start = audio_worker.bytes if audio_worker is not None else 0
+    audio_frames_start = audio_worker.frames if audio_worker is not None else 0
+    stream_options = _benchmark_brain_options(args)
+    stream = (
+        brain.stream_with_tts(
+            prompt,
+            thread_id=f"bench:{transport}",
+            tts_options=tts_options,
+            use_memory=not args.fast,
+            **stream_options,
+        )
+        if args.tts
+        else brain.stream(
+            prompt,
+            thread_id=f"bench:{transport}",
+            use_memory=not args.fast,
+            **stream_options,
+        )
+    )
+    async for event in stream:
+        now_ms = int((time.perf_counter() - started_at) * 1000)
+        if event.type == "text.delta":
+            stats.text_chunks += 1
+            if stats.first_text_ms is None:
+                stats.first_text_ms = now_ms
+            stats.last_text_ms = now_ms
+        elif event.type == "response.done":
+            stats.response_done_ms = now_ms
+        elif event.type == "tts.audio":
+            if stats.first_audio_ms is None:
+                stats.first_audio_ms = now_ms
+            audio = event.data.get("audio", "")
+            if isinstance(audio, str):
+                stats.audio_bytes += (len(audio) * 3) // 4
+            if audio_worker is not None:
+                await audio_worker.enqueue_event(event)
+        elif event.type == "tts.playlist.done":
+            stats.tts_done_ms = now_ms
+            if audio_worker is not None:
+                await audio_worker.drain()
+                stats.playback_done_ms = int((time.perf_counter() - started_at) * 1000)
+    if audio_worker is not None:
+        stats.audio_frames = audio_worker.frames - audio_frames_start
+        stats.audio_bytes = audio_worker.bytes - audio_bytes_start
+    return stats
+
+
+def _benchmark_config_kwargs(args: argparse.Namespace, transport: str) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "database_path": args.database,
+        "env_file": args.env_file,
+        "openai_stream_transport": transport,
+    }
+    model = args.model or (FAST_CHAT_MODEL if args.fast else None)
+    if model:
+        kwargs["default_model"] = model
+    if args.fast:
+        kwargs["openai_ws_pool_size"] = 1
+    return kwargs
+
+
+def _benchmark_brain_options(args: argparse.Namespace) -> dict[str, object]:
+    options: dict[str, object] = {"stateless": args.fast}
+    if args.fast:
+        options["tool_names"] = []
+    if args.max_output_tokens is not None:
+        options["max_output_tokens"] = args.max_output_tokens
+    if args.service_tier:
+        options["service_tier"] = args.service_tier
+    return options
+
+
+def _format_benchmark_turn(stats: BenchmarkTurn) -> str:
+    fields = [
+        f"{stats.transport} round={stats.round}",
+        f"first_text={stats.first_text_ms}ms",
+        f"last_text={stats.last_text_ms}ms",
+        f"response_done={stats.response_done_ms}ms",
+    ]
+    if stats.first_audio_ms is not None:
+        fields.extend(
+            [
+                f"first_audio={stats.first_audio_ms}ms",
+                f"tts_done={stats.tts_done_ms}ms",
+                f"playback_done={stats.playback_done_ms}ms",
+                f"audio_frames={stats.audio_frames}",
+                f"audio_bytes={stats.audio_bytes}",
+            ]
+        )
+    fields.append(f"text_chunks={stats.text_chunks}")
+    return "[" + ", ".join(fields) + "]"
+
+
 def serve(args: argparse.Namespace) -> None:
     kwargs: dict[str, Any] = {
         "database_path": args.database,
@@ -229,6 +390,41 @@ def main() -> None:
     tts_parser.add_argument("--model", default=None)
     tts_parser.add_argument("--env-file", default=None)
     tts_parser.set_defaults(func=lambda args: asyncio.run(tts(args)))
+
+    bench_parser = subparsers.add_parser("bench")
+    bench_parser.add_argument("--database", default="brain.sqlite3")
+    bench_parser.add_argument("--model", default=None)
+    bench_parser.add_argument("--env-file", default=None)
+    bench_parser.add_argument(
+        "--transport",
+        default="both",
+        choices=["http", "websocket", "both"],
+    )
+    bench_parser.add_argument("--rounds", type=int, default=5)
+    bench_parser.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        help="Prompt to benchmark. Pass more than once to rotate prompts.",
+    )
+    bench_parser.add_argument("--tts", action="store_true")
+    bench_parser.add_argument("--voice", default=None)
+    bench_parser.add_argument(
+        "--audio-player",
+        default="none",
+        choices=["auto", "sounddevice", "winsound", "none"],
+    )
+    bench_parser.add_argument("--fast", action="store_true")
+    bench_parser.add_argument("--json", action="store_true")
+    bench_parser.add_argument("--max-output-tokens", type=int, default=96)
+    bench_parser.add_argument(
+        "--service-tier",
+        choices=["auto", "default", "flex", "scale", "priority"],
+        default=None,
+    )
+    bench_parser.set_defaults(
+        func=lambda args: asyncio.run(bench(args)),
+    )
 
     args = parser.parse_args()
     args.func(args)

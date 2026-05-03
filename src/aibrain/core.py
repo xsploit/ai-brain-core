@@ -120,6 +120,10 @@ class Brain:
     async def close(self) -> None:
         await self.stt.close()
         await self.tts.close()
+        if hasattr(self.memory, "close"):
+            self.memory.close()
+        if hasattr(self.thread_store, "close"):
+            self.thread_store.close()
         if self._openai is not None:
             await self._openai.close()
         client = self._client
@@ -140,6 +144,9 @@ class Brain:
             await self.openai.warmup()
         if stt:
             await self.stt.warmup()
+            if self.vad is None:
+                self.vad = create_vad_detector(self.config.stt_config.vad_config)
+            await self.vad.warmup()
         if tts:
             await self.tts.warmup(**(tts_options or {}))
 
@@ -489,20 +496,30 @@ class Brain:
             if steps > (max_agent_steps or self.config.max_agent_steps):
                 yield BrainEvent("error", {"message": "Max agent tool steps exceeded"})
                 return
-            outputs = []
             for call in calls:
                 yield BrainEvent("tool.call", {"name": call["name"], "call_id": call["call_id"]})
-                result = await self._execute_tool_call(call, context)
-                tool_results.append(result)
-                yield BrainEvent("tool.result", result)
-                outputs.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call["call_id"],
-                        "output": json.dumps(result["output"]),
-                    }
-                )
-            params = self._continuation_params(params, response, outputs)
+            results: list[dict[str, Any] | None] = [None] * len(calls)
+            tasks = [
+                asyncio.create_task(self._execute_tool_call_index(index, call, context))
+                for index, call in enumerate(calls)
+            ]
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    index, result = await completed
+                    results[index] = result
+                    tool_results.append(result)
+                    yield BrainEvent("tool.result", result)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            ordered_results = [result for result in results if result is not None]
+            params = self._continuation_params(
+                params,
+                response,
+                self._tool_outputs(ordered_results),
+            )
 
     async def speak(self, text: str, **tts_options: Any) -> TTSAudio:
         return await self.tts.synthesize(text, **tts_options)
@@ -742,7 +759,7 @@ class Brain:
 
         producer = asyncio.create_task(produce_stream())
         control_burst = 0
-        max_control_burst = 8
+        max_control_burst = 4
         try:
             while True:
                 async with event_condition:
@@ -1057,7 +1074,9 @@ class Brain:
             memory_message = memory_policy.build_injection_message(memory_hits)
             if memory_message:
                 input_items.append(memory_message)
-        input_items.append(build_user_message(text, images=images, files=files))
+        input_items.append(
+            await asyncio.to_thread(build_user_message, text, images=images, files=files)
+        )
 
         params: dict[str, Any] = {
             "model": response_options.pop("model", resolved.model or self.config.default_model),
@@ -1205,18 +1224,40 @@ class Brain:
             steps += 1
             if steps > max_agent_steps:
                 raise RuntimeError("Max agent tool steps exceeded")
-            outputs = []
-            for call in calls:
-                result = await self._execute_tool_call(call, context)
-                tool_results.append(result)
-                outputs.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call["call_id"],
-                        "output": json.dumps(result["output"]),
-                    }
-                )
-            params = self._continuation_params(params, response, outputs)
+            results = await self._execute_tool_calls(calls, context)
+            tool_results.extend(results)
+            params = self._continuation_params(params, response, self._tool_outputs(results))
+
+    async def _execute_tool_calls(
+        self,
+        calls: list[dict[str, Any]],
+        context: ToolContext,
+    ) -> list[dict[str, Any]]:
+        indexed_results = await asyncio.gather(
+            *[
+                self._execute_tool_call_index(index, call, context)
+                for index, call in enumerate(calls)
+            ]
+        )
+        return [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+    async def _execute_tool_call_index(
+        self,
+        index: int,
+        call: dict[str, Any],
+        context: ToolContext,
+    ) -> tuple[int, dict[str, Any]]:
+        return index, await self._execute_tool_call(call, context)
+
+    def _tool_outputs(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": result["call_id"],
+                "output": json.dumps(result["output"]),
+            }
+            for result in results
+        ]
 
     async def _execute_tool_call(
         self,
@@ -1330,7 +1371,8 @@ class Brain:
             last_response_id=response_id,
         )
         state.openai_conversation_id = conversation_id
-        state.last_response_id = response_id
+        if response_id is not None:
+            state.last_response_id = response_id
 
     def _normalize_stream_event(self, event: Any) -> BrainEvent | None:
         event_type = getattr(event, "type", "")

@@ -3,7 +3,16 @@ from fastapi.testclient import TestClient
 import asyncio
 from types import SimpleNamespace
 
-from aibrain import Brain, BrainConfig, NullSTT, NullTTS, STTConfig, TTSConfig
+from aibrain import (
+    BaseTTSProvider,
+    Brain,
+    BrainConfig,
+    NullSTT,
+    NullTTS,
+    STTConfig,
+    TTSChunk,
+    TTSConfig,
+)
 from aibrain.server import create_app
 
 
@@ -25,6 +34,11 @@ class FakeModels:
 class FakeClient:
     def __init__(self):
         self.models = FakeModels()
+
+
+class FakeTTS(BaseTTSProvider):
+    async def stream(self, text: str, **options):
+        yield TTSChunk(audio=b"pcm-audio", sample_rate=16000, index=0, final=True)
 
 
 class SlowStreamResponses:
@@ -140,3 +154,31 @@ def test_stream_websocket_cancel_stops_active_turn(tmp_path):
             assert ws.receive_json()["type"] == "text.delta"
             ws.send_json({"type": "cancel"})
             assert ws.receive_json()["type"] == "cancelled"
+
+
+def test_tts_websocket_can_send_binary_audio_frames(tmp_path):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=FakeTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/tts") as ws:
+            ws.send_json(
+                {
+                    "text": "hello",
+                    "audio_transport": "binary",
+                    "options": {},
+                }
+            )
+            assert ws.receive_json()["type"] == "tts.playlist.start"
+            assert ws.receive_json()["type"] == "tts.start"
+            audio_event = ws.receive_json()
+            assert audio_event["type"] == "tts.audio"
+            assert audio_event["audio_transport"] == "binary"
+            assert audio_event["binary_bytes"] == len(b"pcm-audio")
+            assert ws.receive_bytes() == b"pcm-audio"
+            assert ws.receive_json()["type"] == "tts.done"
+            assert ws.receive_json()["type"] == "tts.playlist.done"

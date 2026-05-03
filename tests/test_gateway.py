@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import pytest
 
 from aibrain import OpenAIGateway
-from aibrain.gateway import _json_event_to_namespace, _responses_websocket_url, _websocket_headers
+from aibrain.gateway import (
+    _json_event_to_namespace,
+    _responses_websocket_url,
+    _websocket_headers,
+    _websocket_is_open,
+)
 
 
 class FakeResponses:
@@ -41,6 +46,35 @@ class FakeConversations:
 
     async def retrieve(self, conversation_id, **kwargs):
         return ("conversation", conversation_id, kwargs)
+
+
+class FakeWebSocket:
+    def __init__(self, *, recv_items=None, send_error=None, recv_error=None, closed=False):
+        self.recv_items = list(recv_items or [])
+        self.sent = []
+        self.close_calls = 0
+        self.send_error = send_error
+        self.recv_error = recv_error
+        self.closed = closed
+
+    async def send(self, payload):
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent.append(payload)
+
+    async def recv(self):
+        if self.recv_error is not None:
+            raise self.recv_error
+        if not self.recv_items:
+            raise RuntimeError("no recv items")
+        item = self.recv_items.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def close(self):
+        self.close_calls += 1
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -97,6 +131,14 @@ def test_json_event_to_namespace_recurses():
     assert event.response.output[0].type == "message"
 
 
+def test_websocket_is_open_detects_closed_sockets():
+    assert _websocket_is_open(None) is False
+    assert _websocket_is_open(SimpleNamespace(closed=True)) is False
+    assert _websocket_is_open(SimpleNamespace(close_code=1000)) is False
+    assert _websocket_is_open(SimpleNamespace(state=SimpleNamespace(name="CLOSED"))) is False
+    assert _websocket_is_open(SimpleNamespace()) is True
+
+
 @pytest.mark.asyncio
 async def test_gateway_websocket_pool_skips_busy_slot():
     gateway = OpenAIGateway(
@@ -112,3 +154,111 @@ async def test_gateway_websocket_pool_skips_busy_slot():
         gateway._responses_ws_locks[0].release()
 
     assert slot == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_websocket_slot_reservation_locks_selected_slot():
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=2,
+    )
+
+    await gateway._responses_ws_locks[0].acquire()
+    try:
+        slot = await gateway._acquire_responses_websocket_slot()
+    finally:
+        gateway._responses_ws_locks[0].release()
+
+    try:
+        assert slot == 1
+        assert gateway._responses_ws_locks[1].locked()
+    finally:
+        gateway._responses_ws_locks[1].release()
+
+
+@pytest.mark.asyncio
+async def test_gateway_reconnects_stale_websocket_before_request(monkeypatch):
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+    stale = FakeWebSocket(closed=True)
+    fresh = FakeWebSocket(
+        recv_items=[
+            '{"type":"response.completed","response":{"id":"resp_1","output":[]}}'
+        ]
+    )
+    gateway._responses_ws_pool[0] = stale
+
+    async def connect():
+        return fresh
+
+    monkeypatch.setattr(gateway, "_connect_responses_websocket", connect)
+
+    events = [event async for event in gateway._stream_response_websocket({"model": "gpt"})]
+
+    assert stale.close_calls == 1
+    assert fresh.sent
+    assert events[0].response.id == "resp_1"
+
+
+@pytest.mark.asyncio
+async def test_gateway_retries_once_if_websocket_fails_before_stream(monkeypatch):
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+    broken = FakeWebSocket(send_error=RuntimeError("stale"))
+    fresh = FakeWebSocket(
+        recv_items=[
+            '{"type":"response.completed","response":{"id":"resp_retry","output":[]}}'
+        ]
+    )
+    sockets = iter([broken, fresh])
+
+    async def connect():
+        return next(sockets)
+
+    monkeypatch.setattr(gateway, "_connect_responses_websocket", connect)
+
+    events = [event async for event in gateway._stream_response_websocket({"model": "gpt"})]
+
+    assert broken.close_calls == 1
+    assert fresh.sent
+    assert events[0].response.id == "resp_retry"
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_retry_after_stream_started(monkeypatch):
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+    first = FakeWebSocket(
+        recv_items=[
+            '{"type":"response.output_text.delta","delta":"hi"}',
+            RuntimeError("drop"),
+        ]
+    )
+    second = FakeWebSocket(
+        recv_items=[
+            '{"type":"response.completed","response":{"id":"resp_duplicate","output":[]}}'
+        ]
+    )
+    sockets = iter([first, second])
+
+    async def connect():
+        return next(sockets)
+
+    monkeypatch.setattr(gateway, "_connect_responses_websocket", connect)
+
+    stream = gateway._stream_response_websocket({"model": "gpt"})
+    first_event = await anext(stream)
+    assert first_event.type == "response.output_text.delta"
+    with pytest.raises(RuntimeError, match="drop"):
+        await anext(stream)
+    assert second.sent == []

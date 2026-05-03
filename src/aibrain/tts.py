@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import tempfile
 import wave
 from collections.abc import AsyncIterator
@@ -14,12 +15,6 @@ from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
-
-
-KNOWN_PIPER_DIR = Path(r"C:\Users\SUBSECT\Documents\GitHub\dvb\piper")
-TEXTY_ROOT = Path(r"D:\TextyMcSpeechy")
-TEXTY_COMPARE_MANIFEST = TEXTY_ROOT / "scratch" / "riko_neuro_compare_20260322" / "compare_manifest.json"
-PREFERRED_TEXTY_VOICE = "riko_fish_s2_200_rvc_32k_2259"
 
 
 def _env_path(name: str, fallback: Path | None = None) -> Path | None:
@@ -49,21 +44,39 @@ def _env_int(name: str, fallback: int | None = None) -> int | None:
         return fallback
 
 
+def _default_tts_provider() -> Literal["piper_process", "piper_executable", "piper_http", "null"]:
+    value = (
+        os.environ.get("AIBRAIN_TTS_PROVIDER")
+        or os.environ.get("TTS_PROVIDER")
+        or "piper_process"
+    ).strip().lower()
+    aliases = {
+        "none": "null",
+        "off": "null",
+        "disabled": "null",
+        "piper": "piper_process",
+        "process": "piper_process",
+        "executable": "piper_executable",
+        "http": "piper_http",
+    }
+    normalized = aliases.get(value, value)
+    if normalized in {"piper_process", "piper_executable", "piper_http", "null"}:
+        return normalized  # type: ignore[return-value]
+    return "piper_process"
+
+
 class TTSConfig(BaseModel):
-    enabled: bool = Field(default_factory=lambda: os.environ.get("TTS_PROVIDER", "piper") != "none")
+    enabled: bool = Field(default_factory=lambda: _default_tts_provider() != "null")
     provider: Literal["piper_process", "piper_executable", "piper_http", "null"] = Field(
-        default_factory=lambda: os.environ.get("AIBRAIN_TTS_PROVIDER", "piper_process")
+        default_factory=lambda: _default_tts_provider()
     )
     piper_executable_path: Path | None = Field(
-        default_factory=lambda: _env_path("PIPER_EXE", KNOWN_PIPER_DIR / "piper.exe")
+        default_factory=lambda: _default_piper_executable_path()
     )
     piper_model_path: Path | None = Field(default_factory=lambda: _default_piper_model_path())
     piper_config_path: Path | None = Field(default_factory=lambda: _default_piper_config_path())
     piper_espeak_data_path: Path | None = Field(
-        default_factory=lambda: _env_path(
-            "PIPER_ESPEAK_DATA",
-            KNOWN_PIPER_DIR / "espeak-ng-data",
-        )
+        default_factory=lambda: _env_path("PIPER_ESPEAK_DATA")
     )
     piper_http_url: str = Field(
         default_factory=lambda: os.environ.get("PIPER_HTTP_URL", "http://127.0.0.1:5000")
@@ -242,6 +255,7 @@ class PiperProcessTTS(PiperExecutableTTS):
         key = tts_config_process_key(runtime_config)
         lock = await self._process_lock(key)
         async with lock:
+            yielded_anything = False
             try:
                 index = 0
                 for segment in split_tts_text(text, runtime_config):
@@ -250,10 +264,13 @@ class PiperProcessTTS(PiperExecutableTTS):
                         config=runtime_config,
                         start_index=index,
                     ):
+                        yielded_anything = True
                         yield chunk
                         index = chunk.index + 1
             except Exception:
                 await self._close_process(key)
+                if yielded_anything:
+                    raise
                 async for chunk in super().stream(text, **options):
                     yield chunk
 
@@ -440,6 +457,9 @@ def create_tts_provider(config: TTSConfig | None = None) -> BaseTTSProvider:
 
 
 def split_tts_text(text: str, config: TTSConfig) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
     chunker = SentenceChunker(
         max_chars=config.chunk_chars,
         min_chars=config.min_chunk_chars,
@@ -449,7 +469,7 @@ def split_tts_text(text: str, config: TTSConfig) -> list[str]:
     tail = chunker.flush()
     if tail:
         chunks.append(tail)
-    return chunks or [text.strip()]
+    return chunks or [stripped]
 
 
 def tts_config_for_voice(config: TTSConfig, voice: Any | None) -> TTSConfig:
@@ -553,7 +573,10 @@ def discover_piper_voices(
     search_roots: list[Path] | None = None,
 ) -> list[PiperVoice]:
     voices: dict[str, PiperVoice] = {}
-    for manifest_path in manifest_paths or [TEXTY_COMPARE_MANIFEST]:
+    resolved_manifests = manifest_paths if manifest_paths is not None else _env_path_list(
+        "AIBRAIN_TTS_MANIFESTS"
+    )
+    for manifest_path in resolved_manifests:
         if not manifest_path.exists():
             continue
         try:
@@ -573,7 +596,10 @@ def discover_piper_voices(
                 config=config,
                 created_at=item.get("created_at"),
             )
-    for root in search_roots or [TEXTY_ROOT / "tts_dojo", KNOWN_PIPER_DIR]:
+    resolved_roots = search_roots if search_roots is not None else _env_path_list(
+        "AIBRAIN_TTS_VOICE_ROOTS"
+    )
+    for root in resolved_roots:
         if not root.exists():
             continue
         for onnx in root.rglob("*.onnx"):
@@ -605,13 +631,15 @@ def resolve_piper_voice(voice_id: str | None = None) -> PiperVoice | None:
         for voice in voices:
             if requested_lower in voice.slug.lower() or requested_lower in str(voice.onnx).lower():
                 return voice
-    for voice in voices:
-        if voice.slug == PREFERRED_TEXTY_VOICE:
-            return voice
-    for voice in voices:
-        if voice.slug.startswith("riko_fish"):
-            return voice
     return voices[0]
+
+
+def _default_piper_executable_path() -> Path | None:
+    explicit = _env_path("PIPER_EXE")
+    if explicit:
+        return explicit
+    discovered = shutil.which("piper")
+    return Path(discovered) if discovered else None
 
 
 def _default_piper_model_path() -> Path | None:
@@ -621,7 +649,7 @@ def _default_piper_model_path() -> Path | None:
     voice = resolve_piper_voice()
     if voice:
         return voice.onnx
-    return _env_path("PIPER_MODEL", KNOWN_PIPER_DIR / "en_US-ryari-high.onnx")
+    return None
 
 
 def _default_piper_config_path() -> Path | None:
@@ -647,6 +675,11 @@ def _existing_path(value: Any) -> Path | None:
 def _matching_config(onnx: Path) -> Path | None:
     candidate = Path(str(onnx) + ".json")
     return candidate if candidate.exists() else None
+
+
+def _env_path_list(name: str) -> list[Path]:
+    value = os.environ.get(name, "")
+    return [Path(item) for item in value.split(os.pathsep) if item.strip()]
 
 
 def _piper_command(config: TTSConfig, *, output_raw: bool, output_stdout: bool) -> list[str]:

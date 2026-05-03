@@ -292,6 +292,23 @@ textarea:focus {
   min-height: 34px;
 }
 
+.compact-field {
+  display: grid;
+  grid-template-columns: auto minmax(92px, 120px);
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+}
+
+.compact-field span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compact-field select {
+  min-height: 34px;
+}
+
 .inline-control input {
   width: auto;
   min-height: auto;
@@ -310,6 +327,35 @@ textarea:focus {
   min-height: 360px;
   max-height: calc(100vh - 214px);
   padding: 6px 2px 12px;
+}
+
+.timing-stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  min-height: 44px;
+  margin-bottom: 8px;
+}
+
+.timing-item {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #12171d;
+  min-width: 0;
+}
+
+.timing-item span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.timing-item strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .message {
@@ -463,7 +509,8 @@ textarea:focus {
   .inspector,
   .settings-grid,
   .settings-grid.compact,
-  .voice-grid {
+  .voice-grid,
+  .timing-stats {
     grid-template-columns: 1fr;
   }
 

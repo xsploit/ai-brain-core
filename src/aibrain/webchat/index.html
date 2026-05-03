@@ -47,6 +47,7 @@
           </header>
 
           <div id="messages" class="messages" aria-live="polite"></div>
+          <div id="timingStats" class="timing-stats" aria-label="Streaming timings"></div>
 
           <form id="chatForm" class="composer">
             <textarea id="chatInput" rows="3" placeholder="Message"></textarea>
@@ -62,6 +63,13 @@
               <label class="inline-control">
                 <input id="memoryMode" type="checkbox" checked />
                 <span>Memory</span>
+              </label>
+              <label class="compact-field">
+                <span>Audio</span>
+                <select id="audioTransport">
+                  <option value="json_base64">JSON</option>
+                  <option value="binary">Binary</option>
+                </select>
               </label>
               <button class="primary-button" type="submit">Send</button>
             </div>
@@ -261,6 +269,6 @@
         </section>
       </aside>
     </div>
-    <script type="module" src="/webchat/assets/app.js?v=20260502-fair-stream"></script>
+    <script type="module" src="/webchat/assets/app.js?v=20260503-efficiency"></script>
   </body>
 </html>

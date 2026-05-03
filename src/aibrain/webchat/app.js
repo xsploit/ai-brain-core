@@ -4,33 +4,37 @@ const state = {
   mic: null,
   sttRecorder: null,
   assistantMessage: null,
+  assistantTextNode: null,
   playlist: null,
   chatUsesTts: false,
   responseDone: false,
   ttsPlaylistDone: false,
-  pendingAssistantText: "",
-  assistantFlushScheduled: false,
   textDeltaCount: 0,
   ttsAudioCount: 0,
   ttsAudioBytes: 0,
   turnStartedAt: 0,
   firstTextAt: 0,
   firstAudioAt: 0,
+  responseDoneAt: 0,
+  playlistDoneAt: 0,
+  playbackDoneAt: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
 class AudioPlaylist {
-  constructor() {
+  constructor(onPlaybackDone = () => {}) {
     this.audioContext = null;
-    this.pendingSegments = new Map();
-    this.queue = [];
-    this.playing = false;
+    this.onPlaybackDone = onPlaybackDone;
+    this.pendingBinaryAudio = [];
     this.sources = new Set();
     this.nextPlayTime = 0;
     this.scheduleChain = Promise.resolve();
     this.generation = 0;
+    this.pendingSchedules = 0;
+    this.playlistDone = false;
+    this.playbackDoneReported = false;
   }
 
   context() {
@@ -50,11 +54,12 @@ class AudioPlaylist {
 
   reset() {
     this.generation += 1;
-    this.pendingSegments.clear();
-    this.queue.length = 0;
-    this.playing = false;
+    this.pendingBinaryAudio.length = 0;
     this.nextPlayTime = 0;
     this.scheduleChain = Promise.resolve();
+    this.pendingSchedules = 0;
+    this.playlistDone = false;
+    this.playbackDoneReported = false;
     for (const source of this.sources) {
       try {
         source.stop();
@@ -70,13 +75,31 @@ class AudioPlaylist {
       this.reset();
       return;
     }
+    if (event.type === "tts.playlist.done") {
+      this.playlistDone = true;
+      this.checkPlaybackDone();
+      return;
+    }
     if (event.type === "tts.audio") {
+      if (event.audio_transport === "binary") {
+        this.pendingBinaryAudio.push(event);
+        return;
+      }
+      if (!event.audio) return;
       const generation = this.generation;
+      const bytes = base64ToBytes(event.audio);
+      this.pendingSchedules += 1;
       this.scheduleChain = this.scheduleChain
         .then(() => yieldToBrowser())
         .then(() => {
           if (generation !== this.generation) return null;
-          return this.scheduleAudioEvent(event, generation);
+          return this.scheduleAudioBytes(event, bytes, generation);
+        })
+        .finally(() => {
+          if (generation === this.generation) {
+            this.pendingSchedules = Math.max(0, this.pendingSchedules - 1);
+            this.checkPlaybackDone();
+          }
         })
         .catch((error) => logEvent("audio.error", { message: error.message }));
       return;
@@ -86,21 +109,47 @@ class AudioPlaylist {
     }
   }
 
-  async scheduleAudioEvent(event, generation) {
+  handleBinary(bytes) {
+    const event = this.pendingBinaryAudio.shift();
+    if (!event) {
+      logEvent("audio.error", { message: "Received binary audio without metadata" });
+      return;
+    }
+    const generation = this.generation;
+    this.pendingSchedules += 1;
+    this.scheduleChain = this.scheduleChain
+      .then(() => yieldToBrowser())
+      .then(() => {
+        if (generation !== this.generation) return null;
+        return this.scheduleAudioBytes(event, bytes, generation);
+      })
+      .finally(() => {
+        if (generation === this.generation) {
+          this.pendingSchedules = Math.max(0, this.pendingSchedules - 1);
+          this.checkPlaybackDone();
+        }
+      })
+      .catch((error) => logEvent("audio.error", { message: error.message }));
+  }
+
+  async scheduleAudioBytes(event, bytes, generation) {
     if (event.encoding !== "pcm_s16le") {
       logEvent("audio.error", { message: `Unsupported encoding: ${event.encoding}` });
       return;
     }
-    if (!event.audio) return;
+    if (!bytes.length) return;
     const audioContext = this.context();
     await audioContext.resume();
     if (generation !== this.generation) return;
-    const buffer = this.audioBufferFromPcm(base64ToBytes(event.audio), event.sample_rate || 22050);
+    const buffer = this.audioBufferFromPcm(bytes, event.sample_rate || 22050);
     if (!buffer.length) return;
     const source = audioContext.createBufferSource();
     source.buffer = buffer;
     source.connect(audioContext.destination);
-    source.onended = () => this.sources.delete(source);
+    source.onended = () => {
+      this.sources.delete(source);
+      this.checkPlaybackDone();
+    };
     const startAt = Math.max(audioContext.currentTime + 0.02, this.nextPlayTime || 0);
     this.nextPlayTime = startAt + buffer.duration;
     this.sources.add(source);
@@ -119,67 +168,21 @@ class AudioPlaylist {
     return buffer;
   }
 
-  handleBuffered(event) {
-    if (event.type === "tts.audio") {
-      const segmentId = event.segment_id || `${event.playback_id}:${event.segment_index}`;
-      const segment = this.pendingSegments.get(segmentId) || {
-        id: segmentId,
-        index: event.segment_index || 0,
-        sampleRate: event.sample_rate || 22050,
-        encoding: event.encoding || "pcm_s16le",
-        chunks: [],
-      };
-      segment.chunks.push(base64ToBytes(event.audio));
-      this.pendingSegments.set(segmentId, segment);
-      return;
+  checkPlaybackDone() {
+    if (
+      this.playlistDone &&
+      !this.playbackDoneReported &&
+      this.pendingSchedules === 0 &&
+      this.sources.size === 0
+    ) {
+      this.playbackDoneReported = true;
+      this.onPlaybackDone();
     }
-    if (event.type === "tts.done") {
-      const segmentId = event.segment_id || `${event.playback_id}:${event.segment_index}`;
-      const segment = this.pendingSegments.get(segmentId);
-      if (!segment) return;
-      this.pendingSegments.delete(segmentId);
-      this.queue.push(segment);
-      this.queue.sort((left, right) => left.index - right.index);
-      void this.pump();
-    }
-  }
-
-  async pump() {
-    if (this.playing) return;
-    this.playing = true;
-    try {
-      while (this.queue.length) {
-        await this.playSegment(this.queue.shift());
-      }
-    } finally {
-      this.playing = false;
-    }
-  }
-
-  async playSegment(segment) {
-    if (segment.encoding !== "pcm_s16le") {
-      logEvent("audio.error", { message: `Unsupported encoding: ${segment.encoding}` });
-      return;
-    }
-    const audioContext = this.context();
-    const buffer = this.audioBufferFromPcm(concatBytes(segment.chunks), segment.sampleRate);
-    await audioContext.resume();
-    await new Promise((resolve) => {
-      const source = audioContext.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioContext.destination);
-      source.onended = () => {
-        this.sources.delete(source);
-        resolve();
-      };
-      this.sources.add(source);
-      source.start();
-    });
   }
 }
 
 function init() {
-  state.playlist = new AudioPlaylist();
+  state.playlist = new AudioPlaylist(markPlaybackDone);
   bindTabs();
   bindChat();
   bindTts();
@@ -220,16 +223,20 @@ function bindChat() {
     const text = $("#chatInput").value.trim();
     if (!text) return;
     $("#chatInput").value = "";
-    state.pendingAssistantText = "";
-    state.assistantFlushScheduled = false;
     state.textDeltaCount = 0;
     state.ttsAudioCount = 0;
     state.ttsAudioBytes = 0;
     state.turnStartedAt = performance.now();
     state.firstTextAt = 0;
     state.firstAudioAt = 0;
+    state.responseDoneAt = 0;
+    state.playlistDoneAt = 0;
+    state.playbackDoneAt = 0;
+    renderTiming();
     addMessage("user", text);
     state.assistantMessage = addMessage("assistant", "");
+    state.assistantTextNode = document.createTextNode("");
+    state.assistantMessage.append(state.assistantTextNode);
     const wantsTts = $("#ttsMode").checked;
     if (wantsTts) {
       $("#streamMode").checked = true;
@@ -244,6 +251,7 @@ function bindChat() {
   $("#clearChatButton").addEventListener("click", () => {
     $("#messages").textContent = "";
     state.assistantMessage = null;
+    state.assistantTextNode = null;
   });
   $("#stopChatButton").addEventListener("click", () => {
     if (state.chatSocket) {
@@ -258,6 +266,7 @@ function bindChat() {
 async function sendStreamingChat(text) {
   const useTts = $("#ttsMode").checked;
   const socket = new WebSocket(wsUrl(useTts ? "/brain" : "/stream"));
+  socket.binaryType = "arraybuffer";
   state.chatSocket = socket;
   state.chatUsesTts = useTts;
   state.responseDone = false;
@@ -267,7 +276,13 @@ async function sendStreamingChat(text) {
     setStatus("#chatStatus", "streaming");
     socket.send(JSON.stringify(await buildAskPayload(text, useTts)));
   };
-  socket.onmessage = (message) => handleBrainEvent(JSON.parse(message.data), "#chatStatus");
+  socket.onmessage = (message) => {
+    if (typeof message.data === "string") {
+      handleBrainEvent(JSON.parse(message.data), "#chatStatus");
+    } else {
+      handleBrainBinary(message.data);
+    }
+  };
   socket.onerror = () => setStatus("#chatStatus", "socket error");
   socket.onclose = () => {
     if (state.chatSocket === socket) state.chatSocket = null;
@@ -316,6 +331,7 @@ async function buildAskPayload(text, tts) {
     tool_names: tools.length ? tools : null,
     tts,
     tts_options: buildTtsOptions(),
+    audio_transport: $("#audioTransport").value,
     options,
   };
 }
@@ -334,16 +350,26 @@ function handleBrainEvent(event, statusSelector) {
     setStatus(statusSelector, "error");
   } else if (event.type === "response.done") {
     state.responseDone = true;
+    state.responseDoneAt = performance.now();
+    renderTiming();
     setStatus(statusSelector, "done");
     closeChatSocketIfComplete();
   } else if (event.type === "tts.playlist.done") {
     state.ttsPlaylistDone = true;
+    state.playlistDoneAt = performance.now();
+    renderTiming();
     closeChatSocketIfComplete();
   }
   if (event.type.startsWith("tts.")) {
     state.playlist.handle(event);
   }
   recordEvent(event.type, event);
+}
+
+function handleBrainBinary(data) {
+  const bytes = new Uint8Array(data);
+  state.playlist.handleBinary(bytes);
+  logEvent("tts.audio.binary", { bytes: bytes.length });
 }
 
 function closeChatSocketIfComplete() {
@@ -683,21 +709,14 @@ function addMessage(role, text) {
 
 function appendAssistant(text) {
   if (!text) return;
-  state.pendingAssistantText += text;
-  if (state.assistantFlushScheduled) return;
-  state.assistantFlushScheduled = true;
-  requestAnimationFrame(flushAssistantText);
-}
-
-function flushAssistantText() {
-  state.assistantFlushScheduled = false;
-  const text = state.pendingAssistantText;
-  state.pendingAssistantText = "";
-  if (!text) return;
   if (!state.assistantMessage) {
     state.assistantMessage = addMessage("assistant", "");
   }
-  state.assistantMessage.append(document.createTextNode(text));
+  if (!state.assistantTextNode) {
+    state.assistantTextNode = document.createTextNode("");
+    state.assistantMessage.append(state.assistantTextNode);
+  }
+  state.assistantTextNode.textContent += text;
   $("#messages").scrollTop = $("#messages").scrollHeight;
 }
 
@@ -706,6 +725,7 @@ function recordEvent(type, data) {
     state.textDeltaCount += 1;
     if (!state.firstTextAt) {
       state.firstTextAt = performance.now();
+      renderTiming();
       logEvent("stream.first_text", {
         ms: Math.round(state.firstTextAt - state.turnStartedAt),
         text: data.text || "",
@@ -715,15 +735,22 @@ function recordEvent(type, data) {
   }
   if (type === "tts.audio") {
     state.ttsAudioCount += 1;
+    const byteEstimate =
+      typeof data.audio === "string"
+        ? Math.floor((data.audio.length * 3) / 4)
+        : Number(data.binary_bytes || 0);
     if (typeof data.audio === "string") {
-      state.ttsAudioBytes += Math.floor((data.audio.length * 3) / 4);
+      state.ttsAudioBytes += byteEstimate;
+    } else if (data.binary_bytes) {
+      state.ttsAudioBytes += Number(data.binary_bytes);
     }
     if (!state.firstAudioAt) {
       state.firstAudioAt = performance.now();
+      renderTiming();
       logEvent("stream.first_audio", {
         ms: Math.round(state.firstAudioAt - state.turnStartedAt),
         segment_index: data.segment_index,
-        bytes_estimate: typeof data.audio === "string" ? Math.floor((data.audio.length * 3) / 4) : 0,
+        bytes_estimate: byteEstimate,
       });
     }
     return;
@@ -744,6 +771,34 @@ function recordEvent(type, data) {
     state.ttsAudioBytes = 0;
   }
   logEvent(type, data);
+}
+
+function markPlaybackDone() {
+  if (!state.turnStartedAt || state.playbackDoneAt) return;
+  state.playbackDoneAt = performance.now();
+  renderTiming();
+  logEvent("audio.playback.done", {
+    ms: Math.round(state.playbackDoneAt - state.turnStartedAt),
+  });
+}
+
+function renderTiming() {
+  const node = $("#timingStats");
+  if (!node) return;
+  const elapsed = (value) => (value ? `${Math.round(value - state.turnStartedAt)} ms` : "-");
+  node.innerHTML = "";
+  for (const [label, value] of [
+    ["first text", elapsed(state.firstTextAt)],
+    ["first audio", elapsed(state.firstAudioAt)],
+    ["response done", elapsed(state.responseDoneAt)],
+    ["playlist done", elapsed(state.playlistDoneAt)],
+    ["playback done", elapsed(state.playbackDoneAt)],
+  ]) {
+    const item = document.createElement("div");
+    item.className = "timing-item";
+    item.innerHTML = `<span>${label}</span><strong>${value}</strong>`;
+    node.append(item);
+  }
 }
 
 function logEvent(type, data) {
@@ -897,13 +952,16 @@ async function fileToDataUrl(file) {
 async function playAudioEvent(data) {
   const playlist = state.playlist || new AudioPlaylist();
   playlist.reset();
-  playlist.queue.push({
-    index: 0,
-    sampleRate: data.sample_rate,
-    encoding: data.encoding,
-    chunks: [base64ToBytes(data.audio)],
-  });
-  await playlist.pump();
+  await playlist.unlock();
+  await playlist.scheduleAudioBytes(
+    {
+      encoding: data.encoding,
+      sample_rate: data.sample_rate,
+      segment_index: 0,
+    },
+    base64ToBytes(data.audio),
+    playlist.generation
+  );
 }
 
 init();
