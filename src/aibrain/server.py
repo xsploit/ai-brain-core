@@ -236,7 +236,10 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
         if refresh or app.state.tts_voice_cache is None:
             async with app.state.tts_voice_lock:
                 if refresh or app.state.tts_voice_cache is None:
-                    voices = await asyncio.to_thread(discover_piper_voices)
+                    voices = await asyncio.to_thread(
+                        discover_piper_voices,
+                        refresh=refresh,
+                    )
                     app.state.tts_voice_cache = [voice.model_dump() for voice in voices]
         return list(app.state.tts_voice_cache)
 

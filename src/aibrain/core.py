@@ -4,7 +4,7 @@ import asyncio
 import json
 import random
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -95,7 +95,7 @@ class Brain:
         self.stt = stt_provider or create_stt_provider(self.config.stt_config)
         self.vad = vad_detector
         self.tts = tts_provider or create_tts_provider(self.config.tts_config)
-        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._thread_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         self._thread_locks_guard = asyncio.Lock()
         if self.config.auto_memory_tools:
             self._register_memory_tools()
@@ -202,7 +202,25 @@ class Brain:
             if lock is None:
                 lock = asyncio.Lock()
                 self._thread_locks[thread_id] = lock
+                self._trim_thread_lock_cache()
+            else:
+                self._thread_locks.move_to_end(thread_id)
             return lock
+
+    def _trim_thread_lock_cache(self) -> None:
+        max_locks = self.config.thread_lock_cache_size
+        if max_locks <= 0:
+            return
+        while len(self._thread_locks) > max_locks:
+            removed = False
+            for key, lock in list(self._thread_locks.items()):
+                if lock.locked():
+                    continue
+                self._thread_locks.pop(key, None)
+                removed = True
+                break
+            if not removed:
+                break
 
     def _resolve_persona(self, persona: Persona | dict[str, Any] | None) -> Persona:
         if persona is None:

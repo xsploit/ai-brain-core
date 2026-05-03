@@ -68,6 +68,7 @@ block every other client:
 $env:AIBRAIN_OPENAI_WS_POOL_SIZE="4"
 $env:AIBRAIN_STREAM_EVENT_QUEUE_MAX="256"
 $env:AIBRAIN_MODELS_CACHE_TTL_SECONDS="300"
+$env:AIBRAIN_THREAD_LOCK_CACHE_SIZE="4096"
 ```
 
 Stateful turns for the same `thread_id` are serialized so concurrent Discord or
@@ -200,6 +201,9 @@ $env:AIBRAIN_TTS_MANIFESTS="D:\voices\manifest.json"
 
 The runtime keeps Piper processes hot per selected voice. `GET /tts/voices`
 lists voices from `AIBRAIN_TTS_VOICE_ROOTS` and `AIBRAIN_TTS_MANIFESTS`.
+Voice discovery is cached between requests; pass `refresh=true` to the endpoint
+after adding or changing voice files. For bots that switch between many voices,
+cap the hot Piper process pool with `PIPER_PROCESS_POOL_MAX`.
 
 Terminal smoke test with streaming text and immediate TTS playback:
 

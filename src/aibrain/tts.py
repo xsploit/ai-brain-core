@@ -4,10 +4,11 @@ import asyncio
 import base64
 import json
 import os
-import re
 import shutil
 import tempfile
+import threading
 import wave
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,7 @@ class TTSConfig(BaseModel):
         default_factory=lambda: _env_float("PIPER_PROCESS_IDLE_TIMEOUT", 0.45)
     )
     process_first_chunk_timeout: float = 10.0
+    process_pool_max: int = Field(default_factory=lambda: _env_int("PIPER_PROCESS_POOL_MAX", 4))
     warmup_on_start: bool = True
 
     def resolved_config_path(self) -> Path | None:
@@ -175,6 +177,10 @@ class TTSChunk:
         }
 
 
+_VOICE_CACHE_LOCK = threading.Lock()
+_VOICE_CACHE: dict[tuple[tuple[str, ...], tuple[str, ...]], list[PiperVoice]] = {}
+
+
 class BaseTTSProvider:
     def __init__(self, config: TTSConfig | None = None):
         self.config = config or TTSConfig()
@@ -246,8 +252,8 @@ class PiperExecutableTTS(BaseTTSProvider):
 class PiperProcessTTS(PiperExecutableTTS):
     def __init__(self, config: TTSConfig | None = None):
         super().__init__(config)
-        self._processes: dict[tuple[Any, ...], asyncio.subprocess.Process] = {}
-        self._locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+        self._processes: OrderedDict[tuple[Any, ...], asyncio.subprocess.Process] = OrderedDict()
+        self._locks: OrderedDict[tuple[Any, ...], asyncio.Lock] = OrderedDict()
         self._locks_guard = asyncio.Lock()
 
     async def stream(self, text: str, **options: Any) -> AsyncIterator[TTSChunk]:
@@ -280,7 +286,23 @@ class PiperProcessTTS(PiperExecutableTTS):
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[key] = lock
+                self._trim_lock_cache()
+            else:
+                self._locks.move_to_end(key)
             return lock
+
+    def _trim_lock_cache(self) -> None:
+        max_locks = max(1, self.config.process_pool_max * 4)
+        while len(self._locks) > max_locks:
+            removed = False
+            for key, lock in list(self._locks.items()):
+                if lock.locked() or key in self._processes:
+                    continue
+                self._locks.pop(key, None)
+                removed = True
+                break
+            if not removed:
+                break
 
     async def _stream_process(
         self,
@@ -297,6 +319,8 @@ class PiperProcessTTS(PiperExecutableTTS):
         await process.stdin.drain()
         index = start_index
         got_audio = False
+        sample_rate = runtime_config.resolved_sample_rate()
+        voice_name = tts_voice_name(runtime_config)
         while True:
             timeout = (
                 runtime_config.process_idle_timeout
@@ -314,23 +338,23 @@ class PiperProcessTTS(PiperExecutableTTS):
             got_audio = True
             yield TTSChunk(
                 audio=data,
-                sample_rate=runtime_config.resolved_sample_rate(),
+                sample_rate=sample_rate,
                 encoding="pcm_s16le",
                 index=index,
                 final=False,
                 text=text,
-                voice=tts_voice_name(runtime_config),
+                voice=voice_name,
             )
             index += 1
         if got_audio:
             yield TTSChunk(
                 audio=b"",
-                sample_rate=runtime_config.resolved_sample_rate(),
+                sample_rate=sample_rate,
                 encoding="pcm_s16le",
                 index=index,
                 final=True,
                 text=text,
-                voice=tts_voice_name(runtime_config),
+                voice=voice_name,
             )
 
     async def _ensure_process(self, config: TTSConfig | None = None) -> asyncio.subprocess.Process:
@@ -338,6 +362,7 @@ class PiperProcessTTS(PiperExecutableTTS):
         key = tts_config_process_key(runtime_config)
         process = self._processes.get(key)
         if process and process.returncode is None:
+            self._processes.move_to_end(key)
             return process
         command = _piper_command(runtime_config, output_raw=True, output_stdout=False)
         process = await asyncio.create_subprocess_exec(
@@ -347,6 +372,8 @@ class PiperProcessTTS(PiperExecutableTTS):
             stderr=asyncio.subprocess.DEVNULL,
         )
         self._processes[key] = process
+        self._processes.move_to_end(key)
+        await self._evict_process_pool(keep_key=key)
         return process
 
     def _stdin_line(self, text: str, config: TTSConfig | None = None) -> bytes:
@@ -369,9 +396,31 @@ class PiperProcessTTS(PiperExecutableTTS):
         except asyncio.TimeoutError:
             process.kill()
 
+    async def _evict_process_pool(self, *, keep_key: tuple[Any, ...]) -> None:
+        max_processes = self.config.process_pool_max
+        if max_processes <= 0:
+            return
+        while len(self._processes) > max_processes:
+            evict_key: tuple[Any, ...] | None = None
+            for key, process in list(self._processes.items()):
+                if key == keep_key:
+                    continue
+                if process.returncode is not None:
+                    evict_key = key
+                    break
+                lock = self._locks.get(key)
+                if lock is not None and lock.locked():
+                    continue
+                evict_key = key
+                break
+            if evict_key is None:
+                break
+            await self._close_process(evict_key)
+
     async def close(self) -> None:
         processes = list(self._processes.values())
         self._processes.clear()
+        self._locks.clear()
         for process in processes:
             if process.returncode is not None:
                 continue
@@ -407,20 +456,32 @@ class SentenceChunker:
         self.min_chars = min_chars
         self.comma_chars = comma_chars
         self.buffer = ""
+        self._terminal_scan_pos = 0
+        self._soft_scan_pos = 0
 
     def feed(self, text: str) -> list[str]:
         self.buffer += text
         chunks: list[str] = []
         while True:
-            terminal = self._find_split(r"[.!?。！？]", self.min_chars)
+            terminal = self._find_split(
+                {".", "!", "?", "。", "！", "？"},
+                self.min_chars,
+                "_terminal_scan_pos",
+            )
             if terminal is not None:
                 chunks.append(self.buffer[:terminal].strip())
                 self.buffer = self.buffer[terminal:].lstrip()
+                self._reset_scan_positions()
                 continue
-            soft = self._find_split(r"[,;:，；：]", self.comma_chars)
+            soft = self._find_split(
+                {",", ";", ":", "，", "；", "："},
+                self.comma_chars,
+                "_soft_scan_pos",
+            )
             if soft is not None:
                 chunks.append(self.buffer[:soft].strip())
                 self.buffer = self.buffer[soft:].lstrip()
+                self._reset_scan_positions()
                 continue
             if len(self.buffer) >= self.max_chars:
                 split_at = self.buffer.rfind(" ", 0, self.max_chars)
@@ -428,20 +489,30 @@ class SentenceChunker:
                     split_at = self.max_chars
                 chunks.append(self.buffer[:split_at].strip())
                 self.buffer = self.buffer[split_at:].lstrip()
+                self._reset_scan_positions()
                 continue
             break
         return [chunk for chunk in chunks if chunk]
 
-    def _find_split(self, pattern: str, min_chars: int) -> int | None:
-        for match in re.finditer(pattern, self.buffer):
-            end = match.end()
+    def _find_split(self, split_chars: set[str], min_chars: int, cursor_attr: str) -> int | None:
+        start = max(0, int(getattr(self, cursor_attr)))
+        for index in range(start, len(self.buffer)):
+            if self.buffer[index] not in split_chars:
+                continue
+            end = index + 1
             if end >= min_chars:
                 return end
+        setattr(self, cursor_attr, len(self.buffer))
         return None
+
+    def _reset_scan_positions(self) -> None:
+        self._terminal_scan_pos = 0
+        self._soft_scan_pos = 0
 
     def flush(self) -> str | None:
         text = self.buffer.strip()
         self.buffer = ""
+        self._reset_scan_positions()
         return text or None
 
 
@@ -571,11 +642,25 @@ def discover_piper_voices(
     *,
     manifest_paths: list[Path] | None = None,
     search_roots: list[Path] | None = None,
+    refresh: bool = False,
 ) -> list[PiperVoice]:
     voices: dict[str, PiperVoice] = {}
     resolved_manifests = manifest_paths if manifest_paths is not None else _env_path_list(
         "AIBRAIN_TTS_MANIFESTS"
     )
+    resolved_roots = search_roots if search_roots is not None else _env_path_list(
+        "AIBRAIN_TTS_VOICE_ROOTS"
+    )
+    cache_key = (
+        tuple(str(path) for path in resolved_manifests),
+        tuple(str(path) for path in resolved_roots),
+    )
+    use_cache = manifest_paths is None and search_roots is None
+    if use_cache and not refresh:
+        with _VOICE_CACHE_LOCK:
+            cached = _VOICE_CACHE.get(cache_key)
+            if cached is not None:
+                return list(cached)
     for manifest_path in resolved_manifests:
         if not manifest_path.exists():
             continue
@@ -596,9 +681,6 @@ def discover_piper_voices(
                 config=config,
                 created_at=item.get("created_at"),
             )
-    resolved_roots = search_roots if search_roots is not None else _env_path_list(
-        "AIBRAIN_TTS_VOICE_ROOTS"
-    )
     for root in resolved_roots:
         if not root.exists():
             continue
@@ -615,7 +697,11 @@ def discover_piper_voices(
                     config=_matching_config(onnx),
                 ),
             )
-    return sorted(voices.values(), key=lambda voice: voice.slug)
+    discovered = sorted(voices.values(), key=lambda voice: voice.slug)
+    if use_cache:
+        with _VOICE_CACHE_LOCK:
+            _VOICE_CACHE[cache_key] = list(discovered)
+    return discovered
 
 
 def resolve_piper_voice(voice_id: str | None = None) -> PiperVoice | None:

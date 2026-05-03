@@ -108,6 +108,23 @@ async def test_ask_passes_responses_state_options(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_thread_lock_cache_evicts_old_unlocked_locks(tmp_path):
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            thread_lock_cache_size=2,
+        ),
+        client=FakeOpenAI(),
+    )
+
+    await brain._get_thread_lock("thread-a")
+    await brain._get_thread_lock("thread-b")
+    await brain._get_thread_lock("thread-c")
+
+    assert list(brain._thread_locks) == ["thread-b", "thread-c"]
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_continues_with_function_output(tmp_path):
     client = FakeOpenAI()
 

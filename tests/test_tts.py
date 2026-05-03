@@ -121,6 +121,14 @@ def test_sentence_chunker_splits_early():
     assert chunker.flush() == "next"
 
 
+def test_sentence_chunker_does_not_reconsider_too_short_punctuation():
+    chunker = SentenceChunker(max_chars=80, min_chars=6)
+
+    assert chunker.feed("Hi.") == []
+    assert chunker.feed(" there") == []
+    assert chunker.flush() == "Hi. there"
+
+
 def test_split_tts_text_keeps_sentence_chunks():
     config = TTSConfig(provider="null", chunk_chars=180, min_chunk_chars=6)
     assert split_tts_text("First sentence. Second sentence.", config) == [
@@ -234,6 +242,32 @@ def test_discover_piper_voices_uses_env_roots_and_manifests(tmp_path, monkeypatc
     assert {"manifest", "rooted"} <= slugs
 
 
+def test_discover_piper_voices_caches_and_refreshes_env_scan(tmp_path, monkeypatch):
+    model = tmp_path / "voice.onnx"
+    config_path = tmp_path / "voice.onnx.json"
+    model.write_bytes(b"model")
+    config_path.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps([{"slug": "voice", "label": "First", "onnx": str(model)}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AIBRAIN_TTS_MANIFESTS", str(manifest))
+    monkeypatch.delenv("AIBRAIN_TTS_VOICE_ROOTS", raising=False)
+
+    first = tts_module.discover_piper_voices(refresh=True)
+    manifest.write_text(
+        json.dumps([{"slug": "voice", "label": "Second", "onnx": str(model)}]),
+        encoding="utf-8",
+    )
+    cached = tts_module.discover_piper_voices()
+    refreshed = tts_module.discover_piper_voices(refresh=True)
+
+    assert first[0].label == "First"
+    assert cached[0].label == "First"
+    assert refreshed[0].label == "Second"
+
+
 class FakePiperProcess(PiperProcessTTS):
     def __init__(self):
         super().__init__(TTSConfig(provider="null"))
@@ -272,6 +306,24 @@ class PartialFailurePiperProcess(PiperProcessTTS):
     async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
         self.fallback_calls += 1
         return b"fallback"
+
+
+class FakeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
 
 
 class ConcurrentFakePiperProcess(PiperProcessTTS):
@@ -354,6 +406,25 @@ async def test_piper_process_locks_per_voice(tmp_path):
     await asyncio.gather(first, second)
 
     assert provider.max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_piper_process_pool_evicts_old_idle_process():
+    provider = PiperProcessTTS(TTSConfig(provider="null", process_pool_max=1))
+    old_key = ("old",)
+    new_key = ("new",)
+    old_process = FakeProcess()
+    new_process = FakeProcess()
+    provider._processes[old_key] = old_process
+    provider._processes[new_key] = new_process
+    provider._locks[old_key] = asyncio.Lock()
+    provider._locks[new_key] = asyncio.Lock()
+
+    await provider._evict_process_pool(keep_key=new_key)
+
+    assert old_process.terminated is True
+    assert old_key not in provider._processes
+    assert new_key in provider._processes
 
 
 def test_tts_config_for_voice_resolves_requested_voice(tmp_path, monkeypatch):

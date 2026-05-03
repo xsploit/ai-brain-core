@@ -37,6 +37,9 @@ class BrainConfig(BaseModel):
     stream_event_queue_max: int = Field(
         default_factory=lambda: _env_int("AIBRAIN_STREAM_EVENT_QUEUE_MAX", 256)
     )
+    thread_lock_cache_size: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_THREAD_LOCK_CACHE_SIZE", 4096)
+    )
     models_cache_ttl_seconds: int = Field(
         default_factory=lambda: _env_int("AIBRAIN_MODELS_CACHE_TTL_SECONDS", 300)
     )
