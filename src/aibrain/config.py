@@ -56,6 +56,12 @@ class BrainConfig(BaseModel):
     )
     memory_top_k: int = 5
     memory_min_score: float = 0.05
+    memory_vec_overfetch: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_MEMORY_VEC_OVERFETCH", 5)
+    )
+    voice_socket_max_message_bytes: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_VOICE_SOCKET_MAX_MESSAGE_BYTES", 1 << 20)
+    )
     memory_policy: MemoryPolicy = Field(default_factory=MemoryPolicy)
     auto_memory_tools: bool = True
     default_persona: Persona = Field(default_factory=Persona)

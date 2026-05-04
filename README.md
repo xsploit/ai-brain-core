@@ -6,7 +6,7 @@ Reusable Python brain for bots, avatars, desktop agents, voice apps, and local t
 [![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20%2B%20Conversations-111111)](https://platform.openai.com/docs)
 [![FastAPI](https://img.shields.io/badge/FastAPI-HTTP%20%2B%20WebSocket-009688)](https://fastapi.tiangolo.com/)
 [![CI](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml/badge.svg)](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml)
-[![Tests](https://img.shields.io/badge/tests-96%20passing-2E7D32)](#development)
+[![Tests](https://img.shields.io/badge/tests-102%20passing-2E7D32)](#development)
 
 AI Brain Core is a framework layer around the OpenAI Responses and
 Conversations APIs. It gives you one importable "brain" that can be dropped into
@@ -408,6 +408,8 @@ $env:AIBRAIN_VAD_THRESHOLD="0.5"
 | `AIBRAIN_STREAM_EVENT_QUEUE_MAX` | `256` | Backpressure bound for streaming events |
 | `AIBRAIN_THREAD_LOCK_CACHE_SIZE` | `4096` | Max remembered per-thread locks |
 | `AIBRAIN_MODELS_CACHE_TTL_SECONDS` | `300` | `/models` cache TTL |
+| `AIBRAIN_MEMORY_VEC_OVERFETCH` | `5` | sqlite-vec candidate multiplier before metadata filters |
+| `AIBRAIN_VOICE_SOCKET_MAX_MESSAGE_BYTES` | `1048576` | Max binary `/voice` audio chunk size; `0` disables the guard |
 | `AIBRAIN_TTS_PROVIDER` | `piper_process` | `piper_process`, `piper_executable`, `piper_http`, `null` |
 | `AIBRAIN_STT_PROVIDER` | `faster_whisper` | `faster_whisper` or `null` |
 | `AIBRAIN_VAD_PROVIDER` | `silero` | `silero`, `energy`, or `none` |
@@ -427,7 +429,7 @@ package behavior and are covered by the base test suite.
 Current verification:
 
 ```text
-96 passed
+102 passed
 ```
 
 ## Project Shape

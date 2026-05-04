@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -76,6 +77,11 @@ class FakeWebSocket:
     async def close(self):
         self.close_calls += 1
         self.closed = True
+
+
+class FailingCloseWebSocket:
+    async def close(self):
+        raise RuntimeError("close failed")
 
 
 @pytest.mark.asyncio
@@ -320,3 +326,19 @@ async def test_gateway_closes_websocket_when_stream_is_abandoned(monkeypatch):
 
     assert socket.close_calls == 1
     assert gateway._responses_ws_pool[0] is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_logs_websocket_close_failures(caplog):
+    gateway = OpenAIGateway(
+        SimpleNamespace(responses=FakeResponses(), conversations=FakeConversations()),
+        stream_transport="websocket",
+        websocket_pool_size=1,
+    )
+    gateway._responses_ws_pool[0] = FailingCloseWebSocket()
+
+    caplog.set_level(logging.WARNING, logger="aibrain.gateway")
+    await gateway._close_responses_websocket_slot(0)
+
+    assert gateway._responses_ws_pool[0] is None
+    assert "Failed to close responses websocket slot 0" in caplog.text

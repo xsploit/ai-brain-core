@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +21,7 @@ from .inputs import ImageInput
 from .policy import MemoryPolicy
 from .stt import AudioEncoding, VADConfig, decode_audio_base64
 
+logger = logging.getLogger(__name__)
 
 AudioTransport = Literal["json_base64", "binary"]
 
@@ -328,6 +330,7 @@ async def _list_openai_models(
         )
         model_ids = ids or list(FALLBACK_MODELS)
     except Exception:
+        logger.warning("Failed to list OpenAI models, using fallback list", exc_info=True)
         model_ids = list(FALLBACK_MODELS)
     if cache is not None:
         cache["ids"] = list(model_ids)
@@ -441,6 +444,17 @@ async def _voice_socket(brain: Brain, websocket: WebSocket) -> None:
                         websocket,
                         send_lock,
                         {"type": "error", "message": "audio.start is required before binary audio"}
+                    )
+                    continue
+                max_bytes = brain.config.voice_socket_max_message_bytes
+                if max_bytes > 0 and len(message["bytes"]) > max_bytes:
+                    await _safe_send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": f"Audio chunk exceeds max size ({max_bytes} bytes)",
+                        },
                     )
                     continue
                 result = await _handle_voice_audio(websocket, send_lock, buffer, message["bytes"])

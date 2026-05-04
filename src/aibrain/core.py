@@ -117,6 +117,7 @@ class Brain:
             self.config.database_path,
             embedding_provider=provider,
             dimensions=self.config.embedding_dimensions,
+            vec_overfetch=self.config.memory_vec_overfetch,
         )
         self.tools = tools or ToolRegistry()
         self.stt = stt_provider or create_stt_provider(self.config.stt_config)

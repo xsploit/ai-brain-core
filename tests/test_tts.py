@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -326,6 +327,24 @@ class FakeProcess:
         return self.returncode
 
 
+class StubbornFakeProcess:
+    pid = 12345
+    returncode = None
+
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
 class ConcurrentFakePiperProcess(PiperProcessTTS):
     def __init__(self):
         super().__init__(TTSConfig(provider="null"))
@@ -453,6 +472,29 @@ async def test_piper_process_close_terminates_processes_concurrently():
     assert max_active == 2
     assert provider._processes == {}
     assert provider._locks == {}
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_logs_when_killed_process_still_does_not_exit(monkeypatch, caplog):
+    process = StubbornFakeProcess()
+    calls = 0
+
+    async def fake_wait_for(awaitable, timeout):
+        nonlocal calls
+        calls += 1
+        awaitable.close()
+        if calls == 1:
+            raise asyncio.TimeoutError
+        raise RuntimeError("still alive")
+
+    monkeypatch.setattr(tts_module.asyncio, "wait_for", fake_wait_for)
+    caplog.set_level(logging.WARNING, logger="aibrain.tts")
+
+    await tts_module._terminate_process(process)
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert "Piper process 12345 did not exit after kill" in caplog.text
 
 
 def test_tts_config_for_voice_resolves_requested_voice(tmp_path, monkeypatch):

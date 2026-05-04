@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import suppress
+import logging
 from types import SimpleNamespace
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIGateway:
@@ -90,6 +92,13 @@ class OpenAIGateway:
                     raise
                 except Exception as exc:
                     last_error = exc
+                    logger.warning(
+                        "Responses websocket slot %d failed (attempt %d, started=%s): %s",
+                        slot,
+                        attempt,
+                        started,
+                        exc,
+                    )
                     await self._close_responses_websocket_slot(slot)
                     if started or attempt:
                         raise
@@ -161,10 +170,16 @@ class OpenAIGateway:
         close = getattr(websocket, "close", None)
         if close is None:
             return
-        result = close()
+        try:
+            result = close()
+        except Exception:
+            logger.warning("Failed to close responses websocket slot %d", slot, exc_info=True)
+            return
         if hasattr(result, "__await__"):
-            with suppress(Exception):
+            try:
                 await result
+            except Exception:
+                logger.warning("Failed to close responses websocket slot %d", slot, exc_info=True)
 
     async def parse_response(self, *, text_format: type[Any], **params: Any) -> Any:
         return await self.client.responses.parse(text_format=text_format, **params)

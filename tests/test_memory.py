@@ -265,3 +265,34 @@ def test_memory_vec_backfill_targets_missing_vector_rows(tmp_path):
     assert 7 in {row["rowid"] for row in rows}
     assert missing["vector_rowid"] is not None
     assert store._vec_backfilled is True
+
+
+def test_memory_vec_overfetch_controls_sqlite_vec_k(tmp_path):
+    store = SQLiteMemoryStore(
+        tmp_path / "brain.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=1),
+        dimensions=1,
+        vec_overfetch=7,
+    )
+    store.sqlite_vec_enabled = True
+    calls = []
+
+    class FakeCursor:
+        def fetchall(self):
+            return []
+
+    class FakeConn:
+        def execute(self, sql, params=()):
+            calls.append((sql, params))
+            return FakeCursor()
+
+    rows = store._search_rows_with_sqlite_vec(
+        FakeConn(),
+        [0.1],
+        where=[],
+        params=[],
+        top_k=3,
+    )
+
+    assert rows == []
+    assert calls[0][1] == ("[0.1]", 21)

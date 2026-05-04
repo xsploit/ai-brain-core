@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -10,13 +11,14 @@ import threading
 import wave
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 def _env_path(name: str, fallback: Path | None = None) -> Path | None:
@@ -451,8 +453,10 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(process.wait(), timeout=2)
     except asyncio.TimeoutError:
         process.kill()
-        with suppress(Exception):
+        try:
             await asyncio.wait_for(process.wait(), timeout=2)
+        except Exception:
+            logger.warning("Piper process %s did not exit after kill", process.pid, exc_info=True)
 
 
 class SentenceChunker:

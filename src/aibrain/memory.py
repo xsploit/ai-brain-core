@@ -30,11 +30,13 @@ class SQLiteMemoryStore:
         path: str | Path,
         embedding_provider: EmbeddingProvider | None = None,
         dimensions: int = 256,
+        vec_overfetch: int = 5,
     ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.embedding_provider = embedding_provider or HashEmbeddingProvider(dimensions)
         self.dimensions = dimensions
+        self.vec_overfetch = max(1, vec_overfetch)
         self.sqlite_vec_enabled = False
         self._vec_backfilled = False
         self._conn: sqlite3.Connection | None = None
@@ -363,7 +365,7 @@ class SQLiteMemoryStore:
                 WHERE embedding MATCH ? AND k = ?
                 ORDER BY distance
                 """,
-                (json.dumps(query_embedding), max(top_k * 5, top_k)),
+                (json.dumps(query_embedding), max(top_k * self.vec_overfetch, top_k)),
             ).fetchall()
         except sqlite3.Error:
             return None

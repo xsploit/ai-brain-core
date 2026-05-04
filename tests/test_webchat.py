@@ -1,8 +1,10 @@
-from fastapi.testclient import TestClient
-
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
 
 from aibrain import (
     BaseTTSProvider,
@@ -14,7 +16,7 @@ from aibrain import (
     TTSChunk,
     TTSConfig,
 )
-from aibrain.server import create_app
+from aibrain.server import _list_openai_models, create_app
 
 
 class FakeModels:
@@ -35,6 +37,16 @@ class FakeModels:
 class FakeClient:
     def __init__(self):
         self.models = FakeModels()
+
+
+class BrokenModels:
+    async def list(self):
+        raise RuntimeError("models unavailable")
+
+
+class BrokenModelsClient:
+    def __init__(self):
+        self.models = BrokenModels()
 
 
 class FakeTTS(BaseTTSProvider):
@@ -146,6 +158,22 @@ def test_models_endpoint_uses_cache(tmp_path):
     assert first.status_code == 200
     assert second.status_code == 200
     assert openai_client.models.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_list_fallback_logs_warning(tmp_path, caplog):
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", default_model="gpt-default"),
+        client=BrokenModelsClient(),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+
+    caplog.set_level(logging.WARNING, logger="aibrain.server")
+    model_ids = await _list_openai_models(brain)
+
+    assert "gpt-5-nano" in model_ids
+    assert "Failed to list OpenAI models" in caplog.text
 
 
 def test_stream_websocket_cancel_stops_active_turn(tmp_path):
@@ -304,3 +332,34 @@ def test_voice_websocket_rejects_non_object_text_payload(tmp_path):
 
     assert event["type"] == "error"
     assert "JSON object" in event["message"]
+
+
+def test_voice_websocket_rejects_oversize_binary_audio_chunk(tmp_path):
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            voice_socket_max_message_bytes=4,
+        ),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(TTSConfig(provider="null")),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice") as ws:
+            ws.send_json(
+                {
+                    "type": "audio.start",
+                    "thread_id": "voice:oversize",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "vad": {"provider": "none"},
+                }
+            )
+            assert ws.receive_json()["type"] == "audio.started"
+            ws.send_bytes(b"12345")
+            event = ws.receive_json()
+
+    assert event["type"] == "error"
+    assert "exceeds max size (4 bytes)" in event["message"]
