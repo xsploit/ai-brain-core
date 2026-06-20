@@ -45,6 +45,19 @@ class FakeOpenAI:
         self.responses = FakeResponses()
 
 
+class RecordingEmbeddingProvider:
+    def __init__(self, *, dimensions: int = 16, max_len: int = 12):
+        self.dimensions = dimensions
+        self.max_len = max_len
+        self.calls = []
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        if len(text) > self.max_len:
+            raise AssertionError(f"embedding input too long: {len(text)}")
+        return [1.0, *([0.0] * (self.dimensions - 1))]
+
+
 @pytest.mark.asyncio
 async def test_raw_log_appends_and_lists_thread_events(tmp_path):
     store = SQLiteRawEventStore(tmp_path / "brain.sqlite3")
@@ -244,6 +257,23 @@ async def test_brain_memory_stack_logs_and_extracts_when_enabled(tmp_path):
     assert facts
     assert facts[0].predicate == "likes"
     assert brain.memory_stack.grillo is not None
+
+
+@pytest.mark.asyncio
+async def test_brain_bounds_memory_retrieval_query_before_embedding(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIBRAIN_MEMORY_QUERY_MAX_CHARS", "12")
+    provider = RecordingEmbeddingProvider(max_len=12)
+    config = BrainConfig(
+        database_path=tmp_path / "brain.sqlite3",
+        memory_stack=MemoryStackConfig(enabled=True, retrieve=True),
+    )
+    brain = Brain(config, client=FakeOpenAI(), embedding_provider=provider)
+
+    response = await brain.ask("x" * 200, thread_id="thread-long-query")
+
+    assert response.text == "noted"
+    assert provider.calls
+    assert all(len(call) <= 12 for call in provider.calls)
 
 
 @pytest.mark.asyncio

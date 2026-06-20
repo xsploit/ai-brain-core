@@ -46,7 +46,7 @@ DEFAULT_JB_PROMPT_FILE = "prompts/eni-lite-writer-claude-design.txt"
 DEFAULT_TTS_REPLIES = True
 DEFAULT_IGNORE_BOTS = False
 DEFAULT_RESPOND_TO_BOTS = True
-DEFAULT_MEMORY_QUERY_MAX_CHARS = 12000
+DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
 TEXT_ATTACHMENT_SUFFIXES = {
     ".bat",
@@ -1384,7 +1384,8 @@ class DiscordBrainBot(commands.Bot):
 
 
 def _memory_query_text(text: str) -> str:
-    limit = max(1, _env_int("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS))
+    default = _env_int("AIBRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS)
+    limit = max(1, _env_int("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", default))
     return str(text or "").strip()[:limit]
 
 

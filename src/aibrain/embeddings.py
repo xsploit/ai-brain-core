@@ -7,6 +7,9 @@ import re
 from typing import Any, Callable, Protocol
 
 
+DEFAULT_EMBEDDING_INPUT_MAX_CHARS = 6000
+
+
 class EmbeddingProvider(Protocol):
     async def embed(self, text: str) -> list[float]:
         ...
@@ -44,7 +47,7 @@ class OpenAIEmbeddingProvider:
         client = self.client() if callable(self.client) else self.client
         if not hasattr(client, "embeddings"):
             return await self.fallback.embed(text)
-        kwargs: dict[str, Any] = {"model": self.model, "input": text}
+        kwargs: dict[str, Any] = {"model": self.model, "input": _bounded_embedding_input(text)}
         if self.dimensions is not None:
             kwargs["dimensions"] = self.dimensions
         result = await client.embeddings.create(**kwargs)
@@ -59,3 +62,18 @@ def default_embedding_provider(
     if os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("OPENAI_API_KEY"):
         return OpenAIEmbeddingProvider(client_factory, model=model, dimensions=dimensions)
     return HashEmbeddingProvider(dimensions=dimensions)
+
+
+def _bounded_embedding_input(text: str) -> str:
+    limit = _env_int("AIBRAIN_EMBEDDING_MAX_INPUT_CHARS", DEFAULT_EMBEDDING_INPUT_MAX_CHARS)
+    return str(text or "").strip()[: max(1, limit)]
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default

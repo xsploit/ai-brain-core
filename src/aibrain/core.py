@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import threading
 from collections import OrderedDict, deque
@@ -55,6 +56,7 @@ _HELD_THREAD_LOCKS: ContextVar[frozenset[str]] = ContextVar(
     "aibrain_held_thread_locks",
     default=frozenset(),
 )
+DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
 
 _CONTINUATION_PARAM_KEYS = frozenset(
     {
@@ -1169,15 +1171,16 @@ class Brain:
             response_options.pop("memory_policy", None),
         )
         if memory_policy.enabled and state is not None:
+            memory_query = _memory_query_text(text)
             memory_hits = await memory_policy.retrieve(
                 self.memory,
-                text,
+                memory_query,
                 thread=state,
                 persona_id=resolved.id,
             )
             if self.memory_stack is not None and self.config.memory_stack.retrieve:
                 stack_hits = await self.memory_stack.retrieve_records(
-                    text,
+                    memory_query,
                     top_k=memory_policy.top_k,
                     thread=state,
                     persona_id=resolved.id,
@@ -1626,6 +1629,21 @@ class Brain:
         if isinstance(item, dict):
             return item.get(name)
         return getattr(item, name, None)
+
+
+def _memory_query_text(text: str) -> str:
+    limit = _env_int("AIBRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS)
+    return str(text or "").strip()[: max(1, limit)]
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _dedupe_memory_records(records: list[MemoryRecord]) -> list[MemoryRecord]:
