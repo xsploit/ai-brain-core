@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import aibrain.discord_bot as discord_bot_module
 from aibrain.discord_bot import (
-    DEFAULT_DISCORD_TOOL_NAMES,
     DEFAULT_IGNORE_BOTS,
+    DEFAULT_RESPOND_TO_BOTS,
     DEFAULT_TTS_REPLIES,
     DiscordBrainBot,
     DiscordVoiceClip,
@@ -106,6 +106,27 @@ class _FakeBrain:
         self.kwargs = kwargs
         yield SimpleNamespace(type="text.delta", data={"text": "ok"})
         yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeGrilloPacket:
+    def __init__(self, text: str):
+        self.text = text
+
+    def as_prompt_text(self):
+        return self.text
+
+
+class _FakeGrilloRuntime:
+    def __init__(self, text: str = "<grillo_context />", error: Exception | None = None):
+        self.text = text
+        self.error = error
+        self.calls = []
+
+    async def build_context_packet(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return _FakeGrilloPacket(self.text)
 
 
 class _FakeTTSBrain:
@@ -218,15 +239,14 @@ def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
 
     assert "DOC PROMPT" not in normal
     assert "DOC PROMPT" in jb_persona.instructions
-    assert jb_persona.id == "neuro-sama"
+    assert jb_persona.id == "jb-one-shot"
     assert jb_persona.name == "JB"
     assert jb_persona.model == "deepseek/test"
-    assert "search_memory" in jb_persona.tools
-    assert "remember" in jb_persona.tools
+    assert jb_persona.tools == []
     assert "Neuro-sama" not in jb_persona.name
 
 
-def test_jb_reply_uses_jb_persona_with_memory_enabled(monkeypatch):
+def test_jb_reply_uses_isolated_jb_path(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
     brain = _FakeBrain()
@@ -247,6 +267,12 @@ def test_jb_reply_uses_jb_persona_with_memory_enabled(monkeypatch):
             message,
             user_text_override="write this once",
             persona_override=jb_persona,
+            thread_id_override=f"discord:jb:{message.id}",
+            use_memory=False,
+            tool_names=[],
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
             prompt_cache_key="discord-brain:jb:test",
             prompt_cache_retention="24h",
         )
@@ -254,12 +280,44 @@ def test_jb_reply_uses_jb_persona_with_memory_enabled(monkeypatch):
 
     assert "DOC PROMPT" not in brain.prompt
     assert brain.kwargs["persona"] is jb_persona
-    assert brain.kwargs["thread_id"] == "discord:dm:123"
-    assert brain.kwargs["use_memory"].enabled is True
-    assert brain.kwargs["tool_names"] == DEFAULT_DISCORD_TOOL_NAMES
+    assert brain.kwargs["thread_id"] == "discord:jb:789"
+    assert brain.kwargs["use_memory"] is False
+    assert brain.kwargs["tool_names"] == []
+    assert brain.kwargs["stateless"] is True
     assert brain.kwargs["prompt_cache_key"] == "discord-brain:jb:test"
     assert brain.kwargs["prompt_cache_retention"] == "24h"
     assert message._fake_reply.edits == ["ok"]
+
+
+def test_grillo_query_is_bounded_without_truncating_prompt(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", "12")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    runtime = _FakeGrilloRuntime("<grillo>ok</grillo>")
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=runtime))
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "x" * 40))
+
+    assert len(runtime.calls[0]["query"]) == 12
+    assert len(runtime.calls[0]["current_turn_text"]) == 12
+    assert "x" * 40 in prompt
+    assert "<grillo>ok</grillo>" in prompt
+
+
+def test_grillo_failure_keeps_plain_prompt(monkeypatch):
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    runtime = _FakeGrilloRuntime(error=RuntimeError("embedding limit"))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=runtime))
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "plain text"))
+
+    assert "plain text" in prompt
+    assert "<grillo" not in prompt
 
 
 def test_reply_includes_text_file_attachments(monkeypatch):
@@ -426,6 +484,28 @@ def test_bot_message_ignore_toggle_keeps_self_guard():
 
 def test_bot_messages_are_not_ignored_by_default():
     assert DEFAULT_IGNORE_BOTS is False
+    assert DEFAULT_RESPOND_TO_BOTS is True
+
+
+def test_unignored_bot_messages_trigger_default_reply_without_mention():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = False
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is True
+
+    bot.respond_to_bots = False
+
+    assert bot._should_respond(message) is False
 
 
 def test_unignored_bot_commands_are_invoked_without_process_commands():

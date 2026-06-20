@@ -45,6 +45,8 @@ DEFAULT_DISCORD_TIMEZONE = "America/Los_Angeles"
 DEFAULT_JB_PROMPT_FILE = "prompts/eni-lite-writer-claude-design.txt"
 DEFAULT_TTS_REPLIES = True
 DEFAULT_IGNORE_BOTS = False
+DEFAULT_RESPOND_TO_BOTS = True
+DEFAULT_MEMORY_QUERY_MAX_CHARS = 12000
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
 TEXT_ATTACHMENT_SUFFIXES = {
     ".bat",
@@ -551,6 +553,7 @@ class DiscordBrainBot(commands.Bot):
         self.respond_to_dms = _env_bool("DISCORD_BRAIN_RESPOND_TO_DMS", True)
         self.respond_to_all = _env_bool("DISCORD_BRAIN_RESPOND_TO_ALL", False)
         self.ignore_bots = _env_bool("DISCORD_BRAIN_IGNORE_BOTS", DEFAULT_IGNORE_BOTS)
+        self.respond_to_bots = _env_bool("DISCORD_BRAIN_RESPOND_TO_BOTS", DEFAULT_RESPOND_TO_BOTS)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_MAX_REPLY_CHARS", 1900)
         self.edit_interval_seconds = max(0.25, _env_float("DISCORD_BRAIN_EDIT_INTERVAL_SECONDS", 1.0))
         self.recent_by_scope: dict[str, list[dict[str, Any]]] = {}
@@ -621,6 +624,8 @@ class DiscordBrainBot(commands.Bot):
             return True
         if message.guild is None:
             return self.respond_to_dms
+        if getattr(message.author, "bot", False) and not self.ignore_bots and self.respond_to_bots:
+            return True
         return bool(self.respond_to_mentions and self.user and self.user in message.mentions)
 
     def _is_command_message(self, message: discord.Message) -> bool:
@@ -884,13 +889,17 @@ class DiscordBrainBot(commands.Bot):
             jb_persona = _build_jb_persona(
                 one_shot_prompt,
                 fallback_model=self.brain.config.default_model,
-                base_persona=self.persona,
             )
-            self._record_recent(ctx.message)
             await self._reply_with_brain(
                 ctx.message,
                 user_text_override=content,
                 persona_override=jb_persona,
+                thread_id_override=f"discord:jb:{ctx.message.id}",
+                use_memory=False,
+                tool_names=[],
+                include_grillo_context=False,
+                record_grillo=False,
+                stateless=True,
                 prompt_cache_key=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "discord-brain:jb:v1"),
                 prompt_cache_retention=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h"),
             )
@@ -1205,33 +1214,38 @@ class DiscordBrainBot(commands.Bot):
         tool_names: list[str] | None = None,
         include_grillo_context: bool = True,
         record_grillo: bool = True,
+        stateless: bool = False,
         prompt_cache_key: str | None = None,
         prompt_cache_retention: str | None = None,
-        ) -> None:
+    ) -> None:
         scope = thread_id_override or _scope_for_message(message)
-        user_text = user_text_override if user_text_override is not None else _message_text(message)
-        attachment_text = await _text_attachment_context(message)
-        if attachment_text:
-            user_text = f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
-        persona = persona_override or self.persona
-        prompt = await self._build_prompt_for_message(
-            message,
-            scope,
-            user_text,
-            one_shot_pre_prompt=one_shot_pre_prompt,
-            include_grillo_context=include_grillo_context,
-            persona_name=persona.name,
-        )
-        images = _image_inputs(message)
-        token = DISCORD_CONTEXT.set(self._context_for_message(message))
-        tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
-        response_options: dict[str, Any] = {}
-        if prompt_cache_key:
-            response_options["prompt_cache_key"] = prompt_cache_key
-        if prompt_cache_retention:
-            response_options["prompt_cache_retention"] = prompt_cache_retention
+        token = None
+        tool_token = None
         buffer = ""
         try:
+            user_text = user_text_override if user_text_override is not None else _message_text(message)
+            attachment_text = await _text_attachment_context(message)
+            if attachment_text:
+                user_text = f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
+            persona = persona_override or self.persona
+            prompt = await self._build_prompt_for_message(
+                message,
+                scope,
+                user_text,
+                one_shot_pre_prompt=one_shot_pre_prompt,
+                include_grillo_context=include_grillo_context,
+                persona_name=persona.name,
+            )
+            images = _image_inputs(message)
+            token = DISCORD_CONTEXT.set(self._context_for_message(message))
+            tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
+            response_options: dict[str, Any] = {}
+            if prompt_cache_key:
+                response_options["prompt_cache_key"] = prompt_cache_key
+            if prompt_cache_retention:
+                response_options["prompt_cache_retention"] = prompt_cache_retention
+            if stateless:
+                response_options["stateless"] = True
             async with message.channel.typing():
                 async for event in self.brain.stream(
                     prompt,
@@ -1243,7 +1257,7 @@ class DiscordBrainBot(commands.Bot):
                         if use_memory is None
                         else use_memory
                     ),
-                    tool_names=tool_names or DEFAULT_DISCORD_TOOL_NAMES,
+                    tool_names=tool_names if tool_names is not None else DEFAULT_DISCORD_TOOL_NAMES,
                     **response_options,
                 ):
                     if event.type == "text.delta":
@@ -1257,11 +1271,14 @@ class DiscordBrainBot(commands.Bot):
                 if record_grillo:
                     self._schedule_grillo_ingest(message, scope, user_text, buffer.strip())
         except Exception as exc:
-            self.logger.exception("Brain turn failed for scope %s", scope)
+            logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
+            logger.exception("Brain turn failed for scope %s", scope)
             await message.reply(f"brain failed: {exc}", mention_author=False)
         finally:
-            DISCORD_CONTEXT.reset(token)
-            DISCORD_TOOL_CONTEXT.reset(tool_token)
+            if token is not None:
+                DISCORD_CONTEXT.reset(token)
+            if tool_token is not None:
+                DISCORD_TOOL_CONTEXT.reset(tool_token)
 
     async def _build_prompt_for_message(
         self,
@@ -1291,14 +1308,20 @@ class DiscordBrainBot(commands.Bot):
         runtime = self.brain.memory_stack.grillo if include_grillo_context and self.brain.memory_stack else None
         if runtime is None:
             return prompt
-        packet = await runtime.build_context_packet(
-            scope_key=scope,
-            participant_key=str(message.author.id),
-            query=user_text,
-            current_turn_text=user_text,
-            persona_name=persona_name or self.persona.name,
-            top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
-        )
+        memory_query = _memory_query_text(user_text)
+        try:
+            packet = await runtime.build_context_packet(
+                scope_key=scope,
+                participant_key=str(message.author.id),
+                query=memory_query,
+                current_turn_text=memory_query,
+                persona_name=persona_name or self.persona.name,
+                top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
+            )
+        except Exception:
+            logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
+            logger.exception("GRILLO context packet failed for scope %s; continuing without GRILLO", scope)
+            return prompt
         grillo_prompt = packet.as_prompt_text()
         return f"{grillo_prompt}\n\n{prompt}" if grillo_prompt else prompt
 
@@ -1358,6 +1381,11 @@ class DiscordBrainBot(commands.Bot):
                 await message.reply(chunk, mention_author=False)
             else:
                 await message.channel.send(chunk)
+
+
+def _memory_query_text(text: str) -> str:
+    limit = max(1, _env_int("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS))
+    return str(text or "").strip()[:limit]
 
 
 def _split_discord_text(text: str, limit: int) -> list[str]:
@@ -1800,7 +1828,7 @@ def build_persona() -> Persona:
 
 def _build_jb_persona(instructions: str, *, fallback_model: str, base_persona: Persona | None = None) -> Persona:
     return Persona(
-        id=os.getenv("DISCORD_BRAIN_JB_PERSONA_ID", base_persona.id if base_persona else "jb-one-shot"),
+        id=os.getenv("DISCORD_BRAIN_JB_PERSONA_ID", "jb-one-shot"),
         name=os.getenv("DISCORD_BRAIN_JB_PERSONA_NAME", "JB"),
         instructions=(
             instructions.strip()
@@ -1813,7 +1841,7 @@ def _build_jb_persona(instructions: str, *, fallback_model: str, base_persona: P
             "DISCORD_BRAIN_JB_MODEL",
             os.getenv("DISCORD_BRAIN_MODEL", os.getenv("AI_BRAIN_MODEL", fallback_model)),
         ),
-        tools=base_persona.tools if base_persona and base_persona.tools else DEFAULT_DISCORD_TOOL_NAMES,
+        tools=[],
     )
 
 
