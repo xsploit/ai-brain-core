@@ -18,6 +18,7 @@ from aibrain.discord_bot import (
     _ordered_model_choices,
     _ping_reply,
     _ping_target_mention,
+    _read_attachment_bytes,
     _scoped_ladybug_facts,
     _text_attachment_context,
     _time_context,
@@ -80,6 +81,17 @@ class _FakeVoiceAttachment:
 
     def is_voice_message(self):
         return True
+
+
+class _CachedFailsAttachment:
+    def __init__(self):
+        self.calls = []
+
+    async def read(self, *, use_cached=True):
+        self.calls.append(use_cached)
+        if use_cached:
+            raise RuntimeError("415 Unsupported Media Type: failed to get asset")
+        return b"direct-url-bytes"
 
 
 class _FakeBrain:
@@ -319,6 +331,15 @@ def test_text_attachment_defaults_are_larger(monkeypatch):
 
     assert "notes.txt" in context
     assert "exceeds" not in context
+
+
+def test_attachment_read_uses_direct_url_before_cached_proxy():
+    attachment = _CachedFailsAttachment()
+
+    raw = asyncio.run(_read_attachment_bytes(attachment))
+
+    assert raw == b"direct-url-bytes"
+    assert attachment.calls == [False]
 
 
 def test_tts_replies_default_on():

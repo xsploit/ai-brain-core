@@ -286,10 +286,26 @@ def _is_readable_attachment(attachment: discord.Attachment) -> bool:
 
 
 async def _read_attachment_bytes(attachment: discord.Attachment) -> bytes:
+    errors: list[Exception] = []
+    for use_cached in (False, True):
+        try:
+            return await attachment.read(use_cached=use_cached)
+        except TypeError:
+            if not use_cached:
+                try:
+                    return await attachment.read()
+                except Exception as exc:
+                    errors.append(exc)
+            continue
+        except Exception as exc:
+            errors.append(exc)
+            continue
+    if errors:
+        raise errors[-1]
     try:
-        return await attachment.read(use_cached=True)
-    except TypeError:
         return await attachment.read()
+    except Exception as exc:
+        raise exc
 
 
 def _pdf_text_from_bytes(raw: bytes, *, max_pages: int) -> tuple[str, int]:
