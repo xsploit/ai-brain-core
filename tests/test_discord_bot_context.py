@@ -523,6 +523,67 @@ def test_unignored_bot_messages_trigger_default_reply_without_mention():
     assert bot._should_respond(message) is False
 
 
+def test_pause_blocks_all_normal_responses():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = True
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[SimpleNamespace(id=999)],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_pause_command_messages_are_still_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.command_prefix_text = "!brain"
+
+    assert bot._is_command_message(SimpleNamespace(content="!pause")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!resume")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!unpause")) is True
+
+
+def test_bot_interactions_enabled_requires_not_ignored_and_responding():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.ignore_bots = False
+    bot.respond_to_bots = True
+
+    assert bot._bot_interactions_enabled() is True
+
+    bot.respond_to_bots = False
+
+    assert bot._bot_interactions_enabled() is False
+
+    bot.respond_to_bots = True
+    bot.ignore_bots = True
+
+    assert bot._bot_interactions_enabled() is False
+
+
+def test_paused_reply_with_brain_does_not_send_final_reply(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = True
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._fake_reply.edits == []
+
+
 def test_unignored_bot_commands_are_invoked_without_process_commands():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     events = []

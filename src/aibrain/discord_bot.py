@@ -558,6 +558,7 @@ class DiscordBrainBot(commands.Bot):
         self.respond_to_all = _env_bool("DISCORD_BRAIN_RESPOND_TO_ALL", False)
         self.ignore_bots = _env_bool("DISCORD_BRAIN_IGNORE_BOTS", DEFAULT_IGNORE_BOTS)
         self.respond_to_bots = _env_bool("DISCORD_BRAIN_RESPOND_TO_BOTS", DEFAULT_RESPOND_TO_BOTS)
+        self.paused = _env_bool("DISCORD_BRAIN_PAUSED", False)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_MAX_REPLY_CHARS", 1900)
         self.edit_interval_seconds = max(0.25, _env_float("DISCORD_BRAIN_EDIT_INTERVAL_SECONDS", 1.0))
         self.recent_by_scope: dict[str, list[dict[str, Any]]] = {}
@@ -599,6 +600,8 @@ class DiscordBrainBot(commands.Bot):
         await self._process_commands_including_unignored_bots(message)
         if self._is_command_message(message):
             return
+        if getattr(self, "paused", False):
+            return
         if not self._allowed(message):
             return
         if not self._should_respond(message):
@@ -624,6 +627,8 @@ class DiscordBrainBot(commands.Bot):
         return True
 
     def _should_respond(self, message: discord.Message) -> bool:
+        if getattr(self, "paused", False):
+            return False
         if self.respond_to_all:
             return True
         if message.guild is None:
@@ -642,6 +647,9 @@ class DiscordBrainBot(commands.Bot):
             or stripped.startswith("!jb ")
             or stripped == "!bot"
             or stripped.startswith("!bot ")
+            or stripped == "!pause"
+            or stripped == "!resume"
+            or stripped == "!unpause"
             or stripped == "!model"
             or stripped.startswith("!model ")
             or stripped == "!ping"
@@ -672,6 +680,9 @@ class DiscordBrainBot(commands.Bot):
             return True
         await ctx.reply(f"{action} requires a Discord admin or bot owner.", mention_author=False)
         return False
+
+    def _bot_interactions_enabled(self) -> bool:
+        return bool(not self.ignore_bots and self.respond_to_bots)
 
     def _current_model(self) -> str:
         return str(getattr(self.persona, "model", None) or self.brain.config.default_model)
@@ -781,8 +792,10 @@ class DiscordBrainBot(commands.Bot):
             lines = [
                 "**AI Brain commands**",
                 "`!help` - show this menu",
+                "`!pause` - pause all normal replies while leaving commands available",
+                "`!resume` - resume normal replies",
                 "`!jb <message>` - answer once with the configured JB pre-prompt",
-                "`!bot toggle` - toggle whether bot-authored messages are ignored",
+                "`!bot toggle` - toggle bot-to-bot auto replies",
                 "`!model` - choose the runtime model from a paginated dropdown",
                 "`!model set <model-id>` - set a model by id",
                 "`!model refresh` - refresh model metadata",
@@ -818,6 +831,8 @@ class DiscordBrainBot(commands.Bot):
                         f"model: `{self.brain.config.default_model}`",
                         f"state: `{self.brain.config.state_mode}`",
                         f"memory stack: `{bool(self.brain.memory_stack)}`",
+                        f"normal replies paused: `{self.paused}`",
+                        f"bot-to-bot auto replies: `{self._bot_interactions_enabled()}`",
                         f"database: `{self.brain.config.database_path}`",
                     ]
                 ),
@@ -908,16 +923,37 @@ class DiscordBrainBot(commands.Bot):
                 prompt_cache_retention=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h"),
             )
 
+        @commands.command(name="pause")
+        async def pause(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "pause control"):
+                return
+            self.paused = True
+            await ctx.reply("normal replies paused. commands still work. use `!resume` to resume.", mention_author=False)
+
+        @commands.command(name="resume", aliases=["unpause"])
+        async def resume(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "pause control"):
+                return
+            self.paused = False
+            await ctx.reply("normal replies resumed.", mention_author=False)
+
         @commands.group(name="bot", invoke_without_command=True)
         async def bot_control(ctx: commands.Context) -> None:
-            state = "ignored" if self.ignore_bots else "not ignored"
-            await ctx.reply(f"bot-authored messages are currently `{state}`.", mention_author=False)
+            state = "enabled" if self._bot_interactions_enabled() else "stopped"
+            await ctx.reply(f"bot-to-bot auto replies are `{state}`.", mention_author=False)
 
         @bot_control.command(name="toggle")
         async def bot_toggle(ctx: commands.Context) -> None:
-            self.ignore_bots = not self.ignore_bots
-            state = "ignoring" if self.ignore_bots else "not ignoring"
-            await ctx.reply(f"now `{state}` bot-authored messages.", mention_author=False)
+            if not await self._require_admin_or_owner_command(ctx, "bot interaction control"):
+                return
+            if self._bot_interactions_enabled():
+                self.respond_to_bots = False
+                state = "stopped"
+            else:
+                self.ignore_bots = False
+                self.respond_to_bots = True
+                state = "enabled"
+            await ctx.reply(f"bot-to-bot auto replies are now `{state}`.", mention_author=False)
 
         @commands.command(name="ping")
         async def ping(ctx: commands.Context, *, target: str = "") -> None:
@@ -1171,6 +1207,8 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(remember)
         self.add_command(recall)
         self.add_command(jb)
+        self.add_command(pause)
+        self.add_command(resume)
         self.add_command(bot_control)
         self.add_command(ping)
         self.add_command(model_control)
@@ -1270,12 +1308,16 @@ class DiscordBrainBot(commands.Bot):
                     tool_names=tool_names if tool_names is not None else DEFAULT_DISCORD_TOOL_NAMES,
                     **response_options,
                 ):
+                    if getattr(self, "paused", False):
+                        return
                     if event.type == "text.delta":
                         buffer += event.data.get("text", "")
                     elif event.type == "memory.hit":
                         self.logger.debug("memory hit %s %.3f", event.data.get("id"), event.data.get("score", 0.0))
                     elif event.type == "error":
                         raise RuntimeError(event.data.get("message", "brain stream failed"))
+                if getattr(self, "paused", False):
+                    return
                 await self._send_final_reply(message, buffer.strip() or "done.")
                 await self._maybe_send_tts_reply(message, buffer.strip())
                 if record_grillo:
