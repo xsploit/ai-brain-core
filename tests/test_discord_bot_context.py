@@ -523,6 +523,41 @@ def test_unignored_bot_messages_trigger_default_reply_without_mention():
     assert bot._should_respond(message) is False
 
 
+def test_bot_mentions_do_not_bypass_bot_interaction_toggle():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[SimpleNamespace(id=999)],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_human_mentions_still_trigger_when_bot_interactions_are_stopped():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
+    )
+
+    assert bot._should_respond(message) is True
+
+
 def test_pause_blocks_all_normal_responses():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.paused = True

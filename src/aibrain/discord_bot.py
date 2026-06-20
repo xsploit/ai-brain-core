@@ -629,12 +629,13 @@ class DiscordBrainBot(commands.Bot):
     def _should_respond(self, message: discord.Message) -> bool:
         if getattr(self, "paused", False):
             return False
+        author_is_bot = bool(getattr(message.author, "bot", False))
+        if author_is_bot:
+            return self._bot_interactions_enabled()
         if self.respond_to_all:
             return True
         if message.guild is None:
             return self.respond_to_dms
-        if getattr(message.author, "bot", False) and not self.ignore_bots and self.respond_to_bots:
-            return True
         return bool(self.respond_to_mentions and self.user and self.user in message.mentions)
 
     def _is_command_message(self, message: discord.Message) -> bool:
