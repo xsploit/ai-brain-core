@@ -7,6 +7,7 @@ import aibrain.discord_bot as discord_bot_module
 from aibrain.discord_bot import (
     DEFAULT_IGNORE_BOTS,
     DEFAULT_RESPOND_TO_BOTS,
+    DEFAULT_REQUIRE_MENTION_IN_GUILDS,
     DEFAULT_TTS_REPLIES,
     DiscordBrainBot,
     DiscordVoiceClip,
@@ -500,13 +501,14 @@ def test_bot_message_ignore_toggle_keeps_self_guard():
 def test_bot_messages_are_not_ignored_by_default():
     assert DEFAULT_IGNORE_BOTS is False
     assert DEFAULT_RESPOND_TO_BOTS is True
+    assert DEFAULT_REQUIRE_MENTION_IN_GUILDS is True
 
 
-def test_unignored_bot_messages_trigger_default_reply_without_mention():
+def test_bot_messages_do_not_trigger_without_mention():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.respond_to_all = False
     bot.respond_to_dms = True
-    bot.respond_to_mentions = False
+    bot.respond_to_mentions = True
     bot.respond_to_bots = True
     bot.ignore_bots = False
     bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -514,6 +516,23 @@ def test_unignored_bot_messages_trigger_default_reply_without_mention():
         author=SimpleNamespace(id=111, bot=True),
         guild=SimpleNamespace(id=222),
         mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_bot_mentions_trigger_when_bot_interactions_are_enabled():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
     )
 
     assert bot._should_respond(message) is True
@@ -535,6 +554,24 @@ def test_bot_mentions_do_not_bypass_bot_interaction_toggle():
         author=SimpleNamespace(id=111, bot=True),
         guild=SimpleNamespace(id=222),
         mentions=[SimpleNamespace(id=999)],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_human_guild_messages_require_mention_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
     )
 
     assert bot._should_respond(message) is False

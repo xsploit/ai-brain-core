@@ -46,6 +46,7 @@ DEFAULT_JB_PROMPT_FILE = "prompts/eni-lite-writer-claude-design.txt"
 DEFAULT_TTS_REPLIES = True
 DEFAULT_IGNORE_BOTS = False
 DEFAULT_RESPOND_TO_BOTS = True
+DEFAULT_REQUIRE_MENTION_IN_GUILDS = True
 DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
 TEXT_ATTACHMENT_SUFFIXES = {
@@ -558,6 +559,10 @@ class DiscordBrainBot(commands.Bot):
         self.respond_to_all = _env_bool("DISCORD_BRAIN_RESPOND_TO_ALL", False)
         self.ignore_bots = _env_bool("DISCORD_BRAIN_IGNORE_BOTS", DEFAULT_IGNORE_BOTS)
         self.respond_to_bots = _env_bool("DISCORD_BRAIN_RESPOND_TO_BOTS", DEFAULT_RESPOND_TO_BOTS)
+        self.require_mention_in_guilds = _env_bool(
+            "DISCORD_BRAIN_REQUIRE_MENTION_IN_GUILDS",
+            DEFAULT_REQUIRE_MENTION_IN_GUILDS,
+        )
         self.paused = _env_bool("DISCORD_BRAIN_PAUSED", False)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_MAX_REPLY_CHARS", 1900)
         self.edit_interval_seconds = max(0.25, _env_float("DISCORD_BRAIN_EDIT_INTERVAL_SECONDS", 1.0))
@@ -630,13 +635,14 @@ class DiscordBrainBot(commands.Bot):
         if getattr(self, "paused", False):
             return False
         author_is_bot = bool(getattr(message.author, "bot", False))
-        if author_is_bot:
-            return self._bot_interactions_enabled()
-        if self.respond_to_all:
-            return True
         if message.guild is None:
             return self.respond_to_dms
-        return bool(self.respond_to_mentions and self.user and self.user in message.mentions)
+        mentioned = bool(self.respond_to_mentions and self.user and self.user in message.mentions)
+        if author_is_bot:
+            return bool(self._bot_interactions_enabled() and mentioned)
+        if getattr(self, "require_mention_in_guilds", DEFAULT_REQUIRE_MENTION_IN_GUILDS):
+            return mentioned
+        return bool(self.respond_to_all or mentioned)
 
     def _is_command_message(self, message: discord.Message) -> bool:
         stripped = message.content.strip()
@@ -833,6 +839,7 @@ class DiscordBrainBot(commands.Bot):
                         f"state: `{self.brain.config.state_mode}`",
                         f"memory stack: `{bool(self.brain.memory_stack)}`",
                         f"normal replies paused: `{self.paused}`",
+                        f"guild replies require mention: `{self.require_mention_in_guilds}`",
                         f"bot-to-bot auto replies: `{self._bot_interactions_enabled()}`",
                         f"database: `{self.brain.config.database_path}`",
                     ]
