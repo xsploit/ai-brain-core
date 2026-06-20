@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from ..numeric import safe_float
 from .contracts import RecallItem, VectorRecallStore
 
 
@@ -901,7 +902,7 @@ def _reduce_packet(packet: GrilloContextPacket) -> None:
         values = getattr(packet, section)
         while len(values) > 1 and sum(_estimate_tokens(str(item)) for item in values) > budget:
             if section == "recalled_memories":
-                values.sort(key=lambda item: float(item.get("score", 0.0)) if isinstance(item, dict) else 0.0, reverse=True)
+                values.sort(key=lambda item: safe_float(item.get("score"), 0.0) if isinstance(item, dict) else 0.0, reverse=True)
                 values.pop()
             else:
                 values.pop(0)
@@ -942,7 +943,7 @@ def _row_to_candidate(row: sqlite3.Row) -> GrilloCandidate:
         type=row["type"],
         content=row["content"],
         summary=row["summary"],
-        confidence=float(row["confidence"]),
+        confidence=safe_float(row["confidence"], 0.5),
         tags=_json_list(row["tags_json"]),
         source_turn_ids=_json_list(row["source_turn_ids_json"]),
         promoted=bool(row["promoted"]),

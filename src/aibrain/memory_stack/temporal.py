@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..numeric import safe_float
 from .contracts import GraphQuery, TemporalFact
 
 
@@ -217,8 +218,8 @@ def _row_to_fact(row: sqlite3.Row | dict[str, Any]) -> TemporalFact:
         object=row["object"],
         valid_from=row["valid_from"],
         valid_until=row["valid_until"],
-        confidence=float(row["confidence"]),
-        importance=float(row["importance"]),
+        confidence=safe_float(row["confidence"], 0.7),
+        importance=safe_float(row["importance"], 0.5),
         source_event_id=row["source_event_id"],
         source_session_id=row["source_session_id"],
         supersedes_memory_id=row["supersedes_memory_id"],

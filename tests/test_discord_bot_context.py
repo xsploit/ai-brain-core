@@ -1,17 +1,32 @@
 import asyncio
+import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import aibrain.discord_bot as discord_bot_module
 from aibrain.discord_bot import (
+    DEFAULT_DISCORD_TOOL_NAMES,
+    DEFAULT_IGNORE_BOTS,
+    DEFAULT_TTS_REPLIES,
     DiscordBrainBot,
+    DiscordVoiceClip,
     ModelSelectView,
     _build_jb_persona,
     _format_grillo_export,
+    _message_text,
+    _model_choice_description,
     _ordered_model_choices,
+    _ping_reply,
+    _ping_target_mention,
     _scoped_ladybug_facts,
+    _text_attachment_context,
     _time_context,
+    _tts_spoken_text,
+    build_discord_voice_clip,
+    waveform_base64_from_pcm_s16le,
 )
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
+from aibrain.tts import TTSAudio
 
 
 class _TypingContext:
@@ -46,16 +61,25 @@ class _FakeReply:
 
 
 class _FakeAttachment:
-    filename = "notes.txt"
-    content_type = "text/plain"
-    url = "https://cdn.example.invalid/notes.txt"
-
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, *, filename: str = "notes.txt", content_type: str = "text/plain"):
         self._data = data
+        self.filename = filename
+        self.content_type = content_type
+        self.url = f"https://cdn.example.invalid/{filename}"
         self.size = len(data)
 
     async def read(self, *, use_cached=True):
         return self._data
+
+
+class _FakeVoiceAttachment:
+    filename = "voice-message.ogg"
+    content_type = "audio/ogg"
+    duration = 1.25
+    waveform = bytes([0, 128, 255])
+
+    def is_voice_message(self):
+        return True
 
 
 class _FakeBrain:
@@ -70,6 +94,13 @@ class _FakeBrain:
         self.kwargs = kwargs
         yield SimpleNamespace(type="text.delta", data={"text": "ok"})
         yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeTTSBrain:
+    async def speak(self, text, **tts_options):
+        self.text = text
+        self.tts_options = tts_options
+        return TTSAudio(audio=(b"\x00\x00\xff\x7f\x00\x00\x01\x80" * 100), sample_rate=16000)
 
 
 class _FakeGraphStore:
@@ -103,9 +134,11 @@ def _fake_message(created_at: datetime):
     author = SimpleNamespace(id=123, display_name="Subsect", global_name=None, bot=False)
     channel = _FakeChannel()
     reply = _FakeReply(channel)
+    events = []
 
     async def _reply(content, *, mention_author=False):
         reply.edits.append(content)
+        events.append(("text", content))
         return reply
 
     return SimpleNamespace(
@@ -119,6 +152,7 @@ def _fake_message(created_at: datetime):
         attachments=[],
         reply=_reply,
         _fake_reply=reply,
+        _events=events,
     )
 
 
@@ -210,7 +244,7 @@ def test_jb_reply_uses_jb_persona_with_memory_enabled(monkeypatch):
     assert brain.kwargs["persona"] is jb_persona
     assert brain.kwargs["thread_id"] == "discord:dm:123"
     assert brain.kwargs["use_memory"].enabled is True
-    assert brain.kwargs["tool_names"] == ["discord_context", "remember", "search_memory", "current_time", "brain_context"]
+    assert brain.kwargs["tool_names"] == DEFAULT_DISCORD_TOOL_NAMES
     assert brain.kwargs["prompt_cache_key"] == "discord-brain:jb:test"
     assert brain.kwargs["prompt_cache_retention"] == "24h"
     assert message._fake_reply.edits == ["ok"]
@@ -230,10 +264,128 @@ def test_reply_includes_text_file_attachments(monkeypatch):
 
     asyncio.run(bot._reply_with_brain(message))
 
-    assert "[Text file attachments]" in brain.prompt
+    assert "[Readable attachments]" in brain.prompt
     assert "--- notes.txt (text/plain," in brain.prompt
     assert "important line" in brain.prompt
     assert message._fake_reply.edits == ["ok"]
+
+
+def test_reply_includes_pdf_attachment_text(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+
+    def fake_pdf_text(raw, *, max_pages):
+        assert raw == b"%PDF fake"
+        assert max_pages == 16
+        return "[page 1]\nPDF important line", 3
+
+    monkeypatch.setattr(discord_bot_module, "_pdf_text_from_bytes", fake_pdf_text)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"%PDF fake", filename="paper.pdf", content_type="application/pdf")]
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert "[Readable attachments]" in brain.prompt
+    assert "--- paper.pdf (application/pdf, 3 pages," in brain.prompt
+    assert "PDF important line" in brain.prompt
+    assert message._fake_reply.edits == ["ok"]
+
+
+def test_pdf_without_extractable_text_is_reported(monkeypatch):
+    def fake_pdf_text(raw, *, max_pages):
+        return "", 2
+
+    monkeypatch.setattr(discord_bot_module, "_pdf_text_from_bytes", fake_pdf_text)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"%PDF scanned", filename="scan.pdf", content_type="application/pdf")]
+
+    context = asyncio.run(_text_attachment_context(message))
+
+    assert "[scan.pdf skipped: application/pdf, 2 pages, no extractable text]" in context
+
+
+def test_text_attachment_defaults_are_larger(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_TEXT_ATTACHMENT_MAX_BYTES", raising=False)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"a" * 200_000)]
+
+    context = asyncio.run(_text_attachment_context(message))
+
+    assert "notes.txt" in context
+    assert "exceeds" not in context
+
+
+def test_tts_replies_default_on():
+    assert DEFAULT_TTS_REPLIES is True
+
+
+def test_tts_spoken_text_removes_markdown_formatting():
+    text = "# **Big** update\n- *first* item\n- `code` and [docs](https://example.com)\nplain *asterisks*"
+
+    assert _tts_spoken_text(text) == "Big update\nfirst item\ncode and docs\nplain asterisks"
+
+
+def test_tts_replies_skip_voice_without_constructor_attrs(monkeypatch):
+    async def fail_voice(*args, **kwargs):
+        raise AssertionError("voice should not be sent without constructor TTS attrs")
+
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fail_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._events == [("text", "ok")]
+
+
+def test_tts_reply_sends_text_before_voice(monkeypatch):
+    async def fake_clip(brain, text, *, voice=None):
+        assert text == "ok"
+        return DiscordVoiceClip(ogg=b"ogg", duration_secs=0.1, waveform="AA==")
+
+    async def fake_voice(channel_id, token, clip):
+        message._events.append(("voice", clip.ogg))
+
+    monkeypatch.setattr(discord_bot_module, "build_discord_voice_clip", fake_clip)
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fake_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.send_tts_replies = True
+    bot.discord_token = "token"
+    bot.tts_voice = "neuro-sama"
+    bot.logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._events == [("text", "ok"), ("voice", b"ogg")]
+
+
+def test_message_text_reads_voice_message_waveform():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeVoiceAttachment()]
+
+    text = _message_text(message)
+
+    assert "voice message" in text
+    assert "duration=1.25s" in text
+    assert "waveform_points=3" in text
+    assert "waveform_peak=255" in text
 
 
 def test_bot_message_ignore_toggle_keeps_self_guard():
@@ -249,6 +401,60 @@ def test_bot_message_ignore_toggle_keeps_self_guard():
 
     assert bot._is_ignored_bot_message(other_bot_message) is False
     assert bot._is_ignored_bot_message(self_message) is True
+
+
+def test_bot_messages_are_not_ignored_by_default():
+    assert DEFAULT_IGNORE_BOTS is False
+
+
+def test_unignored_bot_commands_are_invoked_without_process_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    events = []
+    command = object()
+    message = SimpleNamespace(author=SimpleNamespace(id=111, bot=True), content="!ping <@123>")
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    async def fake_get_context(_message):
+        events.append("get_context")
+        return SimpleNamespace(command=command)
+
+    async def fake_invoke(ctx):
+        events.append(("invoke", ctx.command))
+
+    bot.process_commands = fake_process_commands
+    bot.get_context = fake_get_context
+    bot.invoke = fake_invoke
+
+    asyncio.run(bot._process_commands_including_unignored_bots(message))
+
+    assert events == ["get_context", ("invoke", command)]
+
+
+def test_human_commands_still_use_process_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    events = []
+    message = SimpleNamespace(author=SimpleNamespace(id=111, bot=False), content="!ping <@123>")
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    bot.process_commands = fake_process_commands
+
+    asyncio.run(bot._process_commands_including_unignored_bots(message))
+
+    assert events == ["process_commands"]
+
+
+def test_ping_command_targets_user_mentions():
+    mentioned = SimpleNamespace(id=123, mention="<@123>")
+    message = SimpleNamespace(mentions=[mentioned])
+
+    assert _ping_target_mention(message, "") == "<@123>"
+    assert _ping_target_mention(SimpleNamespace(mentions=[]), "<@!456>") == "<@456>"
+    assert _ping_target_mention(SimpleNamespace(mentions=[]), "789") == "<@789>"
+    assert _ping_reply("<@123>") == "yo, what up, fam <@123>"
 
 
 def test_unignored_bot_messages_bypass_human_allow_list():
@@ -349,3 +555,41 @@ def test_model_select_view_paginates_large_model_list():
     assert view.total_pages == 2
     assert len(view.children) == 3
     assert [getattr(child, "label", None) for child in view.children[1:]] == ["Prev", "Next"]
+
+
+def test_model_choice_description_includes_gateway_metadata():
+    choice = ModelChoice(
+        id="provider/model",
+        label="provider/model",
+        owned_by="team",
+        metadata={"provider": "gateway", "context_window": 128000},
+    )
+
+    description = _model_choice_description(choice, True)
+
+    assert "current" in description
+    assert "gateway" in description
+    assert "ctx 128000" in description
+
+
+def test_waveform_base64_from_pcm_s16le_is_bounded():
+    pcm = (b"\x00\x00\xff\x7f\x00\x00\x01\x80" * 800)
+
+    waveform = base64.b64decode(waveform_base64_from_pcm_s16le(pcm, 16000))
+
+    assert 1 <= len(waveform) <= 256
+    assert max(waveform) == 255
+
+
+def test_build_discord_voice_clip_encodes_waveform_and_ogg(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        assert sample_rate == 16000
+        assert pcm
+        return b"ogg-data"
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+
+    clip = asyncio.run(build_discord_voice_clip(_FakeTTSBrain(), "hello", voice="neuro-sama"))
+
+    assert clip == DiscordVoiceClip(ogg=b"ogg-data", duration_secs=0.025, waveform=clip.waveform)
+    assert base64.b64decode(clip.waveform)

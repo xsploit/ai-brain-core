@@ -316,7 +316,9 @@ The Brain-native Discord runtime is a thin demo bot that uses:
 - backend auto-selection: Ladybug graph + TurboVec recall when installed, SQLite fallback
 - streaming Discord replies by editing a live message
 - vision input from image attachments
-- Brain tools: `discord_context`, `remember`, `search_memory`, `current_time`, `brain_context`
+- readable text and PDF attachments
+- agentic Discord tools for guild/channel/member/message/thread/role/moderation actions
+- Brain tools: `discord_context`, `remember`, `search_memory`, `current_time`, `brain_context`, Tavily tools, and Discord tools
 
 ```powershell
 uv run --extra discord aibrain-discord
@@ -332,10 +334,23 @@ DISCORD_BRAIN_RESPOND_TO_DMS=true
 DISCORD_BRAIN_RESPOND_TO_MENTIONS=true
 DISCORD_BRAIN_RESPOND_TO_ALL=false
 DISCORD_BRAIN_COMMAND_PREFIX=!brain
+DISCORD_BRAIN_ALLOWED_USER_IDS=120418341775998976
+DISCORD_BRAIN_OWNER_USER_IDS=120418341775998976
+DISCORD_BRAIN_MEMBERS_INTENT=true
+DISCORD_BRAIN_TOOL_CHANNEL_IDS=
+DISCORD_BRAIN_TOOL_AUDIT_CHANNEL_ID=
+DISCORD_BRAIN_TEXT_ATTACHMENT_MAX_BYTES=300000
+DISCORD_BRAIN_PDF_ATTACHMENT_MAX_PAGES=16
 DISCORD_BRAIN_MEMORY_TOP_K=8
 DISCORD_BRAIN_GRAPH_BACKEND=auto
 DISCORD_BRAIN_VECTOR_BACKEND=auto
 ```
+
+Enable the Discord Developer Portal privileged Members Intent when using member
+list/search tools. `DISCORD_BRAIN_OWNER_USER_IDS` controls owner-only Discord
+tools such as guild list, channel/role structure changes, invites, and webhooks.
+Discord admins can use lower-risk model/admin commands, but owner-only tools
+stay restricted to the configured owner IDs.
 
 Discord commands:
 
@@ -345,6 +360,14 @@ Discord commands:
 - `!brain grillo`
 - `!brain grillo tick [beat_type]`
 - `!brain grillo context [query]`
+- `!model`, `!model set <model-id>`, `!model refresh`, `!model info [model-id]`, `!model export`
+
+The model-facing Discord tool suite includes guild discovery, channel and role
+inventory, member list/search, permissions inspection, bounded channel history
+search, sending/editing/deleting/pinning messages, reactions, thread management,
+timeouts/kicks/bans/unbans, member role assignment, and owner-only server
+structure tools. Tools still check the bot's actual Discord permissions before
+mutating anything.
 
 GRILLO uses the same Discord scope as the Brain thread. Before each turn, the bot
 builds a compact context packet for that DM/channel/thread and prepends it to the

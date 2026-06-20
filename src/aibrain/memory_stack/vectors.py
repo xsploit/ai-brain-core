@@ -11,6 +11,7 @@ from typing import Any
 
 from ..embeddings import EmbeddingProvider
 from ..memory import cosine_similarity
+from ..numeric import safe_float
 from .contracts import RecallHit, RecallItem
 
 
@@ -158,7 +159,8 @@ class SQLiteVectorRecallStore:
                 continue
             embedding = json.loads(row["embedding_json"])
             semantic = cosine_similarity(query_embedding, embedding)
-            score = semantic * (0.5 + float(row["importance"]))
+            importance = safe_float(row["importance"], 0.5)
+            score = semantic * (0.5 + importance)
             hits.append(
                 RecallHit(
                     id=row["id"],
@@ -169,7 +171,7 @@ class SQLiteVectorRecallStore:
                     persona_id=row["persona_id"],
                     source_event_id=row["source_event_id"],
                     source_fact_id=row["source_fact_id"],
-                    importance=float(row["importance"]),
+                    importance=importance,
                     metadata=metadata,
                     created_at=row["created_at"],
                 )
@@ -263,7 +265,7 @@ class TurboVecRecallStore:
             hit = by_numeric_id.get(str(int(item_id)))
             if hit is None:
                 continue
-            hit.score = float(score) * (0.5 + hit.importance)
+            hit.score = safe_float(score, 0.0) * (0.5 + safe_float(hit.importance, 0.5))
             hits.append(hit)
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[:top_k]

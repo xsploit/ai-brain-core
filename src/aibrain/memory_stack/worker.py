@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid5, NAMESPACE_URL
 
+from ..numeric import safe_float
 from .contracts import (
     GraphMemoryStore,
     MemoryExtractor,
@@ -40,7 +41,7 @@ class RuleBasedMemoryExtractor:
                 object=_compact_text(text),
                 valid_from=event.created_at or utc_now(),
                 confidence=0.35,
-                importance=float(event.metadata.get("importance", 0.3)),
+                importance=safe_float(event.metadata.get("importance"), 0.3),
             )
         fact.source_event_id = event.id
         fact.source_session_id = event.session_id

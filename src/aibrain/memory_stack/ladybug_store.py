@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..numeric import safe_float
 from .contracts import GraphQuery, TemporalFact
 
 
@@ -157,8 +158,8 @@ def _row_to_fact(row: dict[str, Any]) -> TemporalFact:
         object=row["object"],
         valid_from=row["valid_from"],
         valid_until=row.get("valid_until"),
-        confidence=float(row.get("confidence", 0.7)),
-        importance=float(row.get("importance", 0.5)),
+        confidence=safe_float(row.get("confidence"), 0.7),
+        importance=safe_float(row.get("importance"), 0.5),
         source_event_id=row.get("source_event_id"),
         source_session_id=row.get("source_session_id"),
         supersedes_memory_id=row.get("supersedes_memory_id"),

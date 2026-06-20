@@ -53,6 +53,7 @@ class ModelChoice:
     label: str
     owned_by: str | None = None
     created: int | None = None
+    metadata: dict[str, Any] | None = None
 
 
 async def list_model_choices(
@@ -120,6 +121,7 @@ def _model_choices_from_result(result: Any) -> list[ModelChoice]:
             label=model_id,
             owned_by=_optional_string(getattr(model, "owned_by", None)),
             created=_optional_int(getattr(model, "created", None)),
+            metadata=_model_metadata(model),
         )
     return sorted(choices.values(), key=lambda choice: choice.id.lower())
 
@@ -154,3 +156,35 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _model_metadata(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        try:
+            dumped = model.model_dump(mode="json")
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if isinstance(model, dict):
+        return dict(model)
+    raw = getattr(model, "__dict__", None)
+    if isinstance(raw, dict):
+        return {key: value for key, value in raw.items() if _jsonish(value)}
+    metadata: dict[str, Any] = {}
+    for key in ("id", "object", "created", "owned_by", "provider", "context_window", "max_output_tokens"):
+        if hasattr(model, key):
+            value = getattr(model, key)
+            if _jsonish(value):
+                metadata[key] = value
+    return metadata
+
+
+def _jsonish(value: Any) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_jsonish(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _jsonish(item) for key, item in value.items())
+    return False
