@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -613,6 +614,7 @@ def tts_config_process_key(config: TTSConfig) -> tuple[Any, ...]:
 
 def with_env_overrides(config: TTSConfig) -> TTSConfig:
     updates: dict[str, Any] = {}
+    voice_id = os.environ.get("AIBRAIN_TTS_VOICE") or os.environ.get("PIPER_VOICE")
     env_map = {
         "AIBRAIN_TTS_PROVIDER": "provider",
         "PIPER_EXE": "piper_executable_path",
@@ -628,8 +630,7 @@ def with_env_overrides(config: TTSConfig) -> TTSConfig:
     if os.environ.get("PIPER_MODEL") and not os.environ.get("PIPER_CONFIG"):
         model_path = Path(os.environ["PIPER_MODEL"])
         updates["piper_config_path"] = _matching_config(model_path)
-    voice_id = os.environ.get("AIBRAIN_TTS_VOICE") or os.environ.get("PIPER_VOICE")
-    if voice_id and not os.environ.get("PIPER_MODEL"):
+    if voice_id:
         voice = resolve_piper_voice(voice_id)
         if voice:
             updates["piper_model_path"] = voice.onnx
@@ -657,9 +658,7 @@ def discover_piper_voices(
     resolved_manifests = manifest_paths if manifest_paths is not None else _env_path_list(
         "AIBRAIN_TTS_MANIFESTS"
     )
-    resolved_roots = search_roots if search_roots is not None else _env_path_list(
-        "AIBRAIN_TTS_VOICE_ROOTS"
-    )
+    resolved_roots = search_roots if search_roots is not None else _default_voice_roots()
     cache_key = (
         tuple(str(path) for path in resolved_manifests),
         tuple(str(path) for path in resolved_roots),
@@ -696,21 +695,72 @@ def discover_piper_voices(
         for onnx in root.rglob("*.onnx"):
             if "\\cache\\" in str(onnx).lower():
                 continue
-            slug = onnx.stem.replace("en_US-", "").replace("-medium", "").replace("-high", "")
-            voices.setdefault(
-                slug,
-                PiperVoice(
-                    slug=slug,
-                    label=slug.replace("_", " ").title(),
-                    onnx=onnx,
-                    config=_matching_config(onnx),
-                ),
+            slug = _unique_voice_slug(
+                _voice_slug_from_stem(onnx.stem),
+                root,
+                onnx,
+                voices,
+            )
+            voices[slug] = PiperVoice(
+                slug=slug,
+                label=slug.replace("_", " ").title(),
+                onnx=onnx,
+                config=_matching_config(onnx),
             )
     discovered = sorted(voices.values(), key=lambda voice: voice.slug)
     if use_cache:
         with _VOICE_CACHE_LOCK:
             _VOICE_CACHE[cache_key] = list(discovered)
     return discovered
+
+
+def _default_voice_roots() -> list[Path]:
+    roots = _env_path_list("AIBRAIN_TTS_VOICE_ROOTS")
+    bundled = _bundled_piper_voice_root()
+    if bundled.exists():
+        roots.append(bundled)
+    return roots
+
+
+def _bundled_piper_voice_root() -> Path:
+    return Path(__file__).with_name("voices") / "piper"
+
+
+def _voice_slug_from_stem(stem: str) -> str:
+    return stem.replace("en_US-", "").replace("-medium", "").replace("-high", "")
+
+
+def _unique_voice_slug(
+    slug: str,
+    root: Path,
+    onnx: Path,
+    voices: dict[str, PiperVoice],
+) -> str:
+    if slug not in voices:
+        return slug
+    try:
+        parent_parts = [
+            part
+            for part in onnx.relative_to(root).parts[:-1]
+            if part.lower() != "tts_voices"
+        ]
+    except ValueError:
+        parent_parts = [onnx.parent.name]
+    candidates = [
+        _normalize_voice_slug("_".join([*parent_parts, slug])),
+        _normalize_voice_slug("_".join([onnx.parent.name, slug])),
+    ]
+    for candidate in candidates:
+        if candidate and candidate not in voices:
+            return candidate
+    suffix = 2
+    while f"{slug}_{suffix}" in voices:
+        suffix += 1
+    return f"{slug}_{suffix}"
+
+
+def _normalize_voice_slug(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9]+", "_", value)).strip("_")
 
 
 def resolve_piper_voice(voice_id: str | None = None) -> PiperVoice | None:
@@ -738,6 +788,11 @@ def _default_piper_executable_path() -> Path | None:
 
 
 def _default_piper_model_path() -> Path | None:
+    voice_id = os.environ.get("AIBRAIN_TTS_VOICE") or os.environ.get("PIPER_VOICE")
+    if voice_id:
+        voice = resolve_piper_voice(voice_id)
+        if voice:
+            return voice.onnx
     explicit = _env_path("PIPER_MODEL")
     if explicit:
         return explicit
@@ -748,6 +803,11 @@ def _default_piper_model_path() -> Path | None:
 
 
 def _default_piper_config_path() -> Path | None:
+    voice_id = os.environ.get("AIBRAIN_TTS_VOICE") or os.environ.get("PIPER_VOICE")
+    if voice_id:
+        voice = resolve_piper_voice(voice_id)
+        if voice:
+            return voice.config
     explicit = _env_path("PIPER_CONFIG")
     if explicit:
         return explicit

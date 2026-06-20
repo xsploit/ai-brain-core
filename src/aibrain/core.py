@@ -26,12 +26,14 @@ from .autonomy import (
     strip_heartbeat_ack,
     within_active_hours,
 )
+from .chat_store import SQLiteChatHistoryStore
 from .config import BrainConfig, Persona
 from .embeddings import EmbeddingProvider, default_embedding_provider
 from .env import load_env_file
 from .gateway import OpenAIGateway
 from .inputs import FileInput, ImageInput, build_user_message
 from .memory import SQLiteMemoryStore
+from .memory_stack import HybridMemoryStack
 from .policy import MemoryPolicy
 from .stt import (
     AudioEncoding,
@@ -93,7 +95,9 @@ class Brain:
         *,
         client: Any | None = None,
         thread_store: SQLiteThreadStore | None = None,
+        chat_store: SQLiteChatHistoryStore | None = None,
         memory_store: SQLiteMemoryStore | None = None,
+        memory_stack: HybridMemoryStack | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         tools: ToolRegistry | None = None,
         openai_gateway: OpenAIGateway | None = None,
@@ -108,6 +112,7 @@ class Brain:
         self._client_lock = threading.Lock()
         self._openai_lock = threading.Lock()
         self.thread_store = thread_store or SQLiteThreadStore(self.config.database_path)
+        self.chat_store = chat_store or SQLiteChatHistoryStore(self.config.database_path)
         provider = embedding_provider or default_embedding_provider(
             self._get_client,
             self.config.embedding_model,
@@ -119,6 +124,17 @@ class Brain:
             dimensions=self.config.embedding_dimensions,
             vec_overfetch=self.config.memory_vec_overfetch,
         )
+        self.memory_stack = memory_stack
+        if self.memory_stack is None and self.config.memory_stack.enabled:
+            self.memory_stack = HybridMemoryStack.sqlite_paths(
+                raw_log_path=self.config.memory_stack.raw_log_path or self.config.database_path,
+                graph_path=self.config.memory_stack.graph_path or self.config.database_path,
+                vector_path=self.config.memory_stack.vector_path or self.config.database_path,
+                embedding_provider=provider,
+                embedding_dimensions=self.config.embedding_dimensions,
+                graph_backend=self.config.memory_stack.graph_backend,
+                vector_backend=self.config.memory_stack.vector_backend,
+            )
         self.tools = tools or ToolRegistry()
         self.stt = stt_provider or create_stt_provider(self.config.stt_config)
         self.vad = vad_detector
@@ -133,8 +149,21 @@ class Brain:
         if self._client is None:
             with self._client_lock:
                 if self._client is None:
-                    self._client = AsyncOpenAI()
+                    kwargs: dict[str, Any] = {}
+                    if self.config.api_key:
+                        kwargs["api_key"] = self.config.api_key
+                    base_url = self._client_base_url()
+                    if base_url:
+                        kwargs["base_url"] = base_url
+                    self._client = AsyncOpenAI(**kwargs)
         return self._client
+
+    def _client_base_url(self) -> str | None:
+        if self.config.base_url:
+            return self.config.base_url
+        if self.config.provider == "vercel":
+            return "https://ai-gateway.vercel.sh/v1"
+        return None
 
     @property
     def client(self) -> Any:
@@ -157,8 +186,12 @@ class Brain:
         await self.tts.close()
         if hasattr(self.memory, "close"):
             self.memory.close()
+        if self.memory_stack is not None:
+            self.memory_stack.close()
         if hasattr(self.thread_store, "close"):
             self.thread_store.close()
+        if hasattr(self.chat_store, "close"):
+            self.chat_store.close()
         if self._openai is not None:
             await self._openai.close()
         client = self._client
@@ -371,7 +404,8 @@ class Brain:
         openai_tools: list[dict[str, Any]] | None = None,
         max_agent_steps: int | None = None,
         **response_options: Any,
-    ) -> BrainResponse:
+        ) -> BrainResponse:
+        memory_stack_record = response_options.pop("memory_stack_record", True)
         async with self._thread_turn(thread_id, response_options):
             params, state, resolved, memory_hits = await self._build_response_params(
                 text,
@@ -385,13 +419,17 @@ class Brain:
                 response_options=response_options,
             )
             context = ToolContext(brain=self, thread=state, persona_id=resolved.id)
-            return await self._run_agent_loop(
+            response = await self._run_agent_loop(
                 params,
                 state=state,
                 context=context,
                 memory_hits=memory_hits,
                 max_agent_steps=max_agent_steps or self.config.max_agent_steps,
             )
+            self._append_local_chat_response(state, response.text, response.response_id)
+            if memory_stack_record:
+                await self._append_memory_stack_response_event(response, state, resolved.id)
+            return response
 
     async def vision(
         self,
@@ -500,6 +538,7 @@ class Brain:
         max_agent_steps: int | None = None,
         **response_options: Any,
     ) -> AsyncIterator[BrainEvent]:
+        memory_stack_record = response_options.pop("memory_stack_record", True)
         params, state, resolved, memory_hits = await self._build_response_params(
             text,
             thread_id=thread_id,
@@ -535,6 +574,13 @@ class Brain:
             self._update_thread_after_response(state, response)
             calls = self._extract_function_calls(response)
             if not calls:
+                self._append_local_chat_response(
+                    state,
+                    self._extract_text(response),
+                    getattr(response, "id", None),
+                )
+                if memory_stack_record:
+                    await self._append_memory_stack_raw_response_event(response, state, resolved.id)
                 yield BrainEvent(
                     "response.done",
                     {
@@ -893,7 +939,11 @@ class Brain:
             kwargs["input"] = input
         if instructions is not None:
             kwargs["instructions"] = instructions
-        if state and state.last_response_id:
+        if (
+            state
+            and state.last_response_id
+            and self.config.state_mode == "previous_response_id"
+        ):
             kwargs.setdefault("previous_response_id", state.last_response_id)
         result = await self.openai.compact_response(**kwargs)
         if state and save_to_memory:
@@ -1125,12 +1175,40 @@ class Brain:
                 thread=state,
                 persona_id=resolved.id,
             )
+            if self.memory_stack is not None and self.config.memory_stack.retrieve:
+                stack_hits = await self.memory_stack.retrieve_records(
+                    text,
+                    top_k=memory_policy.top_k,
+                    thread=state,
+                    persona_id=resolved.id,
+                    filters=memory_policy.metadata_filter,
+                )
+                memory_hits = _dedupe_memory_records([*memory_hits, *stack_hits])[
+                    : memory_policy.top_k
+                ]
             memory_message = memory_policy.build_injection_message(memory_hits)
             if memory_message:
                 input_items.append(memory_message)
-        input_items.append(
-            await asyncio.to_thread(build_user_message, text, images=images, files=files)
-        )
+        if self.memory_stack is not None and state is not None:
+            await self.memory_stack.append_event(
+                event_type="message",
+                actor="user",
+                content=text,
+                thread=state,
+                persona_id=resolved.id,
+                metadata={"source": "brain.ask"},
+                extract=self.config.memory_stack.extract_user_events,
+            )
+        user_message = await asyncio.to_thread(build_user_message, text, images=images, files=files)
+        if state is not None and self.config.state_mode == "local":
+            input_items.extend(self._local_history_input(state))
+            self.chat_store.append(
+                state.thread_id,
+                "user",
+                self._history_content_from_user_message(user_message),
+                metadata={"source": "brain.user"},
+            )
+        input_items.append(user_message)
 
         params: dict[str, Any] = {
             "model": response_options.pop("model", resolved.model or self.config.default_model),
@@ -1141,12 +1219,12 @@ class Brain:
             params["store"] = response_options.pop("store", self.config.store)
         if self.config.truncation is not None:
             params["truncation"] = response_options.pop("truncation", self.config.truncation)
-        if self.config.context_management is not None:
+        if self.config.context_management is not None and self.config.provider == "openai":
             params["context_management"] = response_options.pop(
                 "context_management",
                 self.config.context_management,
             )
-        if self.config.service_tier is not None:
+        if self.config.service_tier is not None and self.config.provider == "openai":
             params["service_tier"] = response_options.pop("service_tier", self.config.service_tier)
         if self.config.reasoning is not None:
             params["reasoning"] = response_options.pop("reasoning", self.config.reasoning)
@@ -1157,17 +1235,19 @@ class Brain:
             or self.config.default_prompt_cache_key
             or f"aibrain:{resolved.id}"
         )
-        if prompt_cache_key:
+        if prompt_cache_key and self.config.provider == "openai":
             params["prompt_cache_key"] = response_options.pop("prompt_cache_key", prompt_cache_key)
         retention = resolved.prompt_cache_retention or self.config.prompt_cache_retention
-        if retention:
+        if retention and self.config.provider == "openai":
             params["prompt_cache_retention"] = response_options.pop(
                 "prompt_cache_retention",
                 retention,
             )
 
         if state is not None:
-            if self.config.state_mode == "conversation":
+            if self.config.state_mode == "local":
+                params["store"] = response_options.pop("store", False)
+            elif self.config.state_mode == "conversation":
                 await self._ensure_remote_conversation(state)
                 params["conversation"] = response_options.pop(
                     "conversation",
@@ -1352,9 +1432,80 @@ class Brain:
         }
         params["input"] = outputs
         response_id = getattr(response, "id", None)
-        if response_id:
+        if self.config.state_mode == "local":
+            params["input"] = [
+                *list(previous_params.get("input") or []),
+                *self._response_output_items(response),
+                *outputs,
+            ]
+            params.pop("previous_response_id", None)
+            params.pop("conversation", None)
+            params.pop("prompt_cache_key", None)
+            params.pop("prompt_cache_retention", None)
+            params.pop("context_management", None)
+        elif response_id:
             params["previous_response_id"] = response_id
         return params
+
+    def _local_history_input(self, state: ThreadState) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "message",
+                "role": message["role"],
+                "content": self._normalize_local_history_content(message["content"]),
+            }
+            for message in self.chat_store.list(
+                state.thread_id,
+                limit=self.config.local_history_limit,
+            )
+        ]
+
+    def _append_local_chat_response(
+        self,
+        state: ThreadState | None,
+        text: str,
+        response_id: str | None,
+    ) -> None:
+        if state is None or self.config.state_mode != "local" or not text:
+            return
+        self.chat_store.append(
+            state.thread_id,
+            "assistant",
+            [{"type": "input_text", "text": text}],
+            metadata={"source": "brain.assistant", "response_id": response_id},
+        )
+
+    def _response_output_items(self, response: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for item in getattr(response, "output", None) or []:
+            if isinstance(item, dict):
+                items.append(item)
+                continue
+            item_type = self._field(item, "type")
+            if item_type == "function_call":
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": self._field(item, "call_id"),
+                        "name": self._field(item, "name"),
+                        "arguments": self._field(item, "arguments") or "{}",
+                    }
+                )
+        return items
+
+    def _normalize_local_history_content(self, content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if isinstance(content, list):
+            return content
+        return [{"type": "input_text", "text": str(content)}]
+
+    def _history_content_from_user_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in message.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "input_text"
+        ]
 
     def _extract_function_calls(self, response: Any) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
@@ -1409,6 +1560,53 @@ class Brain:
             state.last_response_id = response_id
         state.updated_at = updated_state.updated_at
 
+    async def _append_memory_stack_response_event(
+        self,
+        response: BrainResponse,
+        state: ThreadState | None,
+        persona_id: str,
+    ) -> None:
+        if self.memory_stack is None or state is None or not response.text:
+            return
+        await self.memory_stack.append_event(
+            event_type="response",
+            actor="assistant",
+            content=response.text,
+            thread=state,
+            persona_id=persona_id,
+            metadata={
+                "source": "brain.response",
+                "response_id": response.response_id,
+                "conversation_id": response.conversation_id,
+            },
+            extract=self.config.memory_stack.extract_response_events,
+        )
+
+    async def _append_memory_stack_raw_response_event(
+        self,
+        response: Any,
+        state: ThreadState | None,
+        persona_id: str,
+    ) -> None:
+        if self.memory_stack is None or state is None:
+            return
+        text = self._extract_text(response)
+        if not text:
+            return
+        await self.memory_stack.append_event(
+            event_type="response",
+            actor="assistant",
+            content=text,
+            thread=state,
+            persona_id=persona_id,
+            metadata={
+                "source": "brain.stream.response",
+                "response_id": getattr(response, "id", None),
+                "conversation_id": self._extract_conversation_id(response, state),
+            },
+            extract=self.config.memory_stack.extract_response_events,
+        )
+
     def _normalize_stream_event(self, event: Any) -> BrainEvent | None:
         event_type = getattr(event, "type", "")
         if event_type in {"response.output_text.delta", "response.text.delta"}:
@@ -1428,3 +1626,16 @@ class Brain:
         if isinstance(item, dict):
             return item.get(name)
         return getattr(item, name, None)
+
+
+def _dedupe_memory_records(records: list[MemoryRecord]) -> list[MemoryRecord]:
+    deduped: dict[str, MemoryRecord] = {}
+    for record in sorted(records, key=lambda item: item.score, reverse=True):
+        key = str(
+            record.metadata.get("source_fact_id")
+            or record.metadata.get("source_event_id")
+            or record.id
+        )
+        if key not in deduped:
+            deduped[key] = record
+    return list(deduped.values())

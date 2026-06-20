@@ -3,8 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0a0d14" />
     <title>AI Brain Core Console</title>
-    <link rel="stylesheet" href="/webchat/assets/styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+    />
+    <link rel="stylesheet" href="/webchat/assets/styles.css?v=20260504-ui" />
   </head>
   <body>
     <div class="app-shell">
@@ -61,14 +68,14 @@
                 <span>TTS</span>
               </label>
               <label class="inline-control">
-                <input id="memoryMode" type="checkbox" checked />
+                <input id="memoryMode" type="checkbox" />
                 <span>Memory</span>
               </label>
               <label class="compact-field">
                 <span>Audio</span>
                 <select id="audioTransport">
-                  <option value="json_base64">JSON</option>
                   <option value="binary">Binary</option>
+                  <option value="json_base64">JSON</option>
                 </select>
               </label>
               <button class="primary-button" type="submit">Send</button>
@@ -264,7 +271,7 @@
           </label>
           <label class="field">
             <span>Response JSON</span>
-            <textarea id="responseOptions" rows="8">{}</textarea>
+            <textarea id="responseOptions" rows="8">{"stateless":true}</textarea>
           </label>
         </section>
       </aside>

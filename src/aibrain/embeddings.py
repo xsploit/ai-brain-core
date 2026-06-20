@@ -56,6 +56,6 @@ def default_embedding_provider(
     model: str,
     dimensions: int,
 ) -> EmbeddingProvider:
-    if os.environ.get("OPENAI_API_KEY"):
+    if os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("OPENAI_API_KEY"):
         return OpenAIEmbeddingProvider(client_factory, model=model, dimensions=dimensions)
     return HashEmbeddingProvider(dimensions=dimensions)

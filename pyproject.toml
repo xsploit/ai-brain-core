@@ -19,7 +19,10 @@ dependencies = [
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.5.1"]
+discord = ["discord.py>=2.4"]
 vector = ["sqlite-vec>=0.1.6"]
+ladybug = ["ladybug>=0.11.0", "polars-lts-cpu>=1.0"]
+turbovec = ["turbovec>=0.1.0"]
 stt = [
     "faster-whisper>=1.2.1",
     "silero-vad[onnx-cpu]>=6.2.1",
@@ -28,7 +31,11 @@ stt = [
     "sounddevice>=0.5.1",
 ]
 all = [
+    "discord.py>=2.4",
     "sqlite-vec>=0.1.6",
+    "ladybug>=0.11.0",
+    "polars-lts-cpu>=1.0",
+    "turbovec>=0.1.0",
     "faster-whisper>=1.2.1",
     "silero-vad[onnx-cpu]>=6.2.1",
     "soundfile>=0.13.1",
@@ -42,12 +49,19 @@ dev = [
 
 [project.scripts]
 aibrain = "aibrain.cli:main"
+aibrain-discord = "aibrain.discord_bot:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-aibrain = ["webchat/*.html", "webchat/*.css", "webchat/*.js"]
+aibrain = [
+    "webchat/*.html",
+    "webchat/*.css",
+    "webchat/*.js",
+    "voices/piper/**/*.onnx",
+    "voices/piper/**/*.json",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

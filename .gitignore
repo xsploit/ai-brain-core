@@ -8,7 +8,11 @@ venv/
 *.egg-info/
 build/
 dist/
+logs/
 *.pyc
 *.sqlite
 *.sqlite3
+*.ladybug*
+*.turbovec
+*.turbovec.sqlite3
 .env

@@ -8,7 +8,7 @@ persona = Persona(
     id="discord-waifu",
     name="Discord Waifu",
     instructions="You are a concise Discord companion. Keep live replies natural.",
-    model="gpt-5-nano",
+    model="deepseek/deepseek-v4-flash",
 )
 
 

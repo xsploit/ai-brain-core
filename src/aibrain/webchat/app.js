@@ -20,6 +20,8 @@ const state = {
   playbackDoneAt: 0,
 };
 
+const FAST_CHAT_MODEL = "gpt-4.1-mini";
+
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -328,7 +330,7 @@ async function buildAskPayload(text, tts) {
     persona,
     images,
     use_memory: $("#memoryMode").checked,
-    tool_names: tools.length ? tools : null,
+    tool_names: tools,
     tts,
     tts_options: buildTtsOptions(),
     audio_transport: $("#audioTransport").value,
@@ -378,7 +380,7 @@ function closeChatSocketIfComplete() {
 }
 
 function bindTts() {
-  $("#refreshVoicesButton").addEventListener("click", () => void loadVoices());
+  $("#refreshVoicesButton").addEventListener("click", () => void loadVoices(true));
   $("#ttsButton").addEventListener("click", async () => {
     setStatus("#ttsStatus", "rendering");
     try {
@@ -697,7 +699,7 @@ function buildTtsOptions() {
   return voice ? { voice } : {};
 }
 
-async function loadVoices() {
+async function loadVoices(refresh = false) {
   const select = $("#voiceSelect");
   const previous = select.value;
   select.textContent = "";
@@ -706,16 +708,21 @@ async function loadVoices() {
   defaultOption.textContent = "default";
   select.append(defaultOption);
   try {
-    const response = await fetch("/tts/voices");
+    const response = await fetch(`/tts/voices${refresh ? "?refresh=true" : ""}`);
     const voices = await response.json();
+    if (!response.ok) throw new Error(JSON.stringify(voices));
+    const defaultVoice = voices.find((voice) => voice.default);
     for (const voice of voices) {
       const option = document.createElement("option");
       option.value = voice.slug;
-      option.textContent = voice.label || voice.slug;
+      option.textContent =
+        voice.label && voice.label !== voice.slug ? `${voice.label} (${voice.slug})` : voice.slug;
       select.append(option);
     }
     if (previous && Array.from(select.options).some((option) => option.value === previous)) {
       select.value = previous;
+    } else if (defaultVoice) {
+      select.value = defaultVoice.slug;
     }
     logEvent("tts.voices", { count: voices.length });
   } catch (error) {
@@ -743,15 +750,18 @@ async function loadModels() {
     }
     if (previous && Array.from(select.options).some((option) => option.value === previous)) {
       select.value = previous;
+    } else if (Array.from(select.options).some((option) => option.value === FAST_CHAT_MODEL)) {
+      select.value = FAST_CHAT_MODEL;
     }
     logEvent("models.loaded", { count: models.length });
   } catch (error) {
-    for (const model of ["gpt-5-nano", "gpt-5-mini", "gpt-5", "gpt-4.1-mini"]) {
+    for (const model of ["gpt-5-nano", "gpt-5-mini", "gpt-5", FAST_CHAT_MODEL]) {
       const option = document.createElement("option");
       option.value = model;
       option.textContent = model;
       select.append(option);
     }
+    select.value = FAST_CHAT_MODEL;
     logEvent("models.error", { message: error.message });
   }
 }
