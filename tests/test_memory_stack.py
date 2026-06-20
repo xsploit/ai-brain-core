@@ -277,6 +277,31 @@ async def test_brain_bounds_memory_retrieval_query_before_embedding(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_brain_can_keep_attachment_text_out_of_memory_and_history(tmp_path):
+    provider = RecordingEmbeddingProvider(dimensions=256, max_len=80)
+    config = BrainConfig(
+        database_path=tmp_path / "brain.sqlite3",
+        memory_stack=MemoryStackConfig(enabled=True, retrieve=True, extract_user_events=True),
+    )
+    brain = Brain(config, client=FakeOpenAI(), embedding_provider=provider)
+
+    response = await brain.ask(
+        "please summarize\n\n[Readable attachments]\nSECRET FILE TEXT",
+        thread_id="thread-file-context",
+        memory_query_text="please summarize",
+        memory_event_text="please summarize",
+        history_text="please summarize",
+    )
+
+    assert response.text == "noted"
+    assert all("SECRET FILE TEXT" not in call for call in provider.calls)
+    events = await brain.memory_stack.raw_log.list_thread_events("thread-file-context")
+    assert events[0].content == "please summarize"
+    history = brain.chat_store.list("thread-file-context", limit=10)
+    assert history[0]["content"] == [{"type": "input_text", "text": "please summarize"}]
+
+
+@pytest.mark.asyncio
 async def test_ladybug_adapter_smoke_when_installed(tmp_path):
     if importlib.util.find_spec("ladybug") is None:
         pytest.skip("ladybug extra not installed")

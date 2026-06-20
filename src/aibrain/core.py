@@ -1166,12 +1166,15 @@ class Brain:
         state = None if force_stateless else await self._ensure_thread(thread_id, resolved)
         memory_hits: list[MemoryRecord] = []
         input_items: list[dict[str, Any]] = []
+        memory_query_source = response_options.pop("memory_query_text", text)
+        memory_event_text = response_options.pop("memory_event_text", text)
+        history_text = response_options.pop("history_text", text)
         memory_policy = self._resolve_memory_policy(
             use_memory,
             response_options.pop("memory_policy", None),
         )
         if memory_policy.enabled and state is not None:
-            memory_query = _memory_query_text(text)
+            memory_query = _memory_query_text(memory_query_source)
             memory_hits = await memory_policy.retrieve(
                 self.memory,
                 memory_query,
@@ -1192,11 +1195,11 @@ class Brain:
             memory_message = memory_policy.build_injection_message(memory_hits)
             if memory_message:
                 input_items.append(memory_message)
-        if self.memory_stack is not None and state is not None:
+        if self.memory_stack is not None and state is not None and str(memory_event_text or "").strip():
             await self.memory_stack.append_event(
                 event_type="message",
                 actor="user",
-                content=text,
+                content=str(memory_event_text),
                 thread=state,
                 persona_id=resolved.id,
                 metadata={"source": "brain.ask"},
@@ -1205,10 +1208,15 @@ class Brain:
         user_message = await asyncio.to_thread(build_user_message, text, images=images, files=files)
         if state is not None and self.config.state_mode == "local":
             input_items.extend(self._local_history_input(state))
+            history_message = (
+                user_message
+                if history_text == text
+                else await asyncio.to_thread(build_user_message, str(history_text), images=images, files=files)
+            )
             self.chat_store.append(
                 state.thread_id,
                 "user",
-                self._history_content_from_user_message(user_message),
+                self._history_content_from_user_message(history_message),
                 metadata={"source": "brain.user"},
             )
         input_items.append(user_message)

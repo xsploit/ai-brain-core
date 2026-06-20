@@ -121,12 +121,16 @@ class _FakeGrilloRuntime:
         self.text = text
         self.error = error
         self.calls = []
+        self.ingests = []
 
     async def build_context_packet(self, **kwargs):
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
         return _FakeGrilloPacket(self.text)
+
+    async def ingest_turn_pair(self, **kwargs):
+        self.ingests.append(kwargs)
 
 
 class _FakeTTSBrain:
@@ -325,6 +329,8 @@ def test_reply_includes_text_file_attachments(monkeypatch):
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
     message.attachments = [_FakeAttachment(b"user uploaded notes\nimportant line")]
     brain = _FakeBrain()
+    runtime = _FakeGrilloRuntime("<grillo>ok</grillo>")
+    brain.memory_stack = SimpleNamespace(grillo=runtime)
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.recent_by_scope = {}
     bot.brain = brain
@@ -337,6 +343,12 @@ def test_reply_includes_text_file_attachments(monkeypatch):
     assert "[Readable attachments]" in brain.prompt
     assert "--- notes.txt (text/plain," in brain.prompt
     assert "important line" in brain.prompt
+    assert runtime.calls[0]["query"] == "what day is it?"
+    assert "important line" not in runtime.calls[0]["query"]
+    assert runtime.ingests[0]["user_text"] == "what day is it?"
+    assert brain.kwargs["memory_query_text"] == "what day is it?"
+    assert brain.kwargs["memory_event_text"] == "what day is it?"
+    assert brain.kwargs["history_text"] == "what day is it?"
     assert message._fake_reply.edits == ["ok"]
 
 
@@ -364,6 +376,9 @@ def test_reply_includes_pdf_attachment_text(monkeypatch):
     assert "[Readable attachments]" in brain.prompt
     assert "--- paper.pdf (application/pdf, 3 pages," in brain.prompt
     assert "PDF important line" in brain.prompt
+    assert brain.kwargs["memory_query_text"] == "what day is it?"
+    assert "PDF important line" not in brain.kwargs["memory_event_text"]
+    assert "PDF important line" not in brain.kwargs["history_text"]
     assert message._fake_reply.edits == ["ok"]
 
 

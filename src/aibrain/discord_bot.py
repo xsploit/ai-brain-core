@@ -212,7 +212,7 @@ def _display_name(user: discord.abc.User) -> str:
 
 
 def _message_text(message: discord.Message) -> str:
-    content = message.clean_content or message.content or ""
+    content = _message_content_text(message)
     attachments = []
     for attachment in message.attachments:
         if _is_voice_message_attachment(attachment):
@@ -222,6 +222,10 @@ def _message_text(message: discord.Message) -> str:
     if attachments:
         content = f"{content}\n\n[Attachments]\n" + "\n".join(attachments)
     return content.strip()
+
+
+def _message_content_text(message: discord.Message) -> str:
+    return (message.clean_content or message.content or "").strip()
 
 
 def _is_voice_message_attachment(attachment: discord.Attachment) -> bool:
@@ -1224,16 +1228,19 @@ class DiscordBrainBot(commands.Bot):
         buffer = ""
         try:
             user_text = user_text_override if user_text_override is not None else _message_text(message)
+            memory_text = user_text_override if user_text_override is not None else _message_content_text(message)
+            prompt_text = user_text
             attachment_text = await _text_attachment_context(message)
             if attachment_text:
-                user_text = f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
+                prompt_text = f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
             persona = persona_override or self.persona
             prompt = await self._build_prompt_for_message(
                 message,
                 scope,
-                user_text,
+                prompt_text,
                 one_shot_pre_prompt=one_shot_pre_prompt,
                 include_grillo_context=include_grillo_context,
+                memory_query_text=memory_text,
                 persona_name=persona.name,
             )
             images = _image_inputs(message)
@@ -1246,6 +1253,9 @@ class DiscordBrainBot(commands.Bot):
                 response_options["prompt_cache_retention"] = prompt_cache_retention
             if stateless:
                 response_options["stateless"] = True
+            response_options["memory_query_text"] = memory_text
+            response_options["memory_event_text"] = memory_text
+            response_options["history_text"] = memory_text
             async with message.channel.typing():
                 async for event in self.brain.stream(
                     prompt,
@@ -1269,7 +1279,7 @@ class DiscordBrainBot(commands.Bot):
                 await self._send_final_reply(message, buffer.strip() or "done.")
                 await self._maybe_send_tts_reply(message, buffer.strip())
                 if record_grillo:
-                    self._schedule_grillo_ingest(message, scope, user_text, buffer.strip())
+                    self._schedule_grillo_ingest(message, scope, memory_text, buffer.strip())
         except Exception as exc:
             logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
             logger.exception("Brain turn failed for scope %s", scope)
@@ -1288,6 +1298,7 @@ class DiscordBrainBot(commands.Bot):
         *,
         one_shot_pre_prompt: str | None = None,
         include_grillo_context: bool = True,
+        memory_query_text: str | None = None,
         persona_name: str | None = None,
     ) -> str:
         discord_context = self._context_for_message(message)
@@ -1308,7 +1319,7 @@ class DiscordBrainBot(commands.Bot):
         runtime = self.brain.memory_stack.grillo if include_grillo_context and self.brain.memory_stack else None
         if runtime is None:
             return prompt
-        memory_query = _memory_query_text(user_text)
+        memory_query = _memory_query_text(memory_query_text if memory_query_text is not None else user_text)
         try:
             packet = await runtime.build_context_packet(
                 scope_key=scope,
