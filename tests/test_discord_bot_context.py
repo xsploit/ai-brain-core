@@ -239,6 +239,37 @@ def test_discord_message_context_and_prompt_include_local_time(monkeypatch):
     assert "Message sent at: 2026-06-19T09:15:00-07:00" in prompt
 
 
+def test_discord_prompt_includes_recent_channel_context(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    side_message = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    side_message.id = 555
+    side_message.guild = SimpleNamespace(id=222, name="Test Guild")
+    side_message.channel = channel
+    side_message.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    side_message.content = "oh wait technically my bot can already do all of them"
+    side_message.clean_content = side_message.content
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = channel
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True))
+    bot._record_recent(side_message)
+    bot._record_recent_assistant(side_message, "oh yeah, your bot can already do the toolbox stuff")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "yeah that was wild"))
+
+    assert "Recent channel context before this message:" in prompt
+    assert "Karah" in prompt
+    assert "oh wait technically my bot can already do all of them" in prompt
+    assert "Neuro-sama (bot)" in prompt
+    assert "oh yeah, your bot can already do the toolbox stuff" in prompt
+
+
 def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
@@ -597,6 +628,28 @@ def test_bot_mentions_trigger_when_bot_interactions_are_enabled():
     assert bot._should_respond(message) is False
 
 
+def test_bot_direct_replies_trigger_when_bot_interactions_are_enabled():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+        reference=SimpleNamespace(resolved=SimpleNamespace(author=bot.user)),
+    )
+
+    assert bot._should_respond(message) is True
+
+    bot.respond_to_bots = False
+
+    assert bot._should_respond(message) is False
+
+
 def test_bot_mentions_do_not_bypass_bot_interaction_toggle():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.paused = False
@@ -614,7 +667,7 @@ def test_bot_mentions_do_not_bypass_bot_interaction_toggle():
     assert bot._should_respond(message) is False
 
 
-def test_human_guild_messages_require_mention_by_default():
+def test_human_guild_messages_do_not_trigger_without_direct_target_by_default():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.paused = False
     bot.respond_to_all = True
@@ -630,6 +683,47 @@ def test_human_guild_messages_require_mention_by_default():
     )
 
     assert bot._should_respond(message) is False
+
+
+def test_human_guild_direct_replies_trigger_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+    message.reference = SimpleNamespace(resolved=SimpleNamespace(author=bot.user))
+
+    assert bot._should_respond(message) is True
+
+
+def test_human_guild_messages_can_use_ambient_mode():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot.require_mention_in_guilds = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is True
 
 
 def test_human_mentions_still_trigger_when_bot_interactions_are_stopped():
@@ -648,6 +742,24 @@ def test_human_mentions_still_trigger_when_bot_interactions_are_stopped():
     )
 
     assert bot._should_respond(message) is True
+
+
+def test_bot_dm_does_not_bypass_bot_interaction_toggle():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=None,
+        mentions=[],
+        reference=SimpleNamespace(resolved=SimpleNamespace(author=bot.user)),
+    )
+
+    assert bot._should_respond(message) is False
 
 
 def test_pause_blocks_all_normal_responses():
@@ -709,6 +821,30 @@ def test_paused_reply_with_brain_does_not_send_final_reply(monkeypatch):
     asyncio.run(bot._reply_with_brain(message))
 
     assert message._fake_reply.edits == []
+
+
+def test_blank_visible_message_uses_nonempty_memory_query(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.content = ""
+    message.clean_content = ""
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.discord_token = None
+    bot.logger = SimpleNamespace(debug=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert brain.kwargs["memory_query_text"].strip()
+    assert brain.kwargs["history_text"].strip()
+    assert brain.kwargs["memory_event_text"] == ""
 
 
 def test_unignored_bot_commands_are_invoked_without_process_commands():

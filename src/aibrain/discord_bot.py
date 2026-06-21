@@ -484,6 +484,9 @@ def _build_command_prefix(command_prefix_text: str):
             or stripped.startswith("!bot")
             or stripped.startswith("!model")
             or stripped.startswith("!ping")
+            or stripped.startswith("!pause")
+            or stripped.startswith("!resume")
+            or stripped.startswith("!unpause")
             or stripped.startswith("!say")
             or stripped.startswith("!tts")
         ):
@@ -688,14 +691,33 @@ class DiscordBrainBot(commands.Bot):
         if getattr(self, "paused", False):
             return False
         author_is_bot = bool(getattr(message.author, "bot", False))
+        directed = self._is_directed_at_self(message)
+        if author_is_bot:
+            return bool(self._bot_interactions_enabled() and directed)
         if message.guild is None:
             return self.respond_to_dms
-        mentioned = bool(self.respond_to_mentions and self.user and self.user in message.mentions)
-        if author_is_bot:
-            return bool(self._bot_interactions_enabled() and mentioned)
         if getattr(self, "require_mention_in_guilds", DEFAULT_REQUIRE_MENTION_IN_GUILDS):
-            return mentioned
-        return bool(self.respond_to_all or mentioned)
+            return directed
+        return bool(self.respond_to_all or directed)
+
+    def _is_directed_at_self(self, message: discord.Message) -> bool:
+        if not self.respond_to_mentions or self.user is None:
+            return False
+        user_id = getattr(self.user, "id", None)
+        mentioned = any(getattr(user, "id", None) == user_id for user in getattr(message, "mentions", []))
+        return bool(mentioned or self._is_reply_to_self(message))
+
+    def _is_reply_to_self(self, message: discord.Message) -> bool:
+        if self.user is None:
+            return False
+        user_id = getattr(self.user, "id", None)
+        reference = getattr(message, "reference", None)
+        for attr in ("resolved", "cached_message"):
+            resolved = getattr(reference, attr, None) if reference is not None else None
+            author = getattr(resolved, "author", None)
+            if getattr(author, "id", None) == user_id:
+                return True
+        return False
 
     def _is_command_message(self, message: discord.Message) -> bool:
         stripped = message.content.strip()
@@ -1285,8 +1307,28 @@ class DiscordBrainBot(commands.Bot):
             {
                 "author": _display_name(message.author),
                 "author_id": message.author.id,
+                "author_is_bot": bool(getattr(message.author, "bot", False)),
+                "message_id": getattr(message, "id", None),
                 "content": _message_text(message)[:1000],
                 "created_at": message.created_at.isoformat() if message.created_at else None,
+            }
+        )
+        del recent[:-12]
+
+    def _record_recent_assistant(self, message: discord.Message, text: str) -> None:
+        if not text.strip():
+            return
+        scope = _scope_for_message(message)
+        recent = self.recent_by_scope.setdefault(scope, [])
+        author = getattr(self, "user", None)
+        recent.append(
+            {
+                "author": _display_name(author) if author is not None else getattr(self.persona, "name", "assistant"),
+                "author_id": getattr(author, "id", None),
+                "author_is_bot": True,
+                "message_id": None,
+                "content": text[:1000],
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         del recent[:-12]
@@ -1343,7 +1385,7 @@ class DiscordBrainBot(commands.Bot):
                 prompt_text,
                 one_shot_pre_prompt=one_shot_pre_prompt,
                 include_grillo_context=include_grillo_context,
-                memory_query_text=memory_text,
+                memory_query_text=memory_text.strip() or prompt_text.strip() or "discord message",
                 persona_name=persona.name,
             )
             images = _image_inputs(message)
@@ -1356,9 +1398,10 @@ class DiscordBrainBot(commands.Bot):
                 response_options["prompt_cache_retention"] = prompt_cache_retention
             if stateless:
                 response_options["stateless"] = True
-            response_options["memory_query_text"] = memory_text
+            memory_query_text = memory_text.strip() or prompt_text.strip() or "discord message"
+            response_options["memory_query_text"] = memory_query_text
             response_options["memory_event_text"] = memory_text
-            response_options["history_text"] = memory_text
+            response_options["history_text"] = memory_query_text
             async with message.channel.typing():
                 async for event in self.brain.stream(
                     prompt,
@@ -1384,6 +1427,7 @@ class DiscordBrainBot(commands.Bot):
                 if getattr(self, "paused", False):
                     return
                 await self._send_final_reply(message, buffer.strip() or "done.")
+                self._record_recent_assistant(message, buffer.strip() or "done.")
                 await self._maybe_send_tts_reply(message, buffer.strip())
                 if record_grillo:
                     self._schedule_grillo_ingest(message, scope, memory_text, buffer.strip())
@@ -1410,6 +1454,13 @@ class DiscordBrainBot(commands.Bot):
     ) -> str:
         discord_context = self._context_for_message(message)
         metadata_block = "\n".join(_discord_metadata_prompt_lines(discord_context["discord_metadata"]))
+        recent_block = "\n".join(
+            _recent_messages_prompt_lines(
+                discord_context.get("recent_messages", []),
+                current_message_id=getattr(message, "id", None),
+            )
+        )
+        recent_section = f"{recent_block}\n\n" if recent_block else ""
         prompt = (
             f"Discord message from {_display_name(message.author)} in "
             f"{discord_context['guild'] or 'DM'}#{discord_context['channel']}:\n"
@@ -1417,6 +1468,7 @@ class DiscordBrainBot(commands.Bot):
             f"Message sent at: {discord_context['message_local_created_at'] or discord_context['message_created_at']}\n"
             "Discord metadata for this speaker and channel:\n"
             f"{metadata_block}\n\n"
+            f"{recent_section}"
             f"{user_text}"
         )
         if one_shot_pre_prompt:
@@ -1505,6 +1557,27 @@ def _memory_query_text(text: str) -> str:
     default = _env_int("AIBRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS)
     limit = max(1, _env_int("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", default))
     return str(text or "").strip()[:limit]
+
+
+def _recent_messages_prompt_lines(
+    recent_messages: list[dict[str, Any]],
+    *,
+    current_message_id: int | None,
+) -> list[str]:
+    lines: list[str] = []
+    for item in recent_messages[-8:]:
+        if item.get("message_id") == current_message_id:
+            continue
+        content = " ".join(str(item.get("content") or "").split())
+        if not content:
+            continue
+        author = str(item.get("author") or item.get("author_id") or "unknown")
+        marker = " (bot)" if item.get("author_is_bot") else ""
+        created_at = item.get("created_at") or "unknown time"
+        lines.append(f"- [{created_at}] {author}{marker}: {content[:500]}")
+    if not lines:
+        return []
+    return ["Recent channel context before this message:", *lines]
 
 
 def _split_discord_text(text: str, limit: int) -> list[str]:
