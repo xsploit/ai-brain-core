@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,19 @@ DEFAULT_SLOT_BUDGETS = {
     "thoughts": 180,
     "output_description": 80,
 }
+
+GrilloReflector = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+SLOT_NAMES = {
+    "core_identity",
+    "relationship_state",
+    "user_facts",
+    "preferences",
+    "boundaries",
+    "ongoing_threads",
+    "working_scratchpad",
+}
+CANDIDATE_TYPES = {"preference", "fact", "goal", "boundary", "bond_signal", "thread"}
+SLOT_OPERATIONS = {"merge", "replace"}
 
 
 def utc_now() -> str:
@@ -518,11 +532,13 @@ class GrilloRuntime:
         *,
         store: SQLiteGrilloStore,
         vector_store: VectorRecallStore | None = None,
+        reflector: GrilloReflector | None = None,
         auto_promote_threshold: float = 0.7,
         max_slot_items: int = 24,
     ):
         self.store = store
         self.vector_store = vector_store
+        self.reflector = reflector
         self.auto_promote_threshold = auto_promote_threshold
         self.max_slot_items = max_slot_items
         self._tick_lock = asyncio.Lock()
@@ -596,6 +612,23 @@ class GrilloRuntime:
                     summary="No turns available for GRILLO tick.",
                 )
                 return {"ok": True, "candidates": 0, "diary": 0, "slots": 0}
+            if self.reflector is not None:
+                try:
+                    return await self._run_reflection_tick(
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        beat_type=beat_type,
+                        turns=turns,
+                    )
+                except Exception as exc:
+                    await self.store.append_activity(
+                        beat_type="grillo_reflector_failed",
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        summary=f"GRILLO reflector failed; using fallback extractor: {type(exc).__name__}",
+                        metadata={"error": str(exc)},
+                    )
+
             candidates = await self._extract_candidates(turns)
             stored_candidates = [await self.store.append_candidate(candidate) for candidate in candidates]
             diary = await self._write_diary(scope_key, participant_key, beat_type, turns, stored_candidates)
@@ -621,6 +654,167 @@ class GrilloRuntime:
                 "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
                 "diary_id": diary.diary_id,
             }
+
+    async def _run_reflection_tick(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        assert self.reflector is not None
+        context = await self._build_reflection_context(scope_key, participant_key, beat_type, turns)
+        reflection = await self.reflector(context)
+        stored_candidates, diary, promoted = await self._apply_reflection(
+            scope_key=scope_key,
+            participant_key=participant_key,
+            beat_type=beat_type,
+            turns=turns,
+            reflection=reflection,
+        )
+        if self.vector_store is not None:
+            await self._index_semantic(turns, stored_candidates, diary)
+        diary_count = 1 if diary is not None else 0
+        await self.store.append_activity(
+            beat_type=beat_type,
+            scope_key=scope_key,
+            participant_key=participant_key,
+            summary=(
+                f"GRILLO LLM reflector wrote {len(stored_candidates)} candidates, "
+                f"{diary_count} diary entries, {len(promoted)} slots."
+            ),
+            metadata={
+                "mode": "llm_reflector",
+                "notes": str(reflection.get("notes", ""))[:500] if isinstance(reflection, dict) else "",
+                "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
+                "diary_id": diary.diary_id if diary is not None else None,
+                "slot_names": [slot.slot_name for slot in promoted],
+            },
+        )
+        return {
+            "ok": True,
+            "mode": "llm_reflector",
+            "candidates": len(stored_candidates),
+            "diary": diary_count,
+            "slots": len(promoted),
+            "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
+            "diary_id": diary.diary_id if diary is not None else None,
+        }
+
+    async def _build_reflection_context(
+        self,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        slots, diary, candidates = await asyncio.gather(
+            self.store.list_slots(scope_key, participant_key),
+            self.store.list_diary(scope_key, participant_key, limit=6),
+            self.store.list_candidates(scope_key, participant_key, limit=12),
+        )
+        return {
+            "scope_key": scope_key,
+            "participant_key": participant_key,
+            "beat_type": beat_type,
+            "current_time_iso": utc_now(),
+            "turns": [_turn_to_reflection_dict(turn) for turn in turns],
+            "memory_slots": [_slot_to_reflection_dict(slot) for slot in slots],
+            "recent_diary": [_diary_to_reflection_dict(entry) for entry in diary],
+            "recent_candidates": [_candidate_to_reflection_dict(candidate) for candidate in candidates],
+        }
+
+    async def _apply_reflection(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        turns: list[GrilloTurn],
+        reflection: dict[str, Any],
+    ) -> tuple[list[GrilloCandidate], GrilloDiaryEntry | None, list[GrilloSlot]]:
+        if not isinstance(reflection, dict):
+            reflection = {"notes": "reflector returned non-object result"}
+        raw_candidates = _as_list(reflection.get("candidates"))
+        if isinstance(reflection.get("candidate"), dict):
+            raw_candidates.append(reflection["candidate"])
+        candidates = [
+            candidate
+            for candidate in (
+                _candidate_from_reflection(raw, scope_key, participant_key, turns) for raw in raw_candidates
+            )
+            if candidate is not None
+        ]
+        candidates = _dedupe_candidates(candidates)
+        stored_candidates = [await self.store.append_candidate(candidate) for candidate in candidates]
+
+        diary = _diary_from_reflection(
+            reflection.get("diary"),
+            scope_key=scope_key,
+            participant_key=participant_key,
+            beat_type=beat_type,
+            turns=turns,
+            candidates=stored_candidates,
+        )
+        stored_diary = await self.store.append_diary(diary) if diary is not None else None
+
+        explicit_slots = await self._apply_slot_updates(
+            scope_key=scope_key,
+            participant_key=participant_key,
+            updates=_as_list(reflection.get("slots")),
+            candidates=stored_candidates,
+        )
+        promoted = await self._promote_candidates(scope_key, participant_key, stored_candidates)
+        return stored_candidates, stored_diary, _dedupe_slots([*explicit_slots, *promoted])
+
+    async def _apply_slot_updates(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        updates: list[Any],
+        candidates: list[GrilloCandidate],
+    ) -> list[GrilloSlot]:
+        if not updates:
+            return []
+        existing = {slot.slot_name: slot for slot in await self.store.list_slots(scope_key, participant_key)}
+        written: list[GrilloSlot] = []
+        candidate_ids = [candidate.candidate_id for candidate in candidates]
+        for raw in updates:
+            if not isinstance(raw, dict):
+                continue
+            slot_name = str(raw.get("slot_name") or raw.get("block_name") or "").strip()
+            if slot_name not in SLOT_NAMES:
+                continue
+            items = [_compact(item, 220) for item in _string_list(raw.get("items"))]
+            if not items:
+                continue
+            operation = str(raw.get("operation") or "merge").strip().lower()
+            if operation not in SLOT_OPERATIONS:
+                operation = "merge"
+            current = existing.get(slot_name)
+            merged_items = items if operation == "replace" else _dedupe([*(current.items if current else []), *items])
+            source_candidate_ids = _dedupe(
+                [
+                    *(current.source_candidate_ids if current else []),
+                    *_string_list(raw.get("source_candidate_ids")),
+                    *candidate_ids,
+                ]
+            )
+            slot = await self.store.upsert_slot(
+                GrilloSlot(
+                    slot_id=(current.slot_id if current else f"{scope_key}:{participant_key}:{slot_name}"),
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    slot_name=slot_name,  # type: ignore[arg-type]
+                    items=merged_items[-self.max_slot_items :],
+                    source_candidate_ids=source_candidate_ids[-500:],
+                )
+            )
+            existing[slot.slot_name] = slot
+            written.append(slot)
+        return written
 
     async def build_context_packet(
         self,
@@ -788,7 +982,7 @@ class GrilloRuntime:
         self,
         turns: list[GrilloTurn],
         candidates: list[GrilloCandidate],
-        diary: GrilloDiaryEntry,
+        diary: GrilloDiaryEntry | None,
     ) -> None:
         assert self.vector_store is not None
         for candidate in candidates:
@@ -809,6 +1003,8 @@ class GrilloRuntime:
                     created_at=candidate.created_at,
                 )
             )
+        if diary is None:
+            return
         await self.vector_store.add(
             RecallItem(
                 id=f"grillo:diary:{diary.diary_id}",
@@ -961,6 +1157,166 @@ def _compact(text: str, limit: int = 320) -> str:
 def _format_turn(turn: GrilloTurn) -> str:
     author = turn.author_name or turn.role
     return f"{author} ({turn.role}): {_compact(turn.content, 360)}"
+
+
+def _turn_to_reflection_dict(turn: GrilloTurn) -> dict[str, Any]:
+    return {
+        "turn_id": turn.turn_id,
+        "role": turn.role,
+        "author_name": turn.author_name,
+        "content": _compact(turn.content, 1200),
+        "channel_id": turn.channel_id,
+        "interface_path": turn.interface_path,
+        "source": turn.source,
+        "created_at": turn.created_at,
+    }
+
+
+def _slot_to_reflection_dict(slot: GrilloSlot) -> dict[str, Any]:
+    return {
+        "slot_name": slot.slot_name,
+        "items": slot.items[-12:],
+        "updated_at": slot.updated_at,
+    }
+
+
+def _diary_to_reflection_dict(entry: GrilloDiaryEntry) -> dict[str, Any]:
+    return {
+        "beat_type": entry.beat_type,
+        "summary": entry.summary,
+        "personal_thought": _compact(entry.personal_thought, 600),
+        "tags": entry.tags,
+        "created_at": entry.created_at,
+    }
+
+
+def _candidate_to_reflection_dict(candidate: GrilloCandidate) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "type": candidate.type,
+        "summary": candidate.summary,
+        "confidence": candidate.confidence,
+        "tags": candidate.tags,
+        "promoted": candidate.promoted,
+        "created_at": candidate.created_at,
+    }
+
+
+def _candidate_from_reflection(
+    raw: Any,
+    scope_key: str,
+    participant_key: str,
+    turns: list[GrilloTurn],
+) -> GrilloCandidate | None:
+    if not isinstance(raw, dict):
+        return None
+    candidate_type = str(raw.get("type") or "").strip()
+    if candidate_type not in CANDIDATE_TYPES:
+        return None
+    content = _compact(str(raw.get("content") or raw.get("summary") or "").strip(), 500)
+    summary = _compact(str(raw.get("summary") or content).strip(), 220)
+    if not content or not summary:
+        return None
+    source_turn_ids = _string_list(raw.get("source_turn_ids"))
+    origin_turn_id = str(raw.get("origin_turn_id") or "").strip()
+    if origin_turn_id:
+        source_turn_ids.append(origin_turn_id)
+    valid_turn_ids = {turn.turn_id for turn in turns}
+    source_turn_ids = [turn_id for turn_id in _dedupe(source_turn_ids) if turn_id in valid_turn_ids]
+    if not source_turn_ids:
+        source_turn_ids = [turn.turn_id for turn in turns if turn.role == "user"][-2:]
+    return GrilloCandidate(
+        candidate_id=str(uuid4()),
+        scope_key=scope_key,
+        participant_key=participant_key,
+        type=candidate_type,  # type: ignore[arg-type]
+        content=content,
+        summary=summary,
+        confidence=max(0.0, min(1.0, safe_float(raw.get("confidence"), 0.65))),
+        tags=_dedupe(_string_list(raw.get("tags")))[:10],
+        source_turn_ids=source_turn_ids,
+    )
+
+
+def _diary_from_reflection(
+    raw: Any,
+    *,
+    scope_key: str,
+    participant_key: str,
+    beat_type: str,
+    turns: list[GrilloTurn],
+    candidates: list[GrilloCandidate],
+) -> GrilloDiaryEntry | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    summary = _compact(str(raw.get("summary") or "").strip(), 240)
+    personal = _compact(
+        str(raw.get("personal_thought") or raw.get("content") or summary).strip(),
+        700,
+    )
+    if not summary and personal:
+        summary = _compact(personal, 240)
+    if not personal:
+        return None
+    source_turn_ids = _string_list(raw.get("source_turn_ids"))
+    valid_turn_ids = {turn.turn_id for turn in turns}
+    source_turn_ids = [turn_id for turn_id in _dedupe(source_turn_ids) if turn_id in valid_turn_ids]
+    if not source_turn_ids:
+        source_turn_ids = [turn.turn_id for turn in turns[-4:]]
+    tags = _dedupe(
+        [
+            "grillo",
+            str(raw.get("beat_type") or beat_type),
+            *_string_list(raw.get("tags")),
+            *[tag for candidate in candidates for tag in candidate.tags],
+        ]
+    )[:10]
+    return GrilloDiaryEntry(
+        diary_id=str(uuid4()),
+        scope_key=scope_key,
+        participant_key=participant_key,
+        beat_type=_compact(str(raw.get("beat_type") or beat_type), 80),
+        summary=summary,
+        personal_thought=personal,
+        tags=tags,
+        source_turn_ids=source_turn_ids,
+    )
+
+
+def _dedupe_slots(slots: list[GrilloSlot]) -> list[GrilloSlot]:
+    seen: set[str] = set()
+    out: list[GrilloSlot] = []
+    for slot in slots:
+        if slot.slot_name in seen:
+            continue
+        seen.add(slot.slot_name)
+        out.append(slot)
+    return out
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _string_list(value: Any) -> list[str]:
+    out: list[str] = []
+    for item in _as_list(value):
+        if item is None:
+            continue
+        if isinstance(item, (dict, list)):
+            text = json.dumps(item, ensure_ascii=False)
+        else:
+            text = str(item)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            out.append(text)
+    return out
 
 
 def _estimate_tokens(text: str) -> int:

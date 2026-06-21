@@ -198,10 +198,67 @@ async def test_grillo_runtime_ingests_diary_slots_and_context_packet(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_grillo_runtime_splits_profile_blob_into_clean_reflections(tmp_path):
+async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path):
+    async def reflector(context):
+        user_turn = next(turn for turn in context["turns"] if turn["role"] == "user")
+        return {
+            "done": True,
+            "notes": "stored profile and relationship memory",
+            "candidates": [
+                {
+                    "type": "fact",
+                    "content": "LO is a male adult erotica author.",
+                    "summary": "LO is a male adult erotica author.",
+                    "confidence": 0.91,
+                    "tags": ["profile"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+                {
+                    "type": "preference",
+                    "content": "LO prefers crude direct language in adult writing contexts.",
+                    "summary": "LO prefers crude direct language in adult writing contexts.",
+                    "confidence": 0.88,
+                    "tags": ["preference"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+                {
+                    "type": "bond_signal",
+                    "content": "LO is correcting the assistant toward the real GRILLO reflection design.",
+                    "summary": "LO expects GRILLO to be an AI diary/reflection system.",
+                    "confidence": 0.84,
+                    "tags": ["relationship"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+            ],
+            "diary": {
+                "summary": "LO clarified what GRILLO is supposed to be.",
+                "personal_thought": "I should treat LO's memory as reflective relationship context, not as pattern-matched labels.",
+                "tags": ["grillo", "relationship"],
+                "source_turn_ids": [user_turn["turn_id"]],
+            },
+            "slots": [
+                {
+                    "slot_name": "user_facts",
+                    "items": ["LO is a male adult erotica author."],
+                    "operation": "merge",
+                },
+                {
+                    "slot_name": "preferences",
+                    "items": ["LO prefers crude direct language in adult writing contexts."],
+                    "operation": "merge",
+                },
+                {
+                    "slot_name": "relationship_state",
+                    "items": ["LO expects GRILLO to be an AI diary/reflection system."],
+                    "operation": "merge",
+                },
+            ],
+        }
+
     runtime = GrilloRuntime(
         store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
         vector_store=None,
+        reflector=reflector,
     )
 
     await runtime.ingest_turn_pair(
@@ -226,13 +283,13 @@ async def test_grillo_runtime_splits_profile_blob_into_clean_reflections(tmp_pat
     all_items = [item for slot in slots for item in slot.items]
     relationship_text = "\n".join(packet.relationship_memory)
 
-    assert any("My name is LO" in item for item in by_slot["user_facts"])
-    assert any("Adult Erotica Author" in item for item in by_slot["user_facts"])
+    assert any("adult erotica author" in item.lower() for item in by_slot["user_facts"])
     assert any("crude direct language" in item for item in by_slot["preferences"])
+    assert any("AI diary/reflection system" in item for item in by_slot["relationship_state"])
     assert not any("This applies to all chats" in item for item in all_items)
-    assert all(len(item) <= 180 for item in all_items)
     assert "This applies to all chats" not in relationship_text
     assert "Preference signal:" not in relationship_text
+    assert "pattern-matched labels" in packet.thoughts[0]
 
 
 @pytest.mark.asyncio
@@ -295,6 +352,7 @@ async def test_brain_memory_stack_logs_and_extracts_when_enabled(tmp_path):
     assert facts
     assert facts[0].predicate == "likes"
     assert brain.memory_stack.grillo is not None
+    assert brain.memory_stack.grillo.reflector is not None
 
 
 @pytest.mark.asyncio

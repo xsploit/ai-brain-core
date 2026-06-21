@@ -58,6 +58,97 @@ _HELD_THREAD_LOCKS: ContextVar[frozenset[str]] = ContextVar(
 )
 DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
 
+_GRILLO_REFLECTION_INSTRUCTIONS = "\n".join(
+    [
+        "You are the background sleep-time memory agent for this AI companion.",
+        "You are not writing a user-facing chat reply.",
+        "Read the JSON payload and return only JSON matching the schema.",
+        "Write durable memory candidates for explicit preferences, facts, goals, boundaries, bond signals, and ongoing threads.",
+        "Write relationship memory when the turn changes trust, tone, attachment, recurring context, or how the assistant should understand the participant.",
+        "Write diary entries only when the turn meaningfully changes relationship, mood, goals, or stream/server context.",
+        "Diary entries are private first-person reflections from the avatar perspective, not receipts or summaries of every reply.",
+        "A good diary personal_thought says how the speaker or chat made the avatar feel, what changed, and what to remember next time.",
+        "Do not write mechanical diary text like 'Processed N turns' or 'I noticed X and answered as Y'.",
+        "Use slots for consolidated grounded memory, not every transient message.",
+        "Prefer concise, clean memory text. Remove wrapper labels like Preference signal or Durable fact signal.",
+    ]
+)
+
+_GRILLO_REFLECTION_SCHEMA: dict[str, Any] = {
+    "name": "grillo_reflection",
+    "strict": False,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "done": {"type": "boolean"},
+            "notes": {"type": "string"},
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["preference", "fact", "goal", "boundary", "bond_signal", "thread"],
+                        },
+                        "content": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "source_turn_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["type", "content", "summary", "confidence", "tags"],
+                },
+            },
+            "diary": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "beat_type": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "personal_thought": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                            "source_turn_ids": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["summary", "personal_thought", "tags"],
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "slots": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "slot_name": {
+                            "type": "string",
+                            "enum": [
+                                "core_identity",
+                                "relationship_state",
+                                "user_facts",
+                                "preferences",
+                                "boundaries",
+                                "ongoing_threads",
+                                "working_scratchpad",
+                            ],
+                        },
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "operation": {"type": "string", "enum": ["merge", "replace"]},
+                        "source_candidate_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["slot_name", "items", "operation"],
+                },
+            },
+        },
+        "required": ["done", "notes", "candidates", "diary", "slots"],
+    },
+}
+
 _CONTINUATION_PARAM_KEYS = frozenset(
     {
         "model",
@@ -88,6 +179,26 @@ _CONTINUATION_PARAM_KEYS = frozenset(
 
 class _StreamQueueOverflow(RuntimeError):
     pass
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = value.strip("`").strip()
+        if value.lower().startswith("json"):
+            value = value[4:].strip()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(value[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class Brain:
@@ -146,6 +257,7 @@ class Brain:
         if self.config.auto_memory_tools:
             self._register_memory_tools()
             self._register_context_tools()
+        self._wire_grillo_reflector()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -201,6 +313,50 @@ class Brain:
             result = client.close()
             if hasattr(result, "__await__"):
                 await result
+
+    def _wire_grillo_reflector(self) -> None:
+        if self.memory_stack is None or self.memory_stack.grillo is None:
+            return
+        enabled = os.environ.get("AIBRAIN_GRILLO_LLM_REFLECTOR", "true").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return
+        self.memory_stack.grillo.reflector = self._reflect_grillo_memory
+
+    async def _reflect_grillo_memory(self, context: dict[str, Any]) -> dict[str, Any]:
+        persona = Persona(
+            id="grillo-memory-worker",
+            name="GRILLO Memory Worker",
+            instructions=_GRILLO_REFLECTION_INSTRUCTIONS,
+            model=self.config.default_model,
+            prompt_cache_key="aibrain:grillo-memory-worker",
+            tools=[],
+        )
+        payload = {
+            "scope_key": context.get("scope_key"),
+            "participant_key": context.get("participant_key"),
+            "beat_type": context.get("beat_type"),
+            "current_time_iso": context.get("current_time_iso"),
+            "turns": context.get("turns") or [],
+            "memory_slots": context.get("memory_slots") or [],
+            "recent_diary": context.get("recent_diary") or [],
+            "recent_candidates": context.get("recent_candidates") or [],
+        }
+        response = await self.structured(
+            json.dumps(payload, ensure_ascii=False),
+            json_schema=_GRILLO_REFLECTION_SCHEMA,
+            persona=persona,
+            use_memory=False,
+            tool_names=[],
+            stateless=True,
+            memory_event_text="",
+            memory_stack_record=False,
+            temperature=0.25,
+            max_output_tokens=1800,
+        )
+        parsed = _parse_json_object(response.text)
+        if parsed is None:
+            raise ValueError("GRILLO reflector returned invalid JSON")
+        return parsed
 
     async def warmup(
         self,
