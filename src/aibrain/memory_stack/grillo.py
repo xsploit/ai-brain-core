@@ -1388,7 +1388,7 @@ class GrilloRuntime:
         if name == "core.worker_diary_write":
             return await self._write_worker_diary(scope_key, participant_key, args, turns)
         if name == "core.worker_memory_write":
-            return await self._write_worker_memory(scope_key, participant_key, args)
+            return await self._write_worker_memory(scope_key, participant_key, args, turns)
         if name == "core.worker_profile_patch":
             return await self._patch_worker_profile(scope_key, participant_key, args, turns)
         if name == "core.worker_emotion_read":
@@ -1559,6 +1559,7 @@ class GrilloRuntime:
         scope_key: str,
         participant_key: str,
         args: dict[str, Any],
+        turns: list[GrilloTurn],
     ) -> dict[str, Any]:
         block_name = _normalize_memory_block_name(args.get("block_name"))
         if not block_name:
@@ -1572,10 +1573,19 @@ class GrilloRuntime:
         if not slots:
             raise ValueError("block_name and non-empty items are required")
         slot = slots[-1]
+        profile_synced = False
+        if slot.slot_name == "relationship_state":
+            profile_synced = await self._sync_relationship_profile_from_slot(
+                scope_key=scope_key,
+                participant_key=participant_key,
+                slot=slot,
+                turns=turns,
+            )
         return {
             "block_name": slot.slot_name,
             "item_count": len(slot.items),
             "slot_id": slot.slot_id,
+            "profile_synced": profile_synced,
         }
 
     async def _patch_worker_profile(
@@ -1824,6 +1834,29 @@ class GrilloRuntime:
         stored = await self.store.upsert_relationship_profile(profile)
         await self._sync_relationship_profile_graph(stored)
         return stored
+
+    async def _sync_relationship_profile_from_slot(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        slot: GrilloSlot,
+        turns: list[GrilloTurn],
+    ) -> bool:
+        existing = await self.store.get_relationship_profile(scope_key)
+        profile = existing or _default_relationship_profile(scope_key, participant_key)
+        before = json.dumps(_relationship_profile_to_reflection_dict(profile), sort_keys=True)
+        _merge_relationship_slot_items(profile, slot.items)
+        after = json.dumps(_relationship_profile_to_reflection_dict(profile), sort_keys=True)
+        if before == after:
+            return False
+        profile.participant_keys = _dedupe([*profile.participant_keys, participant_key])
+        profile.turn_count = max(profile.turn_count, len(turns))
+        profile.last_seen_at = turns[-1].created_at if turns else utc_now()
+        profile.updated_at = utc_now()
+        stored = await self.store.upsert_relationship_profile(profile)
+        await self._sync_relationship_profile_graph(stored)
+        return True
 
     async def _sync_relationship_profile_graph(self, profile: GrilloRelationshipProfile) -> None:
         target = self.relationship_graph_store
@@ -2736,6 +2769,36 @@ def _merge_relationship_profile(profile: GrilloRelationshipProfile, raw: dict[st
         profile.affect_state = {**profile.affect_state, **affect_state}
 
 
+def _merge_relationship_slot_items(profile: GrilloRelationshipProfile, items: list[str]) -> None:
+    for raw_item in items:
+        item = str(raw_item or "").strip()
+        if not item:
+            continue
+        stage_match = re.search(r"\bstage=([^,\s;]+)", item)
+        if stage_match:
+            profile.relationship_stage = _compact(stage_match.group(1), 120)
+        mood_match = re.search(r"\bmood=([^,\s;]+)", item)
+        if mood_match:
+            profile.mood = _compact(mood_match.group(1), 120)
+        if item.startswith("summary="):
+            profile.summary = _compact(item.split("=", 1)[1], 800)
+        if item.startswith("active_threads="):
+            value = _compact(item.split("=", 1)[1], 260)
+            if value:
+                profile.active_threads = _dedupe([*profile.active_threads, value])[-40:]
+        if item.startswith("known_facts=") or item.startswith("facts="):
+            value = item.split("=", 1)[1]
+            facts = _json_string_list(value) or [value]
+            profile.facts = _dedupe([*profile.facts, *[_compact(fact, 260) for fact in facts]])[-80:]
+        scores_match = re.search(r"\bscores=([^;]+)", item)
+        if scores_match:
+            scores = scores_match.group(1)
+            for attr in ("trust", "attraction", "respect", "irritation", "jealousy", "guard"):
+                score_match = re.search(rf"\b{attr}\s*:\s*(-?\d+(?:\.\d+)?)", scores)
+                if score_match:
+                    setattr(profile, attr, _clamp_int(score_match.group(1), 0, 100, getattr(profile, attr)))
+
+
 def _apply_profile_patch(profile: GrilloRelationshipProfile, raw: Any) -> None:
     if not isinstance(raw, dict):
         return
@@ -2867,6 +2930,14 @@ def _string_list(value: Any) -> list[str]:
         if text:
             out.append(text)
     return out
+
+
+def _json_string_list(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return []
+    return _string_list(parsed) if isinstance(parsed, list) else []
 
 
 def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:

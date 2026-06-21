@@ -595,6 +595,60 @@ async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_grillo_worker_relationship_state_slot_syncs_profile(tmp_path):
+    requests = []
+
+    async def worker_completion(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {
+                "text": json.dumps(
+                    {
+                        "done": False,
+                        "notes": "write structured relationship slot",
+                        "toolCalls": [
+                            {
+                                "name": "core.worker_memory_write",
+                                "args": {
+                                    "block_name": "relationship_state",
+                                    "items": [
+                                        "stage=rapport_building mood=focused",
+                                        "scores=trust:7 respect:6 attraction:1 irritation:0 jealousy:0 guard:10",
+                                        "active_threads=Subby treats memory tests as bonding rituals.",
+                                        'known_facts=["Subby expects GRILLO profile state to mirror structured relationship memory."]',
+                                    ],
+                                    "operation": "merge",
+                                },
+                            }
+                        ],
+                    }
+                )
+            }
+        return {"text": json.dumps({"done": True, "notes": "no separate relationship merge", "toolCalls": [], "relationship": None})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="Memory tests should update the relationship profile too.",
+        assistant_text="I will keep the relationship state synced.",
+        source="discord",
+    )
+
+    profile = await store.get_relationship_profile("discord:guild:alpha:user:user-alpha:persona:neuro")
+    assert profile is not None
+    assert profile.relationship_stage == "rapport_building"
+    assert profile.mood == "focused"
+    assert profile.trust == 7
+    assert profile.respect == 6
+    assert profile.guard == 10
+    assert "bonding rituals" in profile.active_threads[-1]
+    assert "GRILLO profile state" in profile.facts[-1]
+
+
+@pytest.mark.asyncio
 async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
     async def worker_completion(request):
         return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
