@@ -52,6 +52,7 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_read_channel_history",
     "discord_search_channel_messages",
     "discord_send_channel_message",
+    "discord_send_rich_embed",
     "discord_send_file",
     "discord_edit_own_message",
     "discord_fetch_message",
@@ -532,6 +533,54 @@ async def discord_send_channel_message(
         sent = await _call_discord(channel.send, content, allowed_mentions=allowed_mentions)
     await _audit_action(runtime, "discord_send_channel_message", _id(sent), {"channel_id": _id(channel)})
     return {"sent": True, "message": _serialize_message(sent)}
+
+
+async def discord_send_rich_embed(
+    title: str | None = None,
+    description: str | None = None,
+    fields: list[dict[str, Any]] | None = None,
+    channel_id: int | None = None,
+    content: str | None = None,
+    color: int | str | None = None,
+    url: str | None = None,
+    image_url: str | None = None,
+    thumbnail_url: str | None = None,
+    footer_text: str | None = None,
+    author_name: str | None = None,
+    author_url: str | None = None,
+    reply_to_message_id: int | None = None,
+    allow_user_mentions: bool = False,
+) -> dict[str, Any]:
+    """Send a structured Discord embed with optional title, fields, image, thumbnail, and footer."""
+    runtime = _runtime()
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "send rich embed", "view_channel", "send_messages")
+    embed = _build_rich_embed(
+        title=title,
+        description=description,
+        fields=fields,
+        color=color,
+        url=url,
+        image_url=image_url,
+        thumbnail_url=thumbnail_url,
+        footer_text=footer_text,
+        author_name=author_name,
+        author_url=author_url,
+    )
+    allowed_mentions = discord.AllowedMentions(users=allow_user_mentions, roles=False, everyone=False, replied_user=False)
+    send_content = _bounded_optional(content, _env_int("DISCORD_BRAIN_TOOL_SEND_MAX_CHARS", 1900))
+    if reply_to_message_id:
+        await _require_channel_permissions(runtime, channel, "read reply target", "read_message_history")
+        target = await channel.fetch_message(reply_to_message_id)
+        sent = await _call_discord(target.reply, send_content, mention_author=False, embed=embed, allowed_mentions=allowed_mentions)
+    else:
+        sent = await _call_discord(channel.send, content=send_content, embed=embed, allowed_mentions=allowed_mentions)
+    await _audit_action(runtime, "discord_send_rich_embed", _id(sent), {"channel_id": _id(channel), "fields": len(embed.fields)})
+    return {
+        "sent": True,
+        "message": _serialize_message(sent),
+        "embed": _serialize_embed(embed),
+    }
 
 
 async def discord_send_file(
@@ -1838,6 +1887,20 @@ def _serialize_message(message: Any) -> dict[str, Any]:
     }
 
 
+def _serialize_embed(embed: discord.Embed) -> dict[str, Any]:
+    return {
+        "title": embed.title,
+        "description": embed.description,
+        "url": embed.url,
+        "color": embed.color.value if embed.color is not None else None,
+        "fields": [{"name": field.name, "value": field.value, "inline": field.inline} for field in embed.fields],
+        "footer": getattr(embed.footer, "text", None),
+        "author": getattr(embed.author, "name", None),
+        "image_url": getattr(embed.image, "url", None),
+        "thumbnail_url": getattr(embed.thumbnail, "url", None),
+    }
+
+
 def _serialize_user(user: Any) -> dict[str, Any] | None:
     if user is None:
         return None
@@ -2048,8 +2111,75 @@ def _filter_callable_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
             return kwargs
         return {key: value for key, value in kwargs.items() if key in signature.parameters}
-    common = {"reason", "name", "auto_archive_duration", "content", "allowed_mentions"}
+    common = {"reason", "name", "auto_archive_duration", "content", "allowed_mentions", "embed"}
     return {key: value for key, value in kwargs.items() if key in common}
+
+
+def _build_rich_embed(
+    *,
+    title: str | None,
+    description: str | None,
+    fields: list[dict[str, Any]] | None,
+    color: int | str | None,
+    url: str | None,
+    image_url: str | None,
+    thumbnail_url: str | None,
+    footer_text: str | None,
+    author_name: str | None,
+    author_url: str | None,
+) -> discord.Embed:
+    if not any(str(item or "").strip() for item in (title, description, url, image_url, thumbnail_url, footer_text, author_name)) and not fields:
+        raise DiscordToolError("At least one embed title, description, field, image, thumbnail, footer, or author is required.")
+    embed = discord.Embed(
+        title=_bounded_optional(title, 256),
+        description=_bounded_optional(description, 4096),
+        url=_clean_url(url),
+        color=_parse_embed_color(color),
+    )
+    if author_name:
+        embed.set_author(name=_bounded_text(author_name, 256), url=_clean_url(author_url))
+    if footer_text:
+        embed.set_footer(text=_bounded_text(footer_text, 2048))
+    if image_url:
+        embed.set_image(url=_clean_url(image_url))
+    if thumbnail_url:
+        embed.set_thumbnail(url=_clean_url(thumbnail_url))
+    for field in list(fields or [])[:25]:
+        if not isinstance(field, dict):
+            continue
+        name = _bounded_text(str(field.get("name") or ""), 256)
+        value = _bounded_text(str(field.get("value") or ""), 1024)
+        if not name or not value:
+            continue
+        embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
+    if len(embed) > 6000:
+        raise DiscordToolError("Embed is too large after Discord limits; shorten the description or fields.")
+    return embed
+
+
+def _parse_embed_color(color: int | str | None) -> discord.Color | None:
+    if color is None or color == "":
+        return None
+    if isinstance(color, str):
+        raw = color.strip().lower().removeprefix("#").removeprefix("0x")
+        try:
+            value = int(raw, 16)
+        except ValueError as exc:
+            raise DiscordToolError(f"Invalid embed color: {color}") from exc
+    else:
+        value = int(color)
+    if not 0 <= value <= 0xFFFFFF:
+        raise DiscordToolError("Embed color must be between 0x000000 and 0xFFFFFF.")
+    return discord.Color(value)
+
+
+def _clean_url(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if not (text.startswith("http://") or text.startswith("https://")):
+        raise DiscordToolError("Embed URLs must start with http:// or https://.")
+    return text
 
 
 def _bounded_text(text: str, limit: int) -> str:

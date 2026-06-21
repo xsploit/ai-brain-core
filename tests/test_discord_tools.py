@@ -23,6 +23,7 @@ from aibrain.discord_tools import (
     discord_read_channel_history,
     discord_send_channel_message,
     discord_send_file,
+    discord_send_rich_embed,
     discord_timeout_member,
     register_discord_tools,
 )
@@ -393,6 +394,41 @@ def test_send_channel_message_requires_requester_and_bot_send_permission():
         assert result["sent"] is True
         assert ctx.channel.sent[0][0] == "hello @everyone"
         assert ctx.channel.sent[0][1]["allowed_mentions"].everyone is False
+
+
+def test_send_rich_embed_builds_structured_embed_and_blocks_everyone_mentions():
+    with _tool_context(
+        actor_perms=_Perms(view_channel=True, send_messages=True),
+        bot_perms=_Perms(view_channel=True, send_messages=True),
+    ) as ctx:
+        result = asyncio.run(
+            discord_send_rich_embed(
+                title="Memory Report",
+                description="Here is the clean version.",
+                fields=[
+                    {"name": "Scope", "value": "server-user", "inline": True},
+                    {"name": "Status", "value": "ready", "inline": True},
+                ],
+                color="#55AAFF",
+                image_url="https://example.com/image.png",
+                footer_text="Neuro memory tools",
+                content="@everyone summary",
+                channel_id=123,
+            )
+        )
+
+        sent_content, kwargs = ctx.channel.sent[0]
+        embed = kwargs["embed"]
+
+        assert result["sent"] is True
+        assert sent_content == "@everyone summary"
+        assert kwargs["allowed_mentions"].everyone is False
+        assert embed.title == "Memory Report"
+        assert embed.description == "Here is the clean version."
+        assert embed.color.value == 0x55AAFF
+        assert embed.image.url == "https://example.com/image.png"
+        assert [field.name for field in embed.fields] == ["Scope", "Status"]
+        assert result["embed"]["fields"][0]["inline"] is True
 
 
 def test_read_channel_history_requires_history_permission_and_serializes_messages():
