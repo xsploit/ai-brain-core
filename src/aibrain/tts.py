@@ -264,18 +264,31 @@ class PiperProcessTTS(PiperExecutableTTS):
         runtime_config = tts_config_for_voice(self.config, options.get("voice"))
         key = tts_config_process_key(runtime_config)
         lock = await self._process_lock(key)
+        chunks: list[TTSChunk] = []
         async with lock:
             await self._close_process(key)
-            audio = await self._run_piper(
-                text,
-                output_raw=runtime_config.output_format == "pcm_s16le",
-                config=runtime_config,
-            )
+            try:
+                index = 0
+                for segment in split_tts_text(text, runtime_config):
+                    async for chunk in self._stream_process(
+                        segment,
+                        config=runtime_config,
+                        start_index=index,
+                    ):
+                        chunks.append(chunk)
+                        index = chunk.index + 1
+            finally:
+                await self._close_process(key)
+        voice_name = (
+            chunks[0].voice
+            if chunks and chunks[0].voice
+            else tts_voice_name(runtime_config) or options.get("voice")
+        )
         return TTSAudio(
-            audio=audio,
-            sample_rate=runtime_config.resolved_sample_rate(),
-            encoding=runtime_config.output_format,
-            voice=tts_voice_name(runtime_config) or options.get("voice"),
+            audio=b"".join(chunk.audio for chunk in chunks),
+            sample_rate=chunks[0].sample_rate if chunks else runtime_config.resolved_sample_rate(),
+            encoding=chunks[0].encoding if chunks else runtime_config.output_format,
+            voice=voice_name,
         )
 
     async def stream(self, text: str, **options: Any) -> AsyncIterator[TTSChunk]:

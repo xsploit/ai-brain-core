@@ -452,14 +452,15 @@ class ConcurrentFakePiperProcess(PiperProcessTTS):
             self.active -= 1
 
 
-class RecordingOneShotPiperProcess(PiperProcessTTS):
+class RecordingFreshStreamPiperProcess(PiperProcessTTS):
     def __init__(self):
         super().__init__(TTSConfig(provider="null"))
         self.calls = []
 
     async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        self.calls.append(text)
         yield TTSChunk(
-            audio=b"stale:" + text.encode(),
+            audio=text.encode(),
             sample_rate=22050,
             index=start_index,
             final=True,
@@ -467,8 +468,7 @@ class RecordingOneShotPiperProcess(PiperProcessTTS):
         )
 
     async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
-        self.calls.append(text)
-        return text.encode()
+        raise AssertionError("full synth should use the fresh streaming Piper path")
 
 
 @pytest.mark.asyncio
@@ -524,8 +524,8 @@ async def test_piper_process_locks_per_voice(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_piper_process_synthesize_uses_fresh_one_shot_process():
-    provider = RecordingOneShotPiperProcess()
+async def test_piper_process_synthesize_uses_fresh_streaming_process():
+    provider = RecordingFreshStreamPiperProcess()
 
     first = await provider.synthesize("previous response")
     second = await provider.synthesize("new response")
