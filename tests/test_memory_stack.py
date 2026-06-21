@@ -1,6 +1,6 @@
-from types import SimpleNamespace
-
 import importlib.util
+import json
+from types import SimpleNamespace
 import pytest
 
 from aibrain import Brain, BrainConfig, MemoryStackConfig
@@ -8,6 +8,7 @@ from aibrain.embeddings import HashEmbeddingProvider
 from aibrain.memory_stack import (
     GRILLOMemoryWorker,
     GrilloRuntime,
+    GrilloDiaryEntry,
     GrilloRelationshipProfile,
     GraphQuery,
     HybridMemoryStack,
@@ -317,6 +318,143 @@ async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(tmp_path):
+    seen_requests = []
+
+    async def worker_completion(request):
+        seen_requests.append(request)
+        if len(seen_requests) == 1:
+            prompt = request["messages"][1]["content"]
+            assert "Canonical GRILLO context packet" in prompt
+            assert "stage=familiar mood=guarded" in prompt
+            assert "I already feel guarded but invested around LO." in prompt
+            return {
+                "text": json.dumps(
+                    {
+                        "done": False,
+                        "notes": "reflect with tools",
+                        "toolCalls": [
+                            {"name": "core.worker_memory_read", "args": {}},
+                            {
+                                "name": "core.worker_candidate_write",
+                                "args": {
+                                    "type": "bond_signal",
+                                    "content": "LO wants the real WebWaifu GRILLO worker loop ported one-to-one.",
+                                    "summary": "LO expects one-to-one GRILLO worker parity.",
+                                    "confidence": 0.93,
+                                    "tags": ["relationship", "grillo"],
+                                },
+                            },
+                            {
+                                "name": "core.worker_diary_write",
+                                "args": {
+                                    "summary": "LO pushed for real GRILLO parity.",
+                                    "personal_thought": (
+                                        "I should treat LO's correction as a serious relationship signal: "
+                                        "he wants the real reflective worker, not a shallow memory parser."
+                                    ),
+                                    "tags": ["relationship", "grillo"],
+                                    "beat_type": "relationship",
+                                },
+                            },
+                            {
+                                "name": "core.worker_memory_write",
+                                "args": {
+                                    "block_name": "relationship_state",
+                                    "items": ["LO expects the Discord bot to use the real GRILLO worker loop."],
+                                    "operation": "merge",
+                                    "reason": "grounded relationship beat",
+                                },
+                            },
+                            {
+                                "name": "core.worker_profile_patch",
+                                "args": {
+                                    "field": "interaction_style",
+                                    "operation": "add",
+                                    "value": "Treat one-to-one port requests as literal architecture requirements.",
+                                },
+                            },
+                            {
+                                "name": "core.worker_emotion_update",
+                                "args": {
+                                    "intensities": {"focused": 0.82, "guarded": 0.25},
+                                    "last_signal_source": "relationship beat",
+                                },
+                            },
+                            {
+                                "name": "core.worker_memory_insert_archival",
+                                "args": {"text": "One-to-one GRILLO parity requires the worker loop and tool executor."},
+                            },
+                        ],
+                    }
+                ),
+                "meta": {"provider": "test", "model": "worker-test"},
+            }
+        assert any("core.worker_memory_read" in message["content"] for message in request["messages"])
+        return {"text": json.dumps({"done": True, "notes": "done", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    await store.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:alpha",
+            scope_key="discord:guild:alpha",
+            persona_id="neuro",
+            participant_keys=["user-alpha"],
+            relationship_stage="familiar",
+            mood="guarded",
+            trust=5,
+            summary="LO wants literal GRILLO parity.",
+        )
+    )
+    await store.append_diary(
+        GrilloDiaryEntry(
+            diary_id="diary-existing",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            beat_type="relationship",
+            summary="Existing relationship reflection.",
+            personal_thought="I already feel guarded but invested around LO.",
+            tags=["relationship"],
+            source_turn_ids=[],
+            created_at="2026-06-20T00:00:00+00:00",
+        )
+    )
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        user_text="Get the WebWaifu GRILLO reflection worker one-to-one.",
+        assistant_text="I will port the worker loop.",
+        source="discord",
+    )
+
+    assert len(seen_requests) == 2
+    slots = await store.list_slots("discord:guild:alpha", "user-alpha")
+    profile = await store.get_relationship_profile("discord:guild:alpha")
+    emotion = await store.get_emotion_state("discord:guild:alpha")
+    archival = await store.list_archival_memories("discord:guild:alpha")
+    diary = await store.list_diary("discord:guild:alpha", "user-alpha", limit=4)
+
+    assert any(
+        "real GRILLO worker loop" in item
+        for slot in slots
+        if slot.slot_name == "relationship_state"
+        for item in slot.items
+    )
+    assert profile is not None
+    assert any("literal architecture requirements" in item for item in profile.interaction_style)
+    assert profile.diary_entry.startswith("I should treat LO's correction")
+    assert emotion["intensities"]["focused"] == 0.82
+    assert archival and "worker loop" in archival[0]["text"]
+    assert any("serious relationship signal" in entry.personal_thought for entry in diary)
+
+
+@pytest.mark.asyncio
 async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_participant(tmp_path):
     provider = HashEmbeddingProvider(dimensions=32)
     vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)
@@ -376,6 +514,7 @@ async def test_brain_memory_stack_logs_and_extracts_when_enabled(tmp_path):
     assert facts
     assert facts[0].predicate == "likes"
     assert brain.memory_stack.grillo is not None
+    assert brain.memory_stack.grillo.worker_completion is not None
     assert brain.memory_stack.grillo.reflector is not None
 
 

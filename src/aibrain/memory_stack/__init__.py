@@ -21,6 +21,7 @@ from .grillo import (
     GrilloRuntimeStatus,
     GrilloSlot,
     GrilloTurn,
+    GrilloWorkerCompletion,
     SQLiteGrilloStore,
 )
 from .ladybug_store import LadybugGraphMemoryStore
@@ -41,6 +42,7 @@ __all__ = [
     "GrilloRuntimeStatus",
     "GrilloSlot",
     "GrilloTurn",
+    "GrilloWorkerCompletion",
     "GraphMemoryStore",
     "GraphQuery",
     "HybridMemoryStack",

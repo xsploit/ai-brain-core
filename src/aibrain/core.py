@@ -136,6 +136,9 @@ _GRILLO_REFLECTION_SCHEMA: dict[str, Any] = {
                                 "preferences",
                                 "boundaries",
                                 "ongoing_threads",
+                                "open_threads",
+                                "verified_facts",
+                                "tone_preferences",
                                 "working_scratchpad",
                             ],
                         },
@@ -203,6 +206,49 @@ _GRILLO_REFLECTION_SCHEMA: dict[str, Any] = {
             "relationship_profile",
             "profile_patches",
         ],
+    },
+}
+
+_GRILLO_WORKER_RESPONSE_SCHEMA: dict[str, Any] = {
+    "name": "grillo_worker_response",
+    "strict": False,
+    "schema": {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {
+            "done": {"type": "boolean"},
+            "notes": {"type": "string"},
+            "toolCalls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "enum": [
+                                "core.worker_memory_read",
+                                "core.worker_memory_search",
+                                "core.worker_candidate_list",
+                                "core.worker_candidate_write",
+                                "core.worker_diary_write",
+                                "core.worker_memory_write",
+                                "core.worker_profile_patch",
+                                "core.worker_emotion_read",
+                                "core.worker_emotion_update",
+                                "core.worker_memory_insert_archival",
+                            ],
+                        },
+                        "args": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["name", "args"],
+                },
+            },
+            "candidate": {"type": "object", "additionalProperties": True},
+            "diary": {"type": "object", "additionalProperties": True},
+            "memory": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["done", "notes", "toolCalls"],
     },
 }
 
@@ -377,7 +423,56 @@ class Brain:
         enabled = os.environ.get("AIBRAIN_GRILLO_LLM_REFLECTOR", "true").strip().lower()
         if enabled in {"0", "false", "no", "off"}:
             return
+        self.memory_stack.grillo.worker_completion = self._complete_grillo_worker
         self.memory_stack.grillo.reflector = self._reflect_grillo_memory
+
+    async def _complete_grillo_worker(self, request: dict[str, Any]) -> dict[str, Any]:
+        messages = request.get("messages") if isinstance(request.get("messages"), list) else []
+        system_prompt = ""
+        conversation: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            content = str(message.get("content") or "")
+            if role == "system" and not system_prompt:
+                system_prompt = content
+            else:
+                conversation.append({"role": role or "user", "content": content})
+        persona = Persona(
+            id="grillo-backend-worker",
+            name="GRILLO Backend Worker",
+            instructions=system_prompt or _GRILLO_REFLECTION_INSTRUCTIONS,
+            model=self.config.default_model,
+            prompt_cache_key="aibrain:grillo-backend-worker",
+            tools=[],
+        )
+        payload = {
+            "messages": conversation,
+            "response_format": request.get("responseFormat") or {"type": "json_object"},
+            "state_key": request.get("stateKey"),
+            "state_scope": request.get("stateScope"),
+            "tool_choice_mode": request.get("toolChoiceMode"),
+        }
+        response = await self.structured(
+            json.dumps(payload, ensure_ascii=False),
+            json_schema=_GRILLO_WORKER_RESPONSE_SCHEMA,
+            persona=persona,
+            use_memory=False,
+            tool_names=[],
+            stateless=True,
+            memory_event_text="",
+            memory_stack_record=False,
+            temperature=float(request.get("temperature") or 0.25),
+            max_output_tokens=int(request.get("maxTokens") or 900),
+        )
+        return {
+            "text": response.text,
+            "meta": {
+                "model": self.config.default_model,
+                "provider": self.config.provider,
+            },
+        }
 
     async def _reflect_grillo_memory(self, context: dict[str, Any]) -> dict[str, Any]:
         persona = Persona(

@@ -24,6 +24,9 @@ SlotName = Literal[
     "preferences",
     "boundaries",
     "ongoing_threads",
+    "open_threads",
+    "verified_facts",
+    "tone_preferences",
     "working_scratchpad",
 ]
 
@@ -38,6 +41,7 @@ DEFAULT_SLOT_BUDGETS = {
 }
 
 GrilloReflector = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+GrilloWorkerCompletion = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | str]]
 SLOT_NAMES = {
     "core_identity",
     "relationship_state",
@@ -45,10 +49,33 @@ SLOT_NAMES = {
     "preferences",
     "boundaries",
     "ongoing_threads",
+    "open_threads",
+    "verified_facts",
+    "tone_preferences",
     "working_scratchpad",
 }
 CANDIDATE_TYPES = {"preference", "fact", "goal", "boundary", "bond_signal", "thread"}
 SLOT_OPERATIONS = {"merge", "replace"}
+WORKER_TOOL_NAMES = {
+    "core.worker_memory_read",
+    "core.worker_memory_search",
+    "core.worker_candidate_list",
+    "core.worker_candidate_write",
+    "core.worker_diary_write",
+    "core.worker_memory_write",
+    "core.worker_profile_patch",
+    "core.worker_emotion_read",
+    "core.worker_emotion_update",
+    "core.worker_memory_insert_archival",
+}
+WORKER_WRITE_TOOLS = {
+    "core.worker_candidate_write",
+    "core.worker_diary_write",
+    "core.worker_memory_write",
+    "core.worker_profile_patch",
+    "core.worker_emotion_update",
+    "core.worker_memory_insert_archival",
+}
 
 
 def utc_now() -> str:
@@ -296,6 +323,39 @@ class SQLiteGrilloStore:
                     active_threads_json TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS grillo_emotion_states (
+                    scope_key TEXT PRIMARY KEY,
+                    intensities_json TEXT NOT NULL DEFAULT '{}',
+                    last_signal_at TEXT,
+                    last_signal_source TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS grillo_archival_memories (
+                    archival_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_grillo_archival_scope
+                    ON grillo_archival_memories(scope_key, created_at);
+
+                CREATE TABLE IF NOT EXISTS grillo_worker_context_traces (
+                    trace_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    participant_key TEXT NOT NULL,
+                    beat_type TEXT NOT NULL,
+                    round INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    system_prompt TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    response_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_grillo_worker_traces_scope
+                    ON grillo_worker_context_traces(scope_key, participant_key, created_at);
 
                 CREATE TABLE IF NOT EXISTS grillo_activity (
                     activity_id TEXT PRIMARY KEY,
@@ -596,6 +656,177 @@ class SQLiteGrilloStore:
             ).fetchall()
         return [_row_to_relationship_profile(row) for row in rows]
 
+    async def get_emotion_state(self, scope_key: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_emotion_state_sync, scope_key)
+
+    def _get_emotion_state_sync(self, scope_key: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT * FROM grillo_emotion_states WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+        if row is None:
+            return {
+                "scope_key": scope_key,
+                "intensities": {},
+                "last_signal_at": None,
+                "last_signal_source": "",
+                "updated_at": None,
+            }
+        return {
+            "scope_key": row["scope_key"],
+            "intensities": _json_obj(row["intensities_json"]),
+            "last_signal_at": row["last_signal_at"],
+            "last_signal_source": row["last_signal_source"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def upsert_emotion_state(
+        self,
+        scope_key: str,
+        *,
+        intensities: dict[str, Any],
+        last_signal_source: str = "",
+        last_signal_at: str | None = None,
+    ) -> dict[str, Any]:
+        updated_at = utc_now()
+        await asyncio.to_thread(
+            self._upsert_emotion_state_sync,
+            scope_key,
+            intensities,
+            last_signal_source,
+            last_signal_at or updated_at,
+            updated_at,
+        )
+        return await self.get_emotion_state(scope_key)
+
+    def _upsert_emotion_state_sync(
+        self,
+        scope_key: str,
+        intensities: dict[str, Any],
+        last_signal_source: str,
+        last_signal_at: str,
+        updated_at: str,
+    ) -> None:
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT INTO grillo_emotion_states (
+                    scope_key, intensities_json, last_signal_at, last_signal_source, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    intensities_json = excluded.intensities_json,
+                    last_signal_at = excluded.last_signal_at,
+                    last_signal_source = excluded.last_signal_source,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_key, json.dumps(intensities), last_signal_at, last_signal_source, updated_at),
+            )
+
+    async def append_archival_memory(self, scope_key: str, text: str) -> dict[str, Any]:
+        record = {"archival_id": str(uuid4()), "scope_key": scope_key, "text": text, "created_at": utc_now()}
+        await asyncio.to_thread(self._append_archival_memory_sync, record)
+        return record
+
+    def _append_archival_memory_sync(self, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT INTO grillo_archival_memories (
+                    archival_id, scope_key, text, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (record["archival_id"], record["scope_key"], record["text"], record["created_at"]),
+            )
+
+    async def list_archival_memories(self, scope_key: str, limit: int = 10) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_archival_memories_sync, scope_key, limit)
+
+    def _list_archival_memories_sync(self, scope_key: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connect().execute(
+                """
+                SELECT * FROM grillo_archival_memories
+                WHERE scope_key = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (scope_key, limit),
+            ).fetchall()
+        return [
+            {
+                "archival_id": row["archival_id"],
+                "scope_key": row["scope_key"],
+                "text": row["text"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    async def append_worker_trace(
+        self,
+        *,
+        trace_id: str,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        round: int,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        prompt: str,
+        response_text: str,
+    ) -> None:
+        await asyncio.to_thread(
+            self._append_worker_trace_sync,
+            trace_id,
+            scope_key,
+            participant_key,
+            beat_type,
+            round,
+            provider,
+            model,
+            system_prompt,
+            prompt,
+            response_text,
+        )
+
+    def _append_worker_trace_sync(
+        self,
+        trace_id: str,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        round: int,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        prompt: str,
+        response_text: str,
+    ) -> None:
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT INTO grillo_worker_context_traces (
+                    trace_id, scope_key, participant_key, beat_type, round,
+                    provider, model, system_prompt, prompt, response_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace_id,
+                    scope_key,
+                    participant_key,
+                    beat_type,
+                    round,
+                    provider,
+                    model,
+                    system_prompt,
+                    prompt,
+                    response_text,
+                    utc_now(),
+                ),
+            )
+
     async def append_activity(
         self,
         *,
@@ -666,6 +897,7 @@ class GrilloRuntime:
         vector_store: VectorRecallStore | None = None,
         relationship_graph_store: Any | None = None,
         reflector: GrilloReflector | None = None,
+        worker_completion: GrilloWorkerCompletion | None = None,
         auto_promote_threshold: float = 0.7,
         max_slot_items: int = 24,
     ):
@@ -673,6 +905,7 @@ class GrilloRuntime:
         self.vector_store = vector_store
         self.relationship_graph_store = relationship_graph_store
         self.reflector = reflector
+        self.worker_completion = worker_completion
         self.auto_promote_threshold = auto_promote_threshold
         self.max_slot_items = max_slot_items
         self._tick_lock = asyncio.Lock()
@@ -724,7 +957,7 @@ class GrilloRuntime:
             )
         )
         if run_tick:
-            await self.run_tick(scope_key=scope_key, participant_key=participant_key, beat_type="chat_interaction")
+            await self.run_tick(scope_key=scope_key, participant_key=participant_key, beat_type="relationship")
         return user_turn, assistant_turn
 
     async def run_tick(
@@ -746,6 +979,22 @@ class GrilloRuntime:
                     summary="No turns available for GRILLO tick.",
                 )
                 return {"ok": True, "candidates": 0, "diary": 0, "slots": 0}
+            if self.worker_completion is not None:
+                try:
+                    return await self._run_worker_beat_tick(
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        beat_type=beat_type,
+                        turns=turns,
+                    )
+                except Exception as exc:
+                    await self.store.append_activity(
+                        beat_type="grillo_worker_failed",
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        summary=f"GRILLO worker failed; using fallback reflector: {type(exc).__name__}",
+                        metadata={"error": str(exc)},
+                    )
             if self.reflector is not None:
                 try:
                     return await self._run_reflection_tick(
@@ -788,6 +1037,523 @@ class GrilloRuntime:
                 "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
                 "diary_id": diary.diary_id,
             }
+
+    async def _run_worker_beat_tick(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        assert self.worker_completion is not None
+        context_packet = await self.build_context_packet(
+            scope_key=scope_key,
+            participant_key=participant_key,
+            query=turns[-1].content if turns else "",
+            current_turn_text=turns[-1].content if turns else "",
+        )
+        system_prompt = _build_backend_worker_system_prompt()
+        user_prompt = _build_backend_beat_prompt(
+            beat_type=beat_type,
+            context_packet=context_packet,
+            recent_turns=turns[-8:],
+            scope_key=scope_key,
+        )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        source_turn_ids = [turn.turn_id for turn in turns if turn.turn_id]
+        max_rounds = 4
+        max_tool_rounds = 15
+        writes = 0
+        tool_calls = 0
+        counts = {
+            "candidates": 0,
+            "diary": 0,
+            "slots": 0,
+            "profile_patches": 0,
+            "emotion_updates": 0,
+            "archival": 0,
+        }
+        last_trace_id = ""
+        last_provider = "runtime-provider"
+        last_model = "runtime-model"
+        last_notes = ""
+
+        for round_index in range(1, max_rounds + 1):
+            raw_result = await self.worker_completion(
+                {
+                    "disableState": True,
+                    "maxTokens": 900,
+                    "maxToolRounds": max_tool_rounds,
+                    "messages": messages,
+                    "responseFormat": {"type": "json_object"},
+                    "stateKey": f"memory:{scope_key}",
+                    "stateScope": "memory",
+                    "temperature": 0.2 if beat_type == "relationship" else 0.35,
+                    "toolChoiceMode": "auto",
+                }
+            )
+            raw_text, meta = _worker_completion_text_and_meta(raw_result)
+            last_provider = str(meta.get("provider") or last_provider)
+            last_model = str(meta.get("model") or last_model)
+            last_trace_id = str(uuid4())
+            await self.store.append_worker_trace(
+                trace_id=last_trace_id,
+                scope_key=scope_key,
+                participant_key=participant_key,
+                beat_type=beat_type,
+                round=round_index,
+                provider=last_provider,
+                model=last_model,
+                system_prompt=system_prompt,
+                prompt=user_prompt,
+                response_text=raw_text,
+            )
+
+            parsed = _parse_worker_json(raw_text)
+            last_notes = _compact(str(parsed.get("notes") or ""), 500)
+            calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
+            if not calls:
+                if parsed.get("done") is True:
+                    break
+                await self.store.append_activity(
+                    beat_type=beat_type,
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    summary="GRILLO worker returned no tool calls before done.",
+                    metadata={
+                        "mode": "worker_loop",
+                        "notes": last_notes,
+                        "trace_id": last_trace_id,
+                        "writes": writes,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "mode": "worker_loop",
+                    "no_op_reason": "worker_no_tool_calls" if writes == 0 else None,
+                    "writes": writes,
+                    "tool_calls": tool_calls,
+                    **counts,
+                }
+
+            messages.append({"role": "assistant", "content": raw_text})
+            for call in calls:
+                tool_calls += 1
+                execution = await self.run_worker_tool(
+                    name=call["name"],
+                    args=call["args"],
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    turns=turns,
+                )
+                if execution["ok"] and call["name"] in WORKER_WRITE_TOOLS:
+                    writes += 1
+                    kind = _worker_write_kind(call["name"])
+                    if kind in counts:
+                        counts[kind] += 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "ok": execution["ok"],
+                                "result": execution["result"],
+                                "tool": call["name"],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue this GRILLO beat. Use more worker tools if needed. "
+                        "If complete, return JSON with done=true and toolCalls=[]."
+                    ),
+                }
+            )
+
+        await self.store.append_activity(
+            beat_type=beat_type,
+            scope_key=scope_key,
+            participant_key=participant_key,
+            summary=f"GRILLO worker loop completed with {writes} writes and {tool_calls} tool calls.",
+            metadata={
+                "mode": "worker_loop",
+                "notes": last_notes,
+                "provider": last_provider,
+                "model": last_model,
+                "trace_id": last_trace_id,
+                "writes": writes,
+                "tool_calls": tool_calls,
+                **counts,
+            },
+        )
+        return {
+            "ok": True,
+            "mode": "worker_loop",
+            "writes": writes,
+            "tool_calls": tool_calls,
+            "trace_id": last_trace_id,
+            **counts,
+        }
+
+    async def run_worker_tool(
+        self,
+        *,
+        name: str,
+        args: dict[str, Any] | None = None,
+        scope_key: str,
+        participant_key: str,
+        turns: list[GrilloTurn] | None = None,
+    ) -> dict[str, Any]:
+        normalized_name = str(name or "").strip()
+        started_at = datetime.now(timezone.utc)
+        try:
+            if normalized_name not in WORKER_TOOL_NAMES:
+                raise ValueError(f"Unsupported GRILLO worker tool: {normalized_name or 'unknown'}")
+            result = await self._execute_worker_tool(
+                normalized_name,
+                scope_key=scope_key,
+                participant_key=participant_key,
+                args=args or {},
+                turns=turns or [],
+            )
+            ok = True
+            error = ""
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            ok = False
+            error = str(exc)
+        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        await self.store.append_activity(
+            beat_type="worker_tool",
+            scope_key=scope_key,
+            participant_key=participant_key,
+            summary=(
+                f"{normalized_name} ok"
+                if ok
+                else f"{normalized_name or 'unknown'} failed: {type(result).__name__}"
+            ),
+            metadata={
+                "tool_name": normalized_name,
+                "ok": ok,
+                "error": error,
+                "duration_ms": duration_ms,
+                "args_summary": _summarize_tool_args(args or {}),
+            },
+        )
+        return {
+            "duration_ms": duration_ms,
+            "name": normalized_name,
+            "ok": ok,
+            "result": result,
+        }
+
+    async def _execute_worker_tool(
+        self,
+        name: str,
+        *,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        if name == "core.worker_memory_read":
+            return await self._read_worker_memory(scope_key, participant_key, args)
+        if name == "core.worker_memory_search":
+            return await self._search_worker_memory(scope_key, participant_key, args)
+        if name == "core.worker_candidate_list":
+            return await self._list_worker_candidates(scope_key, participant_key, args)
+        if name == "core.worker_candidate_write":
+            return await self._write_worker_candidate(scope_key, participant_key, args, turns)
+        if name == "core.worker_diary_write":
+            return await self._write_worker_diary(scope_key, participant_key, args, turns)
+        if name == "core.worker_memory_write":
+            return await self._write_worker_memory(scope_key, participant_key, args)
+        if name == "core.worker_profile_patch":
+            return await self._patch_worker_profile(scope_key, participant_key, args, turns)
+        if name == "core.worker_emotion_read":
+            return {"emotion_state": await self.store.get_emotion_state(scope_key)}
+        if name == "core.worker_emotion_update":
+            return await self._update_worker_emotion(scope_key, participant_key, args, turns)
+        return await self._insert_worker_archival_memory(scope_key, args)
+
+    async def _read_worker_memory(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        block_name = _normalize_memory_block_name(args.get("block_name"))
+        slots, diary, candidates, profile, emotion, archival = await asyncio.gather(
+            self.store.list_slots(scope_key, participant_key),
+            self.store.list_diary(scope_key, participant_key, limit=12),
+            self.store.list_candidates(scope_key, participant_key, limit=20),
+            self.store.get_relationship_profile(scope_key),
+            self.store.get_emotion_state(scope_key),
+            self.store.list_archival_memories(scope_key, limit=8),
+        )
+        if block_name:
+            slots = [slot for slot in slots if slot.slot_name == block_name]
+        return {
+            "memory_blocks": archival,
+            "slots": [_slot_to_reflection_dict(slot) for slot in slots],
+            "diary_entries": [_diary_to_reflection_dict(entry) for entry in diary],
+            "candidates": [_candidate_to_reflection_dict(candidate) for candidate in candidates],
+            "relationship_profile": (
+                _relationship_profile_to_reflection_dict(profile) if profile is not None else None
+            ),
+            "emotion_state": emotion,
+        }
+
+    async def _search_worker_memory(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = _compact(str(args.get("query") or "").strip(), 500)
+        limit = _clamp_int(args.get("limit"), 1, 20, 5)
+        if not query:
+            return {"results": []}
+        slots, diary, candidates, profile, archival = await asyncio.gather(
+            self.store.list_slots(scope_key, participant_key),
+            self.store.list_diary(scope_key, participant_key, limit=50),
+            self.store.list_candidates(scope_key, participant_key, limit=80),
+            self.store.get_relationship_profile(scope_key),
+            self.store.list_archival_memories(scope_key, limit=40),
+        )
+        records: list[dict[str, Any]] = []
+        records.extend(
+            {
+                "id": candidate.candidate_id,
+                "metadata": {"source": "candidate", "type": candidate.type},
+                "text": f"{candidate.summary} {candidate.content}".strip(),
+            }
+            for candidate in candidates
+        )
+        records.extend(
+            {
+                "id": entry.diary_id,
+                "metadata": {"source": "diary", "beat_type": entry.beat_type},
+                "text": f"{entry.summary} {entry.personal_thought}".strip(),
+            }
+            for entry in diary
+        )
+        records.extend(
+            {
+                "id": slot.slot_id,
+                "metadata": {"source": "memory_slot", "slot_name": slot.slot_name},
+                "text": " ".join(slot.items),
+            }
+            for slot in slots
+        )
+        records.extend(
+            {
+                "id": record["archival_id"],
+                "metadata": {"source": "archival"},
+                "text": record["text"],
+            }
+            for record in archival
+        )
+        if profile is not None:
+            records.append(
+                {
+                    "id": profile.profile_id,
+                    "metadata": {"source": "relationship_profile"},
+                    "text": " ".join(_format_relationship_profile(profile)),
+                }
+            )
+        results = [
+            {**record, "score": _lexical_score(str(record["text"]), query)}
+            for record in records
+            if str(record.get("id") or "").strip() and str(record.get("text") or "").strip()
+        ]
+        results = [record for record in results if record["score"] > 0]
+        results.sort(key=lambda record: record["score"], reverse=True)
+        return {"results": results[:limit]}
+
+    async def _list_worker_candidates(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        limit = _clamp_int(args.get("limit"), 1, 100, 20)
+        type_filter = str(args.get("type_filter") or "").strip()
+        candidates = await self.store.list_candidates(scope_key, participant_key, limit=limit)
+        if type_filter:
+            candidates = [candidate for candidate in candidates if candidate.type == type_filter]
+        return {"candidates": [_candidate_to_reflection_dict(candidate) for candidate in candidates]}
+
+    async def _write_worker_candidate(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        candidate = _candidate_from_reflection(args, scope_key, participant_key, turns)
+        if candidate is None:
+            raise ValueError("candidate content and summary are required")
+        stored = await self.store.append_candidate(candidate)
+        if self.vector_store is not None:
+            await self._index_semantic([], [stored], None)
+        return {"candidate_id": stored.candidate_id}
+
+    async def _write_worker_diary(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        diary = _diary_from_reflection(
+            args,
+            scope_key=scope_key,
+            participant_key=participant_key,
+            beat_type=str(args.get("beat_type") or "reflection"),
+            turns=turns,
+            candidates=[],
+        )
+        if diary is None:
+            raise ValueError("diary summary and personal_thought are required")
+        stored = await self.store.append_diary(diary)
+        profile = await self.store.get_relationship_profile(scope_key) or _default_relationship_profile(
+            scope_key,
+            participant_key,
+        )
+        profile.participant_keys = _dedupe([*profile.participant_keys, participant_key])
+        profile.turn_count = max(profile.turn_count, len(turns))
+        profile.last_seen_at = turns[-1].created_at if turns else utc_now()
+        profile.diary_entry = stored.personal_thought
+        profile.diary_history = _dedupe([*profile.diary_history, stored.personal_thought])[-24:]
+        profile.last_diary_turn_count = profile.turn_count
+        profile.updated_at = utc_now()
+        await self._sync_relationship_profile_graph(await self.store.upsert_relationship_profile(profile))
+        if self.vector_store is not None:
+            await self._index_semantic([], [], stored)
+        return {"diary_id": stored.diary_id}
+
+    async def _write_worker_memory(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        block_name = _normalize_memory_block_name(args.get("block_name"))
+        if not block_name:
+            raise ValueError("block_name is required")
+        slots = await self._apply_slot_updates(
+            scope_key=scope_key,
+            participant_key=participant_key,
+            updates=[{**args, "slot_name": block_name}],
+            candidates=[],
+        )
+        if not slots:
+            raise ValueError("block_name and non-empty items are required")
+        slot = slots[-1]
+        return {
+            "block_name": slot.slot_name,
+            "item_count": len(slot.items),
+            "slot_id": slot.slot_id,
+        }
+
+    async def _patch_worker_profile(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        profile = await self.store.get_relationship_profile(scope_key) or _default_relationship_profile(
+            scope_key,
+            participant_key,
+        )
+        before = json.dumps(_relationship_profile_to_reflection_dict(profile), sort_keys=True)
+        _apply_profile_patch(profile, args)
+        after = json.dumps(_relationship_profile_to_reflection_dict(profile), sort_keys=True)
+        if before == after:
+            raise ValueError("profile patch field and value are required")
+        profile.participant_keys = _dedupe([*profile.participant_keys, participant_key])
+        profile.turn_count = max(profile.turn_count, len(turns))
+        profile.last_seen_at = turns[-1].created_at if turns else utc_now()
+        profile.updated_at = utc_now()
+        stored = await self.store.upsert_relationship_profile(profile)
+        await self._sync_relationship_profile_graph(stored)
+        return {
+            "field": str(args.get("field") or ""),
+            "ok": True,
+            "operation": str(args.get("operation") or "add"),
+            "value": str(args.get("value") or ""),
+        }
+
+    async def _update_worker_emotion(
+        self,
+        scope_key: str,
+        participant_key: str,
+        args: dict[str, Any],
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        operation = "replace" if str(args.get("operation") or "").strip().lower() == "replace" else "merge"
+        incoming = _emotion_intensities(args.get("intensities") or args.get("emotions"))
+        if not incoming and operation != "replace":
+            raise ValueError('emotion update requires intensities or operation="replace"')
+        current = await self.store.get_emotion_state(scope_key)
+        previous = _emotion_intensities(current.get("intensities"))
+        intensities = incoming if operation == "replace" else {**previous, **incoming}
+        source = str(
+            args.get("last_signal_source")
+            or args.get("lastSignalSource")
+            or args.get("source")
+            or "worker_tool"
+        ).strip()
+        state = await self.store.upsert_emotion_state(
+            scope_key,
+            intensities=intensities,
+            last_signal_source=source,
+        )
+        profile = await self.store.get_relationship_profile(scope_key) or _default_relationship_profile(
+            scope_key,
+            participant_key,
+        )
+        profile.participant_keys = _dedupe([*profile.participant_keys, participant_key])
+        profile.turn_count = max(profile.turn_count, len(turns))
+        profile.last_seen_at = turns[-1].created_at if turns else utc_now()
+        profile.affect_state = {
+            **profile.affect_state,
+            "intensities": intensities,
+            "lastSignalSource": source,
+            "updatedAt": state.get("updated_at"),
+        }
+        profile.updated_at = utc_now()
+        await self._sync_relationship_profile_graph(await self.store.upsert_relationship_profile(profile))
+        return {"emotion_state": state, "ok": True, "operation": operation}
+
+    async def _insert_worker_archival_memory(self, scope_key: str, args: dict[str, Any]) -> dict[str, Any]:
+        text = _compact(str(args.get("text") or "").strip(), 2000)
+        if not text:
+            raise ValueError("archival memory text is required")
+        record = await self.store.append_archival_memory(scope_key, text)
+        if self.vector_store is not None:
+            await self.vector_store.add(
+                RecallItem(
+                    id=f"grillo:archival:{record['archival_id']}",
+                    text=text,
+                    scope="thread",
+                    thread_id=scope_key,
+                    importance=0.6,
+                    metadata={"source": "grillo_archival", "scope_key": scope_key},
+                    created_at=record["created_at"],
+                )
+            )
+        return {"id": record["archival_id"], "ok": True}
 
     async def _run_reflection_tick(
         self,
@@ -1365,6 +2131,287 @@ def _format_relationship_profile(profile: GrilloRelationshipProfile) -> list[str
         f"active_threads={json.dumps(profile.active_threads[-8:])}" if profile.active_threads else "",
     ]
     return [item for item in items if item]
+
+
+def _build_backend_worker_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are the private backend GRILLO memory worker for Web Waifu 4.",
+            "You are not writing a user-facing chat reply.",
+            "Return only JSON matching the schema.",
+            "Use worker tools by returning toolCalls. Do not claim a write happened unless you call a write tool.",
+            "Extract durable memory only when the transcript contains a preference, fact, goal, boundary, bond signal, or ongoing thread.",
+            "Write diary entries only when the exchange meaningfully changes mood, relationship, goals, or stream context.",
+            "Diary personal_thought is private first-person avatar reflection, not a mechanical receipt.",
+            "Reflection beats synthesize higher-order insight from clusters of turns and memories; they do not restate isolated facts.",
+            "A useful reflection explains what pattern is emerging, what changed emotionally or relationally, and how future replies should adapt.",
+            "Use memory_write only for grounded consolidated slots such as open_threads, ongoing_threads, preferences, boundaries, verified_facts, or relationship_state.",
+            "",
+            "Available tools:",
+            '- core.worker_memory_read args: {"block_name"?: string}',
+            '- core.worker_memory_search args: {"query": string, "limit"?: number}',
+            '- core.worker_candidate_list args: {"limit"?: number, "type_filter"?: string}',
+            '- core.worker_candidate_write args: {"type": "preference|fact|goal|boundary|bond_signal|thread", "content": string, "summary": string, "confidence": number, "tags"?: string[], "source_turn_ids"?: string[]}',
+            '- core.worker_diary_write args: {"summary": string, "personal_thought": string, "tags"?: string[], "beat_type"?: string, "source_turn_ids"?: string[]}',
+            '- core.worker_memory_write args: {"block_name": string, "items": string[], "operation": "merge|replace", "reason"?: string, "source_candidate_ids"?: string[]}',
+            '- core.worker_profile_patch args: {"field": "tone_preferences|interaction_style|boundaries|active_threads", "operation": "add|remove", "value": string}',
+            '- core.worker_emotion_read args: {}',
+            '- core.worker_emotion_update args: {"intensities": {"emotion_name": number}, "operation"?: "merge|replace", "last_signal_source"?: string}',
+            '- core.worker_memory_insert_archival args: {"text": string}',
+            "",
+            "First read or search memory if needed. Then call write tools. When finished, return done=true and toolCalls=[].",
+        ]
+    )
+
+
+def _build_backend_beat_prompt(
+    *,
+    beat_type: str,
+    context_packet: GrilloContextPacket,
+    recent_turns: list[GrilloTurn],
+    scope_key: str,
+) -> str:
+    if beat_type == "relationship":
+        task_lines = [
+            "This is a relationship beat.",
+            "Review durable relationship_memory, recalled_memories, thoughts, and recent channel_history.",
+            "Use core.worker_memory_read or core.worker_memory_search if you need more context.",
+            "Write private diary reflection if the relationship/mood changed.",
+            'Use core.worker_memory_write with block_name="relationship_state" for grounded relationship updates.',
+            "Use core.worker_profile_patch for grounded boundaries, interaction_style, tone_preferences, or active_threads.",
+        ]
+    elif beat_type == "consolidation":
+        task_lines = [
+            "This is a consolidation beat.",
+            "Review candidates, slots, blocks, thoughts, recalled_memories, and recent channel_history.",
+            "Use core.worker_candidate_list, core.worker_memory_read, or core.worker_memory_search before writing if useful.",
+            "Promote repeated or high-confidence grounded candidates into durable memory slots or blocks.",
+            'Use core.worker_memory_write with operation="merge" for durable preferences, boundaries, verified_facts, relationship_state, or ongoing_threads.',
+            "Write a diary reflection only if the consolidation changes the private interpretation of the relationship or persona context.",
+            "Do not delete raw records during consolidation.",
+        ]
+    elif beat_type == "curiosity":
+        task_lines = [
+            "This is a curiosity beat.",
+            "Review recent channel_history, thoughts, recalled_memories, relationship_memory, and open threads.",
+            "Identify useful unresolved questions, interests, or follow-up threads that would improve future replies.",
+            "Use core.worker_memory_read or core.worker_memory_search before writing if useful.",
+            "Use core.worker_memory_write for grounded open_threads, ongoing_threads, or working_scratchpad updates.",
+            "Use core.worker_profile_patch for grounded active_threads only when the curiosity is tied to a participant or relationship.",
+            "Do not trigger external actions, messages, searches, or autonomous speech from this beat.",
+        ]
+    elif beat_type == "tag_elaboration":
+        task_lines = [
+            "This is a tag elaboration beat.",
+            "Review candidates, recalled_memories, slots, and recent channel_history for weakly organized memory.",
+            "Use core.worker_candidate_list to inspect candidate types and tags before writing if useful.",
+            "Write concise tag-organized summaries into durable slots or blocks when they improve future retrieval.",
+            "Use core.worker_candidate_write only for newly clarified grounded facts, preferences, goals, boundaries, bond signals, or threads.",
+            'Use core.worker_memory_write with operation="merge" for grouped preferences, boundaries, verified_facts, relationship_state, or ongoing_threads.',
+            "Do not invent tags or summaries that are not grounded in existing memory or recent turns.",
+        ]
+    elif beat_type == "compaction":
+        task_lines = [
+            "This is a compaction beat.",
+            "Review noisy open_threads, working_scratchpad, recalled_memories, thoughts, and recent channel_history.",
+            "Use core.worker_memory_read or core.worker_memory_search to find redundant or stale working memory.",
+            "Compact noisy or overlapping memory into concise durable memory slots or blocks.",
+            'Use core.worker_memory_write with operation="replace" only when the replacement is clearly grounded and shorter.',
+            "Use core.worker_memory_insert_archival only for valuable long-form context that should stay searchable but not prompt-visible.",
+            "Do not delete raw records during compaction.",
+        ]
+    else:
+        task_lines = [
+            "This is a reflection beat.",
+            "Synthesize higher-order insight, not a literal transcript summary.",
+            "Compare recent channel_history with thoughts, recalled_memories, relationship_memory, and emotion state.",
+            "Look for repeated patterns: user preferences, recurring tension, trust or guard shifts, unresolved goals, bits that should continue, and community mood.",
+            "Use core.worker_emotion_read first when emotional continuity is relevant.",
+            "Use core.worker_memory_search before writing if a pattern may already exist.",
+            "Write a diary reflection only when you can state what the pattern means for future replies.",
+            'Use core.worker_memory_write with block_name="relationship_state", "ongoing_threads", or "tone_preferences" only for grounded higher-order insights.',
+            "Do not write diary text that only says what happened; write why it matters.",
+        ]
+    return "\n".join(
+        [
+            f"scopeKey: {scope_key}",
+            f"beatType: {beat_type}",
+            "",
+            *task_lines,
+            "",
+            "Canonical GRILLO context packet:",
+            json.dumps(
+                {
+                    "background_information": context_packet.background_information,
+                    "channel_history": context_packet.channel_history[-10:],
+                    "output_description": context_packet.output_description,
+                    "recalled_memories": context_packet.recalled_memories[:8],
+                    "relationship_memory": context_packet.relationship_memory[:12],
+                    "thoughts": context_packet.thoughts[:8],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "",
+            "Recent turn ids:",
+            json.dumps(
+                [
+                    {
+                        "id": turn.turn_id,
+                        "participantKey": turn.participant_key,
+                        "role": turn.role,
+                        "text": _compact(turn.content, 220),
+                    }
+                    for turn in recent_turns
+                ],
+                ensure_ascii=False,
+            ),
+            "",
+            "If there is nothing useful to write, return done=true with no toolCalls.",
+        ]
+    )
+
+
+def _worker_completion_text_and_meta(raw_result: dict[str, Any] | str) -> tuple[str, dict[str, Any]]:
+    if isinstance(raw_result, str):
+        return raw_result, {}
+    if not isinstance(raw_result, dict):
+        return json.dumps(raw_result, ensure_ascii=False), {}
+    meta = raw_result.get("meta") if isinstance(raw_result.get("meta"), dict) else {}
+    if "text" in raw_result:
+        return str(raw_result.get("text") or ""), dict(meta)
+    return json.dumps(raw_result, ensure_ascii=False), dict(meta)
+
+
+def _parse_worker_json(raw_text: str) -> dict[str, Any]:
+    parsed = _safe_json_obj(raw_text)
+    if parsed:
+        return parsed
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start != -1 and end > start:
+        parsed = _safe_json_obj(raw_text[start : end + 1])
+        if parsed:
+            return parsed
+    return {}
+
+
+def _normalize_worker_tool_calls(parsed: dict[str, Any], source_turn_ids: list[str]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for item in _as_list(parsed.get("toolCalls")):
+        call = _normalize_worker_tool_call(item)
+        if call is not None:
+            calls.append(_with_source_turn_ids(call, source_turn_ids))
+    for item in _as_list(parsed.get("tool_calls")):
+        call = _normalize_openai_worker_tool_call(item)
+        if call is not None:
+            calls.append(_with_source_turn_ids(call, source_turn_ids))
+    for key, name in (
+        ("candidate", "core.worker_candidate_write"),
+        ("diary", "core.worker_diary_write"),
+        ("memory", "core.worker_memory_write"),
+    ):
+        raw_args = parsed.get(key)
+        if isinstance(raw_args, dict):
+            call = _normalize_worker_tool_call({"name": name, "args": raw_args})
+            if call is not None:
+                calls.append(_with_source_turn_ids(call, source_turn_ids))
+    return calls[:12]
+
+
+def _normalize_worker_tool_call(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or raw.get("tool") or "").strip()
+    if name not in WORKER_TOOL_NAMES:
+        return None
+    args = raw.get("args") or raw.get("arguments") or {}
+    if isinstance(args, str):
+        args = _safe_json_obj(args)
+    if not isinstance(args, dict):
+        args = {}
+    return {"name": name, "args": args}
+
+
+def _normalize_openai_worker_tool_call(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+    name = str(fn.get("name") or raw.get("name") or "").strip()
+    if name not in WORKER_TOOL_NAMES:
+        return None
+    args = fn.get("arguments") or raw.get("arguments") or raw.get("args") or {}
+    if isinstance(args, str):
+        args = _safe_json_obj(args)
+    if not isinstance(args, dict):
+        args = {}
+    return {"name": name, "args": args}
+
+
+def _with_source_turn_ids(call: dict[str, Any], source_turn_ids: list[str]) -> dict[str, Any]:
+    if call["name"] not in {"core.worker_candidate_write", "core.worker_diary_write"}:
+        return call
+    args = dict(call["args"])
+    if not _string_list(args.get("source_turn_ids")) and source_turn_ids:
+        args["source_turn_ids"] = source_turn_ids
+    return {"name": call["name"], "args": args}
+
+
+def _worker_write_kind(name: str) -> str:
+    return {
+        "core.worker_candidate_write": "candidates",
+        "core.worker_diary_write": "diary",
+        "core.worker_memory_write": "slots",
+        "core.worker_profile_patch": "profile_patches",
+        "core.worker_emotion_update": "emotion_updates",
+        "core.worker_memory_insert_archival": "archival",
+    }.get(name, "")
+
+
+def _normalize_memory_block_name(value: Any) -> str:
+    block_name = str(value or "").strip()
+    aliases = {
+        "memory_slots": "working_scratchpad",
+        "verified_facts": "verified_facts",
+        "open_threads": "open_threads",
+    }
+    block_name = aliases.get(block_name, block_name)
+    return block_name if block_name in SLOT_NAMES else ""
+
+
+def _emotion_intensities(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, raw in value.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        out[name] = max(0.0, min(1.0, safe_float(raw, 0.0)))
+    return out
+
+
+def _lexical_score(text: str, query: str) -> float:
+    text_terms = set(re.findall(r"[a-z0-9_]{2,}", text.lower()))
+    query_terms = set(re.findall(r"[a-z0-9_]{2,}", query.lower()))
+    if not text_terms or not query_terms:
+        return 0.0
+    overlap = len(text_terms & query_terms)
+    if overlap == 0:
+        return 0.0
+    return overlap / max(1, len(query_terms))
+
+
+def _summarize_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    return {key: _compact(str(value), 160) for key, value in args.items()}
+
+
+def _safe_json_obj(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _turn_to_reflection_dict(turn: GrilloTurn) -> dict[str, Any]:
