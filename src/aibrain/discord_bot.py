@@ -1013,6 +1013,12 @@ class DiscordBrainBot(commands.Bot):
         await ctx.reply(f"{action} requires a Discord admin or bot owner.", mention_author=False)
         return False
 
+    async def _require_owner_command(self, ctx: commands.Context, action: str) -> bool:
+        if self._is_owner_user(ctx.author):
+            return True
+        await ctx.reply(f"{action} requires the configured bot owner.", mention_author=False)
+        return False
+
     def _bot_interactions_enabled(self) -> bool:
         return bool(not self.ignore_bots and self.respond_to_bots)
 
@@ -1086,7 +1092,7 @@ class DiscordBrainBot(commands.Bot):
         await ctx.reply("\n".join(lines)[: self.max_reply_chars], mention_author=False)
 
     async def _queue_codex_bridge_request(self, ctx: commands.Context, *, route: str, prompt: str) -> None:
-        if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+        if not await self._require_owner_command(ctx, "Codex bridge"):
             return
         prompt = prompt.strip()
         route = (route or "codex").strip().lower()
@@ -1120,7 +1126,7 @@ class DiscordBrainBot(commands.Bot):
             message_id=getattr(message, "id", None),
             prompt=prompt,
             intent="harness" if route == "harness" else "ask_codex",
-            authority_mode="manual_owner" if self._is_owner_user(ctx.author) else "manual_admin",
+            authority_mode="manual_owner",
             authority_reason=f"authorized Discord !codex {route} command",
             delivery_mode=delivery_mode,
             recent_messages=recent_messages,
@@ -1316,7 +1322,7 @@ class DiscordBrainBot(commands.Bot):
 
         @codex_bridge.command(name="status")
         async def codex_status(ctx: commands.Context) -> None:
-            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            if not await self._require_owner_command(ctx, "Codex bridge"):
                 return
             status = self.codex_bridge.status()
             await ctx.reply(
@@ -1337,7 +1343,7 @@ class DiscordBrainBot(commands.Bot):
 
         @codex_bridge.command(name="features")
         async def codex_features(ctx: commands.Context) -> None:
-            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            if not await self._require_owner_command(ctx, "Codex bridge"):
                 return
             await ctx.reply(
                 "\n".join(
@@ -1364,21 +1370,21 @@ class DiscordBrainBot(commands.Bot):
 
         @codex_bridge.command(name="pause")
         async def codex_pause(ctx: commands.Context) -> None:
-            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            if not await self._require_owner_command(ctx, "Codex bridge"):
                 return
             self.codex_bridge.set_paused(True, actor_id=ctx.author.id)
             await ctx.reply("Codex bridge queue paused.", mention_author=False)
 
         @codex_bridge.command(name="resume")
         async def codex_resume(ctx: commands.Context) -> None:
-            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            if not await self._require_owner_command(ctx, "Codex bridge"):
                 return
             self.codex_bridge.set_paused(False, actor_id=ctx.author.id)
             await ctx.reply("Codex bridge queue resumed.", mention_author=False)
 
         @codex_bridge.command(name="clear")
         async def codex_clear(ctx: commands.Context) -> None:
-            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            if not await self._require_owner_command(ctx, "Codex bridge"):
                 return
             count = self.codex_bridge.clear_pending(actor_id=ctx.author.id)
             await ctx.reply(f"archived `{count}` pending Codex bridge request(s).", mention_author=False)

@@ -932,6 +932,41 @@ def test_heartbeat_delay_uses_random_min_max_window(monkeypatch):
     assert calls == [(60.0, 900.0)]
 
 
+def test_codex_bridge_requires_owner_not_just_admin():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.owner_users = {120418341775998976}
+    replies = []
+
+    async def fake_reply(content, *, mention_author=False):
+        replies.append((content, mention_author))
+
+    ctx = SimpleNamespace(
+        author=SimpleNamespace(
+            id=111,
+            guild_permissions=SimpleNamespace(administrator=True),
+        ),
+        reply=fake_reply,
+    )
+
+    allowed = asyncio.run(bot._require_owner_command(ctx, "Codex bridge"))
+
+    assert allowed is False
+    assert replies == [("Codex bridge requires the configured bot owner.", False)]
+
+
+def test_codex_bridge_allows_configured_owner():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.owner_users = {120418341775998976}
+    ctx = SimpleNamespace(
+        author=SimpleNamespace(
+            id=120418341775998976,
+            guild_permissions=SimpleNamespace(administrator=False),
+        )
+    )
+
+    assert asyncio.run(bot._require_owner_command(ctx, "Codex bridge")) is True
+
+
 def test_heartbeat_delay_skips_random_when_window_collapses(monkeypatch):
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.heartbeat_min_interval_seconds = 60.0

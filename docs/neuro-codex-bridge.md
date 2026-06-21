@@ -131,7 +131,7 @@ Current subsystems already present:
 
 Manual bridge enqueue:
 
-- Allowed only from bot owner or Discord administrators.
+- Allowed only from the configured bot owner.
 - Bot owner id: `120418341775998976`.
 - Must use an explicit command such as `!codex ask`, not ordinary chat.
 - Should include the Discord message metadata in the queue request.
@@ -281,19 +281,19 @@ Verified agents on this machine as of 2026-06-21:
 
 ## Discord Controls To Add
 
-- `!codex ask <prompt>`: owner/admin queues a request.
+- `!codex ask <prompt>`: owner queues a request.
 - `!codex status`: shows pending, last processed, paused state.
 - `!codex pause`: prevents autonomous enqueue and processing.
 - `!codex resume`: resumes queueing.
-- `!codex clear`: owner/admin clears pending bridge requests.
+- `!codex clear`: owner clears pending bridge requests.
 - `!codex features`: shows the safe bridge capability manifest, not raw local secrets or unrestricted tools.
-- `!codex route <codex|harness> <prompt>`: owner/admin only; explicit route override.
+- `!codex route <codex|harness> <prompt>`: owner only; explicit route override.
 
 The `!codex` group should not be exposed as an LLM-callable Brain tool. It is a Discord command/admin control surface, not a normal persona capability.
 
 ## Safety Rules
 
-- Owner/admin only for manual bridge commands.
+- Owner only for manual bridge commands.
 - Autonomous Neuro heartbeat can enqueue only if bridge is enabled, not paused, and cooldown allows it.
 - Autonomous DMs are limited to owners by default; non-owner DMs require `DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS`.
 - Every request must include requester, channel, guild, and message metadata when available.
