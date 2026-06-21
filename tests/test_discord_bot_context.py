@@ -720,7 +720,7 @@ def test_human_guild_direct_replies_trigger_by_default():
     assert bot._should_respond(message) is True
 
 
-def test_human_guild_messages_can_use_ambient_mode():
+def test_human_guild_messages_do_not_use_ambient_mode():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.paused = False
     bot.respond_to_all = True
@@ -736,7 +736,7 @@ def test_human_guild_messages_can_use_ambient_mode():
         mentions=[],
     )
 
-    assert bot._should_respond(message) is True
+    assert bot._should_respond(message) is False
 
 
 def test_human_mentions_still_trigger_when_bot_interactions_are_stopped():

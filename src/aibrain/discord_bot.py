@@ -703,9 +703,7 @@ class DiscordBrainBot(commands.Bot):
             return bool(self._bot_interactions_enabled() and directed)
         if message.guild is None:
             return self.respond_to_dms
-        if getattr(self, "require_mention_in_guilds", DEFAULT_REQUIRE_MENTION_IN_GUILDS):
-            return directed
-        return bool(self.respond_to_all or directed)
+        return directed
 
     def _is_directed_at_self(self, message: discord.Message) -> bool:
         if not self.respond_to_mentions or self.user is None:
