@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -144,9 +145,16 @@ class HybridMemoryStack:
 def _create_graph_store(path: str | Path, *, backend: str) -> GraphMemoryStore:
     normalized = backend.lower().strip()
     if normalized in {"auto", "ladybug"}:
+        ladybug_path = _derived_path(path, ".ladybug")
         try:
-            return LadybugGraphMemoryStore(_derived_path(path, ".ladybug"))
+            return LadybugGraphMemoryStore(ladybug_path)
         except Exception:
+            if _recover_ladybug_wal(ladybug_path):
+                try:
+                    return LadybugGraphMemoryStore(ladybug_path)
+                except Exception:
+                    if normalized == "ladybug":
+                        raise
             if normalized == "ladybug":
                 raise
     return SQLiteTemporalGraphStore(path)
@@ -172,6 +180,16 @@ def _create_vector_store(
             if normalized == "turbovec":
                 raise
     return SQLiteVectorRecallStore(path, embedding_provider=embedding_provider)
+
+
+def _recover_ladybug_wal(path: str | Path) -> bool:
+    wal_path = Path(f"{Path(path)}.wal")
+    if not wal_path.exists():
+        return False
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = wal_path.with_name(f"{wal_path.name}.corrupt-{stamp}")
+    wal_path.replace(backup)
+    return True
 
 
 def _derived_path(path: str | Path, suffix: str) -> Path:
