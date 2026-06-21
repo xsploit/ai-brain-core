@@ -14,6 +14,7 @@ from aibrain.discord_bot import (
     DiscordVoiceClip,
     ModelSelectView,
     _build_jb_persona,
+    _format_summary_transcript,
     _format_grillo_export,
     _grillo_scope_for_message,
     _message_text,
@@ -23,6 +24,7 @@ from aibrain.discord_bot import (
     _ping_target_mention,
     _read_attachment_bytes,
     _scoped_ladybug_facts,
+    _summary_limit,
     _text_attachment_context,
     _time_context,
     _tts_spoken_text,
@@ -582,6 +584,38 @@ def test_message_text_reads_voice_message_waveform():
     assert "waveform_peak=255" in text
 
 
+def test_summary_limit_clamps_to_safe_channel_history_window():
+    assert _summary_limit(1) == 5
+    assert _summary_limit(75) == 75
+    assert _summary_limit(500) == 200
+
+
+def test_format_summary_transcript_includes_author_bot_marker_and_content():
+    user = SimpleNamespace(display_name="Subby", global_name=None, bot=False)
+    bot_user = SimpleNamespace(display_name="Neuro-sama", global_name=None, bot=True)
+    messages = [
+        SimpleNamespace(
+            author=user,
+            clean_content="hello",
+            content="hello",
+            attachments=[],
+            created_at=datetime(2026, 6, 21, 8, 0, tzinfo=timezone.utc),
+        ),
+        SimpleNamespace(
+            author=bot_user,
+            clean_content="yo",
+            content="yo",
+            attachments=[],
+            created_at=datetime(2026, 6, 21, 8, 1, tzinfo=timezone.utc),
+        ),
+    ]
+
+    transcript = _format_summary_transcript(messages)
+
+    assert "Subby: hello" in transcript
+    assert "Neuro-sama bot: yo" in transcript
+
+
 def test_bot_message_ignore_toggle_keeps_self_guard():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -802,6 +836,7 @@ def test_pause_command_messages_are_still_commands():
     assert bot._is_command_message(SimpleNamespace(content="!unpause")) is True
     assert bot._is_command_message(SimpleNamespace(content="!grillo debug")) is True
     assert bot._is_command_message(SimpleNamespace(content="!ladybug search Subby")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!summary 25")) is True
 
 
 def test_bot_interactions_enabled_requires_not_ignored_and_responding():

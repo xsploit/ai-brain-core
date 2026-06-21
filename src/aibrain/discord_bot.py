@@ -124,7 +124,18 @@ def _env_int(name: str, default: int) -> int:
         return default
     with contextlib.suppress(ValueError):
         return int(value)
-    return default
+        return default
+
+
+def _compact(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 14)].rstrip() + "\n[truncated]"
+
+
+def _summary_limit(value: int) -> int:
+    return max(5, min(200, int(value or 50)))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -283,6 +294,20 @@ def _message_text(message: discord.Message) -> str:
     if attachments:
         content = f"{content}\n\n[Attachments]\n" + "\n".join(attachments)
     return content.strip()
+
+
+def _format_summary_transcript(messages: list[discord.Message]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        content = _compact(_message_text(message), 1200)
+        if not content:
+            continue
+        created_at = getattr(message, "created_at", None)
+        timestamp = created_at.isoformat() if hasattr(created_at, "isoformat") else ""
+        author = _display_name(message.author)
+        bot_mark = " bot" if getattr(message.author, "bot", False) else ""
+        lines.append(f"[{timestamp}] {author}{bot_mark}: {content}")
+    return "\n".join(lines)
 
 
 def _message_content_text(message: discord.Message) -> str:
@@ -498,6 +523,7 @@ def _build_command_prefix(command_prefix_text: str):
             or stripped.startswith("!tts")
             or stripped.startswith("!grillo")
             or stripped.startswith("!ladybug")
+            or stripped.startswith("!summary")
         ):
             prefixes.append("!")
         return commands.when_mentioned_or(*prefixes)(bot, message)
@@ -597,6 +623,41 @@ class ModelSelectMenu(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.model_view.select_model(interaction, int(self.values[0]))
+
+
+class SummaryActionView(discord.ui.View):
+    def __init__(self, bot: Any, owner_id: int, scope: str, summary_text: str, source_label: str):
+        super().__init__(timeout=_env_int("DISCORD_BRAIN_SUMMARY_VIEW_TIMEOUT_SECONDS", 300))
+        self.bot_ref = bot
+        self.owner_id = owner_id
+        self.scope = scope
+        self.summary_text = summary_text
+        self.source_label = source_label
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the requester can use this summary panel.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Remember", style=discord.ButtonStyle.primary)
+    async def remember_summary(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self.bot_ref._remember_text(
+            self.scope,
+            self.owner_id,
+            f"Channel summary from {self.source_label}:\n{self.summary_text}",
+            source="discord_summary_panel",
+        )
+        await interaction.response.send_message(f"remembered `{record.id}`", ephemeral=True)
+
+    @discord.ui.button(label="Export", style=discord.ButtonStyle.secondary)
+    async def export_summary(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        data = io.BytesIO(self.summary_text.encode("utf-8", errors="replace"))
+        await interaction.response.send_message(
+            "summary export",
+            file=discord.File(data, filename="channel-summary.txt"),
+            ephemeral=True,
+        )
 
 
 class DiscordBrainBot(commands.Bot):
@@ -751,6 +812,10 @@ class DiscordBrainBot(commands.Bot):
             or stripped.startswith("!grillo ")
             or stripped == "!ladybug"
             or stripped.startswith("!ladybug ")
+            or stripped == "!summary"
+            or stripped.startswith("!summary ")
+            or stripped == "!summarize"
+            or stripped.startswith("!summarize ")
         )
 
     def _is_ignored_bot_message(self, message: discord.Message) -> bool:
@@ -900,6 +965,7 @@ class DiscordBrainBot(commands.Bot):
                 "`!tts voices` - list discovered Piper voices",
                 "`!tts voice <voice-id>` - choose a Piper voice",
                 "`!tts toggle` - toggle voice clips on normal replies",
+                "`!summary [limit]` - summarize recent channel messages with Remember/Export buttons",
                 f"`{prefix} status` - show model, thread, state, and memory stack",
                 f"`{prefix} remember <text>` - save a durable memory",
                 f"`{prefix} recall <query>` - search long-term memory",
@@ -938,26 +1004,18 @@ class DiscordBrainBot(commands.Bot):
         @commands.command(name="remember")
         async def remember(ctx: commands.Context, *, content: str) -> None:
             scope = _grillo_scope_for_message(ctx.message, self.persona.id)
-            state = await self.brain.open_thread(thread_id=scope, persona=self.persona)
-            record = await self.brain.memory.remember(
-                content,
-                scope="thread",
-                thread_id=state.thread_id,
-                persona_id=self.persona.id,
-                metadata={"source": "discord_command", "author_id": ctx.author.id},
-                importance=0.85,
-            )
-            if self.brain.memory_stack is not None:
-                await self.brain.memory_stack.append_event(
-                    event_type="manual_memory",
-                    actor=str(ctx.author.id),
-                    content=content,
-                    thread=state,
-                    persona_id=self.persona.id,
-                    metadata={"source": "discord_command"},
-                    extract=True,
-                )
+            record = await self._remember_text(scope, ctx.author.id, content, source="discord_command")
             await ctx.reply(f"remembered `{record.id}`", mention_author=False)
+
+        @commands.command(name="summary", aliases=["summarize"])
+        async def summary(ctx: commands.Context, limit: int = 50) -> None:
+            limit = _summary_limit(limit)
+            async with ctx.typing():
+                summary_text = await self._summarize_channel(ctx, limit=limit)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
+            source_label = f"#{getattr(ctx.channel, 'name', 'dm')} last {limit}"
+            view = SummaryActionView(self, ctx.author.id, scope, summary_text, source_label)
+            await ctx.reply(summary_text[: self.max_reply_chars], mention_author=False, view=view)
 
         @commands.command(name="recall")
         async def recall(ctx: commands.Context, *, query: str) -> None:
@@ -1354,6 +1412,7 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(help_command)
         self.add_command(status)
         self.add_command(remember)
+        self.add_command(summary)
         self.add_command(recall)
         self.add_command(jb)
         self.add_command(pause)
@@ -1419,6 +1478,63 @@ class DiscordBrainBot(commands.Bot):
             **_time_context(message.created_at),
             "recent_messages": self.recent_by_scope.get(scope, [])[-8:],
         }
+
+    async def _remember_text(self, scope: str, author_id: int, content: str, *, source: str):
+        state = await self.brain.open_thread(thread_id=scope, persona=self.persona)
+        record = await self.brain.memory.remember(
+            content,
+            scope="thread",
+            thread_id=state.thread_id,
+            persona_id=self.persona.id,
+            metadata={"source": source, "author_id": author_id},
+            importance=0.85,
+        )
+        if self.brain.memory_stack is not None:
+            await self.brain.memory_stack.append_event(
+                event_type="manual_memory",
+                actor=str(author_id),
+                content=content,
+                thread=state,
+                persona_id=self.persona.id,
+                metadata={"source": source},
+                extract=True,
+            )
+        return record
+
+    async def _summarize_channel(self, ctx: commands.Context, *, limit: int) -> str:
+        messages = []
+        async for message in ctx.channel.history(limit=limit):
+            if getattr(message, "id", None) == getattr(ctx.message, "id", None):
+                continue
+            if not _message_text(message):
+                continue
+            messages.append(message)
+        messages.reverse()
+        transcript = _format_summary_transcript(messages)
+        if not transcript:
+            return "No readable recent messages found."
+        prompt = (
+            "Summarize this Discord channel slice for someone catching up. "
+            "Keep it concise, mention decisions/open loops, and avoid inventing context.\n\n"
+            f"<discord_channel_transcript>\n{transcript}\n</discord_channel_transcript>"
+        )
+        buffer = ""
+        async for event in self.brain.stream(
+            prompt,
+            thread_id=f"discord:summary:{getattr(ctx.channel, 'id', 'dm')}:{getattr(ctx.message, 'id', 'latest')}",
+            persona=self.persona,
+            use_memory=False,
+            tool_names=[],
+            stateless=True,
+            memory_query_text="discord channel summary",
+            memory_event_text="",
+            history_text="discord channel summary",
+        ):
+            if event.type == "text.delta":
+                buffer += event.data.get("text", "")
+            elif event.type == "error":
+                raise RuntimeError(event.data.get("message", "summary failed"))
+        return buffer.strip() or "No summary generated."
 
     async def _reply_with_brain(
         self,
