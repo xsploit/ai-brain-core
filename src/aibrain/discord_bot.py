@@ -689,6 +689,110 @@ class SummaryActionView(discord.ui.View):
         )
 
 
+class RelationshipGraphView(discord.ui.View):
+    def __init__(
+        self,
+        bot: Any,
+        owner_id: int,
+        scope: str,
+        participant: str,
+        graph_backend: str,
+        snapshot: dict[str, Any],
+    ):
+        super().__init__(timeout=_env_int("DISCORD_BRAIN_RELATIONSHIP_VIEW_TIMEOUT_SECONDS", 300))
+        self.bot_ref = bot
+        self.owner_id = owner_id
+        self.scope = scope
+        self.participant = participant
+        self.graph_backend = graph_backend
+        self.snapshot = snapshot
+        self.page = "overview"
+        self.last_tick_result: dict[str, Any] | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the requester can use this relationship panel.", ephemeral=True)
+        return False
+
+    def embed(self) -> discord.Embed:
+        return _relationship_graph_embed(
+            scope=self.scope,
+            participant=self.participant,
+            graph_backend=self.graph_backend,
+            snapshot=self.snapshot,
+            page=self.page,
+            tick_result=self.last_tick_result,
+        )
+
+    async def refresh_snapshot(self) -> None:
+        stack = self.bot_ref.brain.memory_stack
+        runtime = stack.grillo if stack is not None else None
+        if stack is None or runtime is None:
+            return
+        self.graph_backend = type(stack.graph_store).__name__
+        self.snapshot = await _relationship_memory_snapshot(stack, runtime, self.scope, self.participant)
+
+    async def edit_page(self, interaction: discord.Interaction, page: str, *, refresh: bool = False) -> None:
+        self.page = page
+        if refresh:
+            await self.refresh_snapshot()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary, row=0)
+    async def overview_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "overview", refresh=True)
+
+    @discord.ui.button(label="Slots", style=discord.ButtonStyle.secondary, row=0)
+    async def slots_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "slots")
+
+    @discord.ui.button(label="Diary", style=discord.ButtonStyle.secondary, row=0)
+    async def diary_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "diary")
+
+    @discord.ui.button(label="Emotion", style=discord.ButtonStyle.secondary, row=0)
+    async def emotion_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "emotion")
+
+    @discord.ui.button(label="Tick", style=discord.ButtonStyle.success, row=1)
+    async def run_tick(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        stack = self.bot_ref.brain.memory_stack
+        runtime = stack.grillo if stack is not None else None
+        if runtime is None:
+            await interaction.response.send_message("GRILLO runtime is not enabled.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        self.last_tick_result = await runtime.run_tick(
+            scope_key=self.scope,
+            participant_key=self.participant,
+            beat_type="manual_panel",
+        )
+        await self.refresh_snapshot()
+        if interaction.message is not None:
+            await interaction.message.edit(embed=self.embed(), view=self)
+        await interaction.followup.send(
+            f"GRILLO tick: `{_compact(str(self.last_tick_result), 1800)}`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Export", style=discord.ButtonStyle.secondary, row=1)
+    async def export_relationships(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.refresh_snapshot()
+        content = _format_relationship_graph_export(
+            scope=self.scope,
+            participant=self.participant,
+            graph_backend=self.graph_backend,
+            snapshot=self.snapshot,
+        )
+        data = io.BytesIO(content.encode("utf-8", errors="replace"))
+        await interaction.response.send_message(
+            "relationship graph export",
+            file=discord.File(data, filename="ladybug-relationship-graph-export.txt"),
+            ephemeral=True,
+        )
+
+
 class DiscordBrainBot(commands.Bot):
     def __init__(self, *, brain: Brain, persona: Persona, discord_token: str | None = None):
         intents = discord.Intents.default()
@@ -1526,12 +1630,17 @@ class DiscordBrainBot(commands.Bot):
             scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             participant = str(ctx.author.id)
             snapshot = await _relationship_memory_snapshot(stack, runtime, scope, participant)
+            view = RelationshipGraphView(
+                self,
+                ctx.author.id,
+                scope,
+                participant,
+                type(stack.graph_store).__name__,
+                snapshot,
+            )
             await ctx.reply(
-                _format_relationship_graph_status(
-                    scope=scope,
-                    graph_backend=type(stack.graph_store).__name__,
-                    snapshot=snapshot,
-                )[: self.max_reply_chars],
+                embed=view.embed(),
+                view=view,
                 mention_author=False,
             )
 
@@ -2240,6 +2349,168 @@ def _format_relationship_graph_status(*, scope: str, graph_backend: str, snapsho
     if diary:
         lines.append(f"latest diary: `{_compact(str(_profile_value(diary[0], 'summary', '')), 220)}`")
     return "\n".join(lines)
+
+
+def _relationship_graph_embed(
+    *,
+    scope: str,
+    participant: str,
+    graph_backend: str,
+    snapshot: dict[str, Any],
+    page: str,
+    tick_result: dict[str, Any] | None = None,
+) -> discord.Embed:
+    graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
+    profile = snapshot.get("profile")
+    diary = snapshot.get("diary") if isinstance(snapshot.get("diary"), list) else []
+    slots = snapshot.get("slots") if isinstance(snapshot.get("slots"), list) else []
+    candidates = snapshot.get("candidates") if isinstance(snapshot.get("candidates"), list) else []
+    emotion = snapshot.get("emotion") if isinstance(snapshot.get("emotion"), dict) else {}
+    graph_facts = graph.get("relationship_facts") or []
+    participants = graph.get("participants") or []
+    embed = discord.Embed(
+        title="Ladybug Relationship Graph",
+        description=_embed_text(scope, 380),
+        color=0x2BAA8A,
+    )
+    embed.add_field(name="Backend", value=f"`{graph_backend}`", inline=True)
+    embed.add_field(
+        name="Ladybug Mirror",
+        value=(
+            f"profile `{bool(graph.get('profile'))}`\n"
+            f"facts `{len(graph_facts)}`\n"
+            f"participants `{len(participants)}`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="GRILLO Store",
+        value=(
+            f"profile `{bool(profile)}`\n"
+            f"slots `{len(slots)}`\n"
+            f"diary `{len(diary)}`\n"
+            f"candidates `{len(candidates)}`"
+        ),
+        inline=True,
+    )
+    if page == "slots":
+        embed.add_field(name="Slots", value=_format_slots_panel(slots), inline=False)
+    elif page == "diary":
+        embed.add_field(name="Diary", value=_format_diary_panel(diary), inline=False)
+        embed.add_field(name="Candidates", value=_format_candidates_panel(candidates), inline=False)
+    elif page == "emotion":
+        embed.add_field(name="Emotion", value=_format_emotion_panel(emotion), inline=False)
+        if tick_result is not None:
+            embed.add_field(name="Last Tick", value=_format_tick_panel(tick_result), inline=False)
+    else:
+        embed.add_field(name="Relationship", value=_format_profile_panel(profile), inline=False)
+        if diary:
+            embed.add_field(
+                name="Latest Diary",
+                value=_embed_text(str(_profile_value(diary[0], "summary", "")), 900),
+                inline=False,
+            )
+        if graph.get("error"):
+            embed.add_field(name="Ladybug Error", value=_embed_text(str(graph["error"]), 900), inline=False)
+        if tick_result is not None:
+            embed.add_field(name="Last Tick", value=_format_tick_panel(tick_result), inline=False)
+    embed.set_footer(text=f"participant {participant} | {page}")
+    return embed
+
+
+def _format_profile_panel(profile: Any) -> str:
+    if profile is None:
+        return "`none`"
+    lines = [
+        f"stage `{_profile_value(profile, 'relationship_stage', 'new')}`",
+        f"mood `{_profile_value(profile, 'mood', 'unknown')}`",
+        (
+            f"trust `{_profile_value(profile, 'trust', 0)}` "
+            f"respect `{_profile_value(profile, 'respect', 0)}` "
+            f"guard `{_profile_value(profile, 'guard', 0)}`"
+        ),
+        f"turns `{_profile_value(profile, 'turn_count', 0)}`",
+    ]
+    summary = str(_profile_value(profile, "summary", "") or "").strip()
+    if summary:
+        lines.append(_embed_text(summary, 420))
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _format_slots_panel(slots: list[Any]) -> str:
+    if not slots:
+        return "`none`"
+    lines: list[str] = []
+    for slot in slots[:8]:
+        name = _profile_value(slot, "slot_name", "slot")
+        items = _profile_value(slot, "items", []) or []
+        rendered = "; ".join(str(item) for item in items[:5]) or "(empty)"
+        lines.append(f"**{_embed_text(str(name), 80)}**\n{_embed_text(rendered, 240)}")
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _format_diary_panel(diary: list[Any]) -> str:
+    if not diary:
+        return "`none`"
+    lines = []
+    for entry in diary[:5]:
+        created_at = _profile_value(entry, "created_at", "")
+        beat_type = _profile_value(entry, "beat_type", "")
+        summary = _profile_value(entry, "summary", "")
+        lines.append(f"`{created_at}` `{beat_type}`\n{_embed_text(str(summary), 260)}")
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _format_candidates_panel(candidates: list[Any]) -> str:
+    if not candidates:
+        return "`none`"
+    lines = []
+    for candidate in candidates[:5]:
+        kind = _profile_value(candidate, "type", "")
+        score = _profile_value(candidate, "confidence", 0)
+        promoted = _profile_value(candidate, "promoted", False)
+        summary = _profile_value(candidate, "summary", "")
+        lines.append(f"`{kind}` score `{score}` promoted `{promoted}`\n{_embed_text(str(summary), 180)}")
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _format_emotion_panel(emotion: dict[str, Any]) -> str:
+    intensities = emotion.get("intensities") or {}
+    if not intensities:
+        return "`none`"
+    lines = [f"`{name}` {value}" for name, value in list(intensities.items())[:12]]
+    source = str(emotion.get("last_signal_source") or "").strip()
+    if source:
+        lines.append(f"source: {_embed_text(source, 320)}")
+    updated_at = str(emotion.get("updated_at") or "").strip()
+    if updated_at:
+        lines.append(f"updated: `{updated_at}`")
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _format_tick_panel(result: dict[str, Any]) -> str:
+    lines = [
+        f"ok `{result.get('ok')}` mode `{result.get('mode', '')}`",
+        f"writes `{result.get('writes', 0)}` tool_calls `{result.get('tool_calls', 0)}`",
+    ]
+    reason = str(result.get("no_op_reason") or result.get("reason") or "").strip()
+    if reason:
+        lines.append(f"reason `{reason}`")
+    fallback = result.get("fallback")
+    if isinstance(fallback, dict):
+        lines.append(
+            "fallback "
+            f"diary `{fallback.get('diary', 0)}` candidates `{fallback.get('candidates', 0)}` slots `{fallback.get('slots', 0)}`"
+        )
+    return _embed_text("\n".join(lines), 1000)
+
+
+def _embed_text(text: str, limit: int) -> str:
+    compacted = str(text or "").strip()
+    if not compacted:
+        return "`none`"
+    compacted = re.sub(r"\s+", " ", compacted) if "\n" not in compacted else compacted
+    return compacted if len(compacted) <= limit else compacted[: limit - 1].rstrip() + "..."
 
 
 def _format_relationship_graph_export(

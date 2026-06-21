@@ -13,12 +13,14 @@ from aibrain.discord_bot import (
     DiscordBrainBot,
     DiscordVoiceClip,
     ModelSelectView,
+    RelationshipGraphView,
     _build_jb_persona,
     _format_summary_transcript,
     _format_tavily_search_result,
     _format_grillo_export,
     _format_relationship_graph_export,
     _format_relationship_graph_status,
+    _relationship_graph_embed,
     _grillo_scope_for_message,
     _message_text,
     _model_choice_description,
@@ -1117,6 +1119,75 @@ def test_relationship_graph_status_and_export_include_grillo_and_ladybug_section
     assert "== GRILLO Relationship Profile ==" in export
     assert "Subsect wants relationship graph export." in export
     assert "trust is high" in export
+
+
+def test_relationship_graph_embed_and_view_render_dashboard_controls():
+    snapshot = {
+        "graph": {
+            "profile": {"relationship_stage": "familiar"},
+            "relationship_facts": [{"text": "Subsect likes graph visibility."}],
+            "participants": [{"id": "123", "login": "subsect"}],
+            "error": "",
+        },
+        "profile": SimpleNamespace(
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            respect=8,
+            guard=9,
+            turn_count=42,
+            summary="Subsect wants memory receipts.",
+        ),
+        "slots": [SimpleNamespace(slot_name="relationship_state", items=["trust is high"])],
+        "diary": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:01:00+00:00",
+                beat_type="relationship",
+                summary="Memory visibility improved.",
+            )
+        ],
+        "candidates": [
+            SimpleNamespace(type="preference", confidence=0.9, promoted=True, summary="User wants graph receipts.")
+        ],
+        "emotion": {"intensities": {"focus": 0.8}},
+        "archival": [],
+    }
+
+    overview = _relationship_graph_embed(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+        page="overview",
+        tick_result={"ok": True, "mode": "worker_loop", "writes": 1, "tool_calls": 2},
+    )
+    slots = _relationship_graph_embed(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+        page="slots",
+    )
+    view = RelationshipGraphView(
+        SimpleNamespace(brain=SimpleNamespace(memory_stack=None)),
+        owner_id=123,
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+
+    assert overview.title == "Ladybug Relationship Graph"
+    assert any(field.name == "Last Tick" for field in overview.fields)
+    assert any(field.name == "Slots" and "trust is high" in field.value for field in slots.fields)
+    assert [getattr(child, "label", None) for child in view.children] == [
+        "Overview",
+        "Slots",
+        "Diary",
+        "Emotion",
+        "Tick",
+        "Export",
+    ]
 
 
 def test_scoped_ladybug_facts_filter_by_raw_event_scope(monkeypatch):
