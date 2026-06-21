@@ -260,6 +260,24 @@ class PiperProcessTTS(PiperExecutableTTS):
         self._locks: OrderedDict[tuple[Any, ...], asyncio.Lock] = OrderedDict()
         self._locks_guard = asyncio.Lock()
 
+    async def synthesize(self, text: str, **options: Any) -> TTSAudio:
+        runtime_config = tts_config_for_voice(self.config, options.get("voice"))
+        key = tts_config_process_key(runtime_config)
+        lock = await self._process_lock(key)
+        async with lock:
+            await self._close_process(key)
+            audio = await self._run_piper(
+                text,
+                output_raw=runtime_config.output_format == "pcm_s16le",
+                config=runtime_config,
+            )
+        return TTSAudio(
+            audio=audio,
+            sample_rate=runtime_config.resolved_sample_rate(),
+            encoding=runtime_config.output_format,
+            voice=tts_voice_name(runtime_config) or options.get("voice"),
+        )
+
     async def stream(self, text: str, **options: Any) -> AsyncIterator[TTSChunk]:
         runtime_config = tts_config_for_voice(self.config, options.get("voice"))
         key = tts_config_process_key(runtime_config)

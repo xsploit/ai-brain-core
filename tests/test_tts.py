@@ -360,6 +360,11 @@ class FakePiperProcess(PiperProcessTTS):
             voice=str(runtime_config.piper_model_path) if runtime_config.piper_model_path else None,
         )
 
+    async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
+        runtime_config = config or self.config
+        self.used_models.append(runtime_config.piper_model_path)
+        return text.encode()
+
 
 class PartialFailurePiperProcess(PiperProcessTTS):
     def __init__(self):
@@ -447,6 +452,25 @@ class ConcurrentFakePiperProcess(PiperProcessTTS):
             self.active -= 1
 
 
+class RecordingOneShotPiperProcess(PiperProcessTTS):
+    def __init__(self):
+        super().__init__(TTSConfig(provider="null"))
+        self.calls = []
+
+    async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        yield TTSChunk(
+            audio=b"stale:" + text.encode(),
+            sample_rate=22050,
+            index=start_index,
+            final=True,
+            text=text,
+        )
+
+    async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
+        self.calls.append(text)
+        return text.encode()
+
+
 @pytest.mark.asyncio
 async def test_piper_process_stream_splits_multi_sentence_text():
     provider = FakePiperProcess()
@@ -497,6 +521,18 @@ async def test_piper_process_locks_per_voice(tmp_path):
     await asyncio.gather(first, second)
 
     assert provider.max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_piper_process_synthesize_uses_fresh_one_shot_process():
+    provider = RecordingOneShotPiperProcess()
+
+    first = await provider.synthesize("previous response")
+    second = await provider.synthesize("new response")
+
+    assert provider.calls == ["previous response", "new response"]
+    assert first.audio == b"previous response"
+    assert second.audio == b"new response"
 
 
 @pytest.mark.asyncio
