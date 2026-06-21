@@ -1950,8 +1950,8 @@ class DiscordBrainBot(commands.Bot):
     def _ensure_heartbeat_task(self) -> None:
         if not self.heartbeat_enabled:
             return
-        if not self.heartbeat_channel_ids:
-            self.logger.warning("Discord heartbeat enabled but DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS is empty.")
+        if not self.heartbeat_channel_ids and not self._heartbeat_can_run_without_channel():
+            self.logger.warning("Discord heartbeat enabled but no channel or channel-less action is configured.")
             return
         if self.heartbeat_task is not None and not self.heartbeat_task.done():
             return
@@ -1969,12 +1969,18 @@ class DiscordBrainBot(commands.Bot):
                 self.logger.debug("Discord heartbeat skipped by probability %.3f", self.heartbeat_chance)
                 continue
             channel = await self._heartbeat_channel()
-            if channel is None:
+            if channel is None and not self._heartbeat_can_run_without_channel():
                 continue
             try:
                 await self._run_heartbeat_tick(channel)
             except Exception:
                 self.logger.exception("Discord heartbeat tick failed")
+
+    def _heartbeat_can_run_without_channel(self) -> bool:
+        return bool(
+            (self.heartbeat_allow_owner_dm and self.owner_users)
+            or (self.codex_bridge.enabled and not self.codex_bridge.is_paused())
+        )
 
     def _next_heartbeat_delay_seconds(self) -> float:
         minimum = min(self.heartbeat_min_interval_seconds, self.heartbeat_interval_seconds)
@@ -1997,8 +2003,10 @@ class DiscordBrainBot(commands.Bot):
             return await self.fetch_channel(channel_id)
         return None
 
-    async def _run_heartbeat_tick(self, channel: Any) -> str:
+    async def _run_heartbeat_tick(self, channel: Any | None) -> str:
         if not getattr(self, "heartbeat_autonomy_enabled", True):
+            if channel is None:
+                return "send_channel_message:no_channel"
             await self._send_heartbeat_message(channel)
             return "send_channel_message"
         decision = await self._build_heartbeat_decision(channel)
@@ -2007,6 +2015,8 @@ class DiscordBrainBot(commands.Bot):
             self.logger.info("Discord heartbeat chose noop: %s", decision.get("reason", ""))
             return "noop"
         if action == "send_channel_message":
+            if channel is None:
+                return "send_channel_message:no_channel"
             text = _heartbeat_decision_text(decision, _env_int("DISCORD_BRAIN_HEARTBEAT_MAX_CHARS", 240))
             if not text:
                 text = await self._build_heartbeat_text(channel)
@@ -2067,7 +2077,7 @@ class DiscordBrainBot(commands.Bot):
             "reason": "model returned text instead of JSON",
         }
 
-    def _heartbeat_autonomy_prompt(self, channel: Any) -> str:
+    def _heartbeat_autonomy_prompt(self, channel: Any | None) -> str:
         channel_id = getattr(channel, "id", "unknown")
         channel_name = getattr(channel, "name", "dm")
         guild = getattr(channel, "guild", None)
@@ -2075,7 +2085,9 @@ class DiscordBrainBot(commands.Bot):
         scope = _scope_for_channel(channel)
         recent = self.recent_by_scope.get(scope, [])[-8:]
         recent_lines = _recent_messages_prompt_lines(recent, current_message_id=None)
-        actions = ["send_channel_message", "noop"]
+        actions = ["noop"]
+        if channel is not None:
+            actions.insert(0, "send_channel_message")
         if self.heartbeat_allow_owner_dm and self.owner_users:
             actions.append("dm_owner")
         if self.heartbeat_dm_user_ids:

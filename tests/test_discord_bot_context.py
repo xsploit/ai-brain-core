@@ -1016,6 +1016,31 @@ def test_autonomous_heartbeat_can_dm_owner(tmp_path):
     assert user.sent == ["I have an upgrade idea."]
 
 
+def test_channelless_autonomous_heartbeat_can_dm_owner(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"dm_owner","message":"channel-less upgrade ping"}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    user = _FakeUser(123)
+    bot.get_user = lambda user_id: user if user_id == 123 else None
+
+    result = asyncio.run(bot._run_heartbeat_tick(None))
+
+    assert result == "dm_owner"
+    assert user.sent == ["channel-less upgrade ping"]
+
+
 def test_autonomous_heartbeat_can_queue_codex_request(tmp_path):
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.brain = _FakeDecisionBrain(
