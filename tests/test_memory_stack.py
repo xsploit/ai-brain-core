@@ -7,6 +7,7 @@ from aibrain import Brain, BrainConfig, MemoryStackConfig
 from aibrain.embeddings import HashEmbeddingProvider
 from aibrain.memory_stack import (
     GRILLOMemoryWorker,
+    GrilloCandidate,
     GrilloRuntime,
     GrilloDiaryEntry,
     GrilloRelationshipProfile,
@@ -488,6 +489,67 @@ async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_partic
 
     assert "Alpha project" in recalled
     assert "Beta project" not in recalled
+
+
+@pytest.mark.asyncio
+async def test_grillo_context_packet_keeps_channel_history_local_but_memory_cross_channel(tmp_path):
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=None,
+    )
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="In the first channel we were talking about the Filian wall countdown.",
+        assistant_text="I remember the wall context.",
+        author_name="Subby",
+        assistant_name="Neuro-sama",
+        channel_id="111",
+        source="discord",
+        run_tick=False,
+    )
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="Now we moved channels and I am asking if you remember the wall thing.",
+        assistant_text="Yeah, that context should follow you.",
+        author_name="Subby",
+        assistant_name="Neuro-sama",
+        channel_id="222",
+        source="discord",
+        run_tick=False,
+    )
+    await runtime.store.append_candidate(
+        GrilloCandidate(
+            candidate_id="candidate-wall",
+            scope_key=scope,
+            participant_key=participant,
+            type="thread",
+            content="Subby discussed the Filian wall countdown in another Discord channel.",
+            summary="Subby has an ongoing Filian wall countdown thread.",
+            confidence=0.9,
+            tags=["discord", "cross_channel"],
+        )
+    )
+
+    packet = await runtime.build_context_packet(
+        scope_key=scope,
+        participant_key=participant,
+        query="wall countdown",
+        current_turn_text="remember the wall thing?",
+        channel_id="222",
+        persona_name="Neuro-sama",
+    )
+    history = "\n".join(packet.channel_history)
+    recalled = "\n".join(item["text"] for item in packet.recalled_memories)
+
+    assert "Now we moved channels" in history
+    assert "first channel" not in history
+    assert "Filian wall countdown" in recalled
+    assert "history_scope: current channel only (222)" in packet.background_information
 
 
 @pytest.mark.asyncio

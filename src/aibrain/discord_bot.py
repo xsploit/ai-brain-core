@@ -208,6 +208,13 @@ def _scope_for_message(message: discord.Message) -> str:
     return ThreadPolicy.discord_channel(message.guild.id, message.channel.id)
 
 
+def _grillo_scope_for_message(message: discord.Message, persona_id: str | None = None) -> str:
+    persona = (persona_id or "unknown").strip() or "unknown"
+    if message.guild is None:
+        return f"discord:dm:{message.author.id}:persona:{persona}"
+    return f"discord:guild:{message.guild.id}:user:{message.author.id}:persona:{persona}"
+
+
 def _thread_id_for_message(message: discord.Message) -> str:
     scope = _scope_for_message(message)
     if message.guild is None or isinstance(message.channel, discord.Thread):
@@ -894,9 +901,9 @@ class DiscordBrainBot(commands.Bot):
                 f"`{prefix} recall <query>` - search long-term memory",
                 f"`{prefix} grillo` - show GRILLO memory worker status",
                 f"`{prefix} grillo tick [type]` - run a GRILLO memory tick",
-                f"`{prefix} grillo slots` - show relationship slots for you in this scope",
-                f"`{prefix} grillo context [query]` - preview injected GRILLO context",
-                f"`{prefix} grillo export [query]` - DM your scoped GRILLO memory packet as a text file",
+                f"`{prefix} grillo slots` - show relationship slots for your server-user scope",
+                f"`{prefix} grillo context [query]` - preview injected server-user GRILLO context",
+                f"`{prefix} grillo export [query]` - DM your server-user GRILLO memory packet as a text file",
                 f"`{prefix} ladybug search <query>` - search scoped graph facts",
                 f"`{prefix} ladybug export <query>` - DM scoped graph facts as a text file",
                 "Mention me, DM me, or use the configured response mode for normal chat.",
@@ -906,10 +913,12 @@ class DiscordBrainBot(commands.Bot):
         @commands.command(name="status")
         async def status(ctx: commands.Context) -> None:
             scope = _scope_for_message(ctx.message)
+            grillo_scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             await ctx.reply(
                 "\n".join(
                     [
-                        f"thread: `{scope}`",
+                        f"channel scope: `{scope}`",
+                        f"grillo scope: `{grillo_scope}`",
                         f"model: `{self.brain.config.default_model}`",
                         f"state: `{self.brain.config.state_mode}`",
                         f"memory stack: `{bool(self.brain.memory_stack)}`",
@@ -924,7 +933,7 @@ class DiscordBrainBot(commands.Bot):
 
         @commands.command(name="remember")
         async def remember(ctx: commands.Context, *, content: str) -> None:
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             state = await self.brain.open_thread(thread_id=scope, persona=self.persona)
             record = await self.brain.memory.remember(
                 content,
@@ -948,7 +957,7 @@ class DiscordBrainBot(commands.Bot):
 
         @commands.command(name="recall")
         async def recall(ctx: commands.Context, *, query: str) -> None:
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             state = await self.brain.open_thread(thread_id=scope, persona=self.persona)
             hits = await self.brain.memory.search(
                 query,
@@ -1156,7 +1165,7 @@ class DiscordBrainBot(commands.Bot):
             if runtime is None:
                 await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             result = await runtime.run_tick(
                 scope_key=scope,
                 participant_key=str(ctx.author.id),
@@ -1170,11 +1179,12 @@ class DiscordBrainBot(commands.Bot):
             if runtime is None:
                 await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             packet = await runtime.build_context_packet(
                 scope_key=scope,
                 participant_key=str(ctx.author.id),
                 query=query,
+                channel_id=str(ctx.channel.id),
                 persona_name=self.persona.name,
                 top_k=5,
             )
@@ -1186,10 +1196,10 @@ class DiscordBrainBot(commands.Bot):
             if runtime is None:
                 await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             slots = await runtime.store.list_slots(scope, str(ctx.author.id))
             if not slots:
-                await ctx.reply("no GRILLO relationship slots for you in this scope.", mention_author=False)
+                await ctx.reply("no GRILLO relationship slots for you in this server-user scope.", mention_author=False)
                 return
             lines = []
             for slot in slots[:12]:
@@ -1203,12 +1213,13 @@ class DiscordBrainBot(commands.Bot):
             if runtime is None:
                 await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             participant = str(ctx.author.id)
             packet = await runtime.build_context_packet(
                 scope_key=scope,
                 participant_key=participant,
                 query=query,
+                channel_id=str(ctx.channel.id),
                 persona_name=self.persona.name,
                 top_k=_env_int("DISCORD_BRAIN_MEMORY_EXPORT_TOP_K", 20),
             )
@@ -1236,7 +1247,7 @@ class DiscordBrainBot(commands.Bot):
             if stack is None:
                 await ctx.reply("memory stack is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             facts = await _scoped_ladybug_facts(stack, scope, "", top_k=5, include_expired=True)
             lines = [
                 f"graph backend: `{type(stack.graph_store).__name__}`",
@@ -1257,7 +1268,7 @@ class DiscordBrainBot(commands.Bot):
                 return
             facts = await _scoped_ladybug_facts(
                 stack,
-                _scope_for_message(ctx.message),
+                _grillo_scope_for_message(ctx.message, self.persona.id),
                 query,
                 top_k=_env_int("DISCORD_BRAIN_LADYBUG_TOP_K", 12),
                 include_expired=False,
@@ -1274,7 +1285,7 @@ class DiscordBrainBot(commands.Bot):
             if stack is None:
                 await ctx.reply("memory stack is not enabled.", mention_author=False)
                 return
-            scope = _scope_for_message(ctx.message)
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
             facts = await _scoped_ladybug_facts(
                 stack,
                 scope,
@@ -1335,9 +1346,13 @@ class DiscordBrainBot(commands.Bot):
 
     def _context_for_message(self, message: discord.Message) -> dict[str, Any]:
         scope = _scope_for_message(message)
+        persona = getattr(self, "persona", None)
+        grillo_scope = _grillo_scope_for_message(message, getattr(persona, "id", None))
         metadata = _discord_message_metadata(message)
         return {
             "scope": scope,
+            "channel_scope": scope,
+            "grillo_scope": grillo_scope,
             "thread_id": _thread_id_for_message(message),
             "guild_id": message.guild.id if message.guild else None,
             "guild": message.guild.name if message.guild else None,
@@ -1366,7 +1381,8 @@ class DiscordBrainBot(commands.Bot):
         prompt_cache_key: str | None = None,
         prompt_cache_retention: str | None = None,
     ) -> None:
-        scope = _scope_for_message(message)
+        channel_scope = _scope_for_message(message)
+        grillo_scope = _grillo_scope_for_message(message, getattr(self.persona, "id", None))
         thread_id = thread_id_override or _thread_id_for_message(message)
         token = None
         tool_token = None
@@ -1381,7 +1397,7 @@ class DiscordBrainBot(commands.Bot):
             persona = persona_override or self.persona
             prompt = await self._build_prompt_for_message(
                 message,
-                scope,
+                grillo_scope,
                 prompt_text,
                 one_shot_pre_prompt=one_shot_pre_prompt,
                 include_grillo_context=include_grillo_context,
@@ -1430,10 +1446,10 @@ class DiscordBrainBot(commands.Bot):
                 self._record_recent_assistant(message, buffer.strip() or "done.")
                 await self._maybe_send_tts_reply(message, buffer.strip())
                 if record_grillo:
-                    self._schedule_grillo_ingest(message, scope, memory_text, buffer.strip())
+                    self._schedule_grillo_ingest(message, grillo_scope, memory_text, buffer.strip())
         except Exception as exc:
             logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
-            logger.exception("Brain turn failed for scope %s", scope)
+            logger.exception("Brain turn failed for scope %s grillo_scope %s", channel_scope, grillo_scope)
             await message.reply(f"brain failed: {exc}", mention_author=False)
         finally:
             if token is not None:
@@ -1444,7 +1460,7 @@ class DiscordBrainBot(commands.Bot):
     async def _build_prompt_for_message(
         self,
         message: discord.Message,
-        scope: str,
+        grillo_scope: str,
         user_text: str,
         *,
         one_shot_pre_prompt: str | None = None,
@@ -1484,16 +1500,34 @@ class DiscordBrainBot(commands.Bot):
         memory_query = _memory_query_text(memory_query_text if memory_query_text is not None else user_text)
         try:
             packet = await runtime.build_context_packet(
-                scope_key=scope,
+                scope_key=grillo_scope,
                 participant_key=str(message.author.id),
                 query=memory_query,
                 current_turn_text=memory_query,
+                channel_id=str(message.channel.id),
                 persona_name=persona_name or self.persona.name,
                 top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
             )
+            if (
+                _env_bool("DISCORD_BRAIN_GRILLO_LEGACY_CHANNEL_FALLBACK", True)
+                and not _grillo_packet_has_durable_context(packet)
+            ):
+                legacy_scope = _scope_for_message(message)
+                if legacy_scope != grillo_scope:
+                    legacy_packet = await runtime.build_context_packet(
+                        scope_key=legacy_scope,
+                        participant_key=str(message.author.id),
+                        query=memory_query,
+                        current_turn_text=memory_query,
+                        channel_id=str(message.channel.id),
+                        persona_name=persona_name or self.persona.name,
+                        top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
+                    )
+                    if _grillo_packet_has_durable_context(legacy_packet):
+                        packet = legacy_packet
         except Exception:
             logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
-            logger.exception("GRILLO context packet failed for scope %s; continuing without GRILLO", scope)
+            logger.exception("GRILLO context packet failed for scope %s; continuing without GRILLO", grillo_scope)
             return prompt
         grillo_prompt = packet.as_prompt_text()
         return f"{grillo_prompt}\n\n{prompt}" if grillo_prompt else prompt
@@ -1557,6 +1591,13 @@ def _memory_query_text(text: str) -> str:
     default = _env_int("AIBRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS)
     limit = max(1, _env_int("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", default))
     return str(text or "").strip()[:limit]
+
+
+def _grillo_packet_has_durable_context(packet: Any) -> bool:
+    for attr in ("relationship_memory", "recalled_memories", "thoughts"):
+        if getattr(packet, attr, None):
+            return True
+    return False
 
 
 def _recent_messages_prompt_lines(
@@ -2089,6 +2130,7 @@ def _load_persona_instructions() -> str:
         parts.append(
             "Runtime additions:\n"
             "- You are backed by AI Brain long-term memory.\n"
+            "- GRILLO relationship, diary, and semantic memory follows the user across channels in the same server; raw chat history remains channel-local.\n"
             "- Use discord_context when channel context matters.\n"
             "- Use remember for durable facts, preferences, projects, decisions, and open loops.\n"
             "- Use Tavily tools for current web facts, search, page extraction, site crawling, URL maps, and deep research.\n"
@@ -2101,6 +2143,7 @@ def _load_persona_instructions() -> str:
 
     return (
         "You are a Discord-native AI companion using long-term memory. "
+        "GRILLO relationship, diary, and semantic memory follows the user across channels in the same server; raw chat history remains channel-local. "
         "Be natural, specific, and concise unless the user asks for depth. "
         "Use discord_context when channel context matters. "
         "Use remember for durable facts, preferences, projects, decisions, and open loops. "

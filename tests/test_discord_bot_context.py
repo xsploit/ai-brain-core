@@ -15,6 +15,7 @@ from aibrain.discord_bot import (
     ModelSelectView,
     _build_jb_persona,
     _format_grillo_export,
+    _grillo_scope_for_message,
     _message_text,
     _model_choice_description,
     _ordered_model_choices,
@@ -221,6 +222,16 @@ def test_time_context_defaults_to_los_angeles(monkeypatch):
     assert context["utc_now"] == "2026-06-19T16:30:00+00:00"
 
 
+def test_discord_grillo_scope_is_server_user_persona_scoped():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(id=123, display_name="Subby", global_name=None, bot=False)
+
+    assert _grillo_scope_for_message(message, "neuro-sama") == "discord:guild:222:user:123:persona:neuro-sama"
+
+
 def test_discord_message_context_and_prompt_include_local_time(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
@@ -300,8 +311,9 @@ def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     asyncio.run(bot._reply_with_brain(message))
 
     assert brain.kwargs["thread_id"] == "discord:guild:222:channel:456:user:123"
-    assert grillo.calls[0]["scope_key"] == "discord:guild:222:channel:456"
+    assert grillo.calls[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
     assert grillo.calls[0]["participant_key"] == "123"
+    assert grillo.calls[0]["channel_id"] == "456"
     assert "author_id: 123" in brain.prompt
     assert "author_username: subsect" in brain.prompt
     assert "author_display_name: SUBSECT" in brain.prompt
@@ -311,6 +323,7 @@ def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     assert metadata["author_display_name"] == "SUBSECT"
     assert metadata["guild_id"] == 222
     assert metadata["channel_id"] == 456
+    assert grillo.ingests[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
 
 
 def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
