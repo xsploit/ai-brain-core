@@ -28,7 +28,7 @@ from aibrain.discord_bot import (
     waveform_base64_from_pcm_s16le,
 )
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
-from aibrain.tts import TTSAudio
+from aibrain.tts import TTSAudio, TTSConfig
 
 
 class _TypingContext:
@@ -139,6 +139,15 @@ class _FakeTTSBrain:
         self.text = text
         self.tts_options = tts_options
         return TTSAudio(audio=(b"\x00\x00\xff\x7f\x00\x00\x01\x80" * 100), sample_rate=16000)
+
+
+class _RecordingTTSBrain:
+    def __init__(self):
+        self.texts = []
+
+    async def speak(self, text, **tts_options):
+        self.texts.append(text)
+        return TTSAudio(audio=(b"\x00\x00\xff\x7f" * 100), sample_rate=16000)
 
 
 class _FakeGraphStore:
@@ -842,3 +851,44 @@ def test_build_discord_voice_clip_encodes_waveform_and_ogg(monkeypatch):
 
     assert clip == DiscordVoiceClip(ogg=b"ogg-data", duration_secs=0.025, waveform=clip.waveform)
     assert base64.b64decode(clip.waveform)
+
+
+def test_discord_voice_clip_uses_current_text_only(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    brain = _RecordingTTSBrain()
+
+    asyncio.run(build_discord_voice_clip(brain, "first reply"))
+    asyncio.run(build_discord_voice_clip(brain, "second reply"))
+
+    assert brain.texts == ["first reply", "second reply"]
+
+
+def test_discord_voice_clip_isolates_piper_process_provider(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    class FakeIsolatedPiper:
+        instances = []
+
+        def __init__(self, config):
+            self.config = config
+            self.calls = []
+            self.instances.append(self)
+
+        async def synthesize(self, text, **tts_options):
+            self.calls.append((text, tts_options))
+            return TTSAudio(audio=(b"\x00\x00\xff\x7f" * 100), sample_rate=16000)
+
+    async def fail_speak(*args, **kwargs):
+        raise AssertionError("persistent brain.speak should not be used for Discord voice clips")
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    monkeypatch.setattr(discord_bot_module, "PiperExecutableTTS", FakeIsolatedPiper)
+    brain = SimpleNamespace(tts=SimpleNamespace(config=TTSConfig(provider="piper_process")), speak=fail_speak)
+
+    asyncio.run(build_discord_voice_clip(brain, "isolated reply", voice="neuro-sama"))
+
+    assert FakeIsolatedPiper.instances[0].calls == [("isolated reply", {"voice": "neuro-sama"})]

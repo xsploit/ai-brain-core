@@ -42,6 +42,7 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_search_members",
     "discord_get_member",
     "discord_get_permissions",
+    "discord_audit_permissions",
     "discord_read_channel_history",
     "discord_search_channel_messages",
     "discord_send_channel_message",
@@ -259,24 +260,81 @@ async def discord_get_member(user_id: int) -> dict[str, Any]:
     return {"member": _serialize_member(member)}
 
 
-async def discord_get_permissions(channel_id: int | None = None, user_id: int | None = None) -> dict[str, Any]:
-    """Return channel permissions for the requester, bot, or a selected member in the current guild."""
+async def discord_get_permissions(
+    channel_id: int | None = None,
+    user_id: int | None = None,
+    guild_id: int | None = None,
+) -> dict[str, Any]:
+    """Return guild/channel permissions for the requester, bot, or a selected member."""
     runtime = _runtime()
-    channel = await _resolve_channel(runtime, channel_id)
-    guild = _require_guild(runtime)
-    actor = await _actor_member(runtime)
-    if user_id is not None and int(user_id) != _id(actor):
+    channel = await _resolve_channel(runtime, channel_id) if channel_id is not None else getattr(runtime.message, "channel", None)
+    channel_guild = _guild_for_channel(runtime, channel) if channel is not None else None
+    guild = await _resolve_guild(runtime, guild_id) if guild_id is not None else (channel_guild or _require_guild(runtime))
+    if channel_guild is not None and _id(channel_guild) != _id(guild):
+        raise DiscordToolError(f"Channel {_id(channel)} is not in guild {_id(guild)}.")
+    actor = await _actor_member_for_guild(runtime, guild)
+    if user_id is not None and (actor is None or int(user_id) != _id(actor)):
         _require_admin_or_owner(runtime, "inspect another member's permissions")
         member = await _resolve_member(guild, user_id)
     else:
         member = actor
-    bot_member = await _bot_member(runtime)
+    bot_member = await _bot_member_for_guild(runtime, guild)
     return {
-        "channel": _serialize_channel(channel),
-        "member": _serialize_member(member),
+        "guild": _serialize_guild(guild),
+        "channel": _serialize_channel(channel) if channel is not None else None,
+        "member": _serialize_member(member) if member is not None else None,
         "bot": _serialize_member(bot_member) if bot_member is not None else None,
-        "member_permissions": _serialize_permissions(_permissions_for(channel, member)),
-        "bot_permissions": _serialize_permissions(_permissions_for(channel, bot_member)),
+        "member_guild_permissions": _serialize_permissions(getattr(member, "guild_permissions", None)),
+        "bot_guild_permissions": _serialize_permissions(getattr(bot_member, "guild_permissions", None)),
+        "member_permissions": _serialize_permissions(_permissions_for(channel, member)) if channel is not None and member is not None else {},
+        "bot_permissions": _serialize_permissions(_permissions_for(channel, bot_member)) if channel is not None else {},
+    }
+
+
+async def discord_audit_permissions(
+    guild_id: int | None = None,
+    channel_id: int | None = None,
+    include_channels: bool = True,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return actual bot guild permissions and channel-level capabilities; owner can use this from DMs."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "audit permissions")
+    guild = await _resolve_guild(runtime, guild_id)
+    bot_member = await _bot_member_for_guild(runtime, guild)
+    limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_LIST_LIMIT", 100))
+    channels = []
+    if include_channels:
+        candidates = [await _resolve_channel(runtime, channel_id)] if channel_id is not None else _iter_guild_channels(guild, include_threads=True)
+        for channel in candidates:
+            if len(channels) >= limit:
+                break
+            if channel is None or not _channel_is_allowed(channel):
+                continue
+            if _id(_guild_for_channel(runtime, channel)) != _id(guild):
+                continue
+            perms = _permissions_for(channel, bot_member)
+            channels.append(
+                {
+                    **_serialize_channel(channel),
+                    "bot_permissions": _serialize_permissions(perms),
+                    "can_view": _perm(perms, "view_channel"),
+                    "can_read_history": _perm(perms, "view_channel") and _perm(perms, "read_message_history"),
+                    "can_send": _perm(perms, "view_channel") and _perm(perms, "send_messages"),
+                    "can_connect": _perm(perms, "connect"),
+                    "can_speak": _perm(perms, "connect") and _perm(perms, "speak"),
+                    "can_moderate": _perm(perms, "moderate_members"),
+                    "can_manage_messages": _perm(perms, "manage_messages"),
+                    "can_manage_channels": _perm(perms, "manage_channels"),
+                    "can_manage_roles": _perm(perms, "manage_roles"),
+                }
+            )
+    return {
+        "guild": _serialize_guild(guild),
+        "bot": _serialize_member(bot_member) if bot_member is not None else None,
+        "bot_guild_permissions": _serialize_permissions(getattr(bot_member, "guild_permissions", None)),
+        "channels": channels,
+        "channel_count": len(channels),
     }
 
 
@@ -970,7 +1028,10 @@ async def _lookup_channel(runtime: DiscordToolRuntime, channel_id: int) -> Any:
     if current is not None and _id(current) == channel_id:
         return current
     guild = getattr(runtime.message, "guild", None)
-    for owner in (guild, getattr(runtime, "bot", None), getattr(runtime, "bot", None)):
+    bot = getattr(runtime, "bot", None)
+    owners = [guild, bot]
+    owners.extend(getattr(bot, "guilds", None) or [])
+    for owner in owners:
         if owner is None:
             continue
         for method_name in ("get_channel_or_thread", "get_thread", "get_channel"):
@@ -979,10 +1040,10 @@ async def _lookup_channel(runtime: DiscordToolRuntime, channel_id: int) -> Any:
                 channel = method(channel_id)
                 if channel is not None:
                     return channel
-    if guild is not None and hasattr(guild, "fetch_channel"):
-        with contextlib.suppress(Exception):
-            return await guild.fetch_channel(channel_id)
-    bot = getattr(runtime, "bot", None)
+    for owner in [guild, *(getattr(bot, "guilds", None) or [])]:
+        if owner is not None and hasattr(owner, "fetch_channel"):
+            with contextlib.suppress(Exception):
+                return await owner.fetch_channel(channel_id)
     if bot is not None and hasattr(bot, "fetch_channel"):
         with contextlib.suppress(Exception):
             return await bot.fetch_channel(channel_id)
@@ -1005,17 +1066,30 @@ def _iter_guild_members(guild: Any) -> list[Any]:
 
 async def _actor_member(runtime: DiscordToolRuntime) -> Any:
     guild = getattr(runtime.message, "guild", None)
+    return await _actor_member_for_guild(runtime, guild)
+
+
+async def _actor_member_for_guild(runtime: DiscordToolRuntime, guild: Any) -> Any:
     author = getattr(runtime.message, "author", None)
     if guild is None or author is None:
         return author
-    if hasattr(author, "guild_permissions"):
+    message_guild = getattr(runtime.message, "guild", None)
+    if hasattr(author, "guild_permissions") and _id(message_guild) == _id(guild):
         return author
-    member = await _resolve_member(guild, _id(author))
-    return member
+    author_id = _id(author)
+    if author_id is None:
+        return author
+    with contextlib.suppress(DiscordToolError, KeyError, LookupError):
+        return await _resolve_member(guild, author_id)
+    return author
 
 
 async def _bot_member(runtime: DiscordToolRuntime) -> Any:
     guild = getattr(runtime.message, "guild", None)
+    return await _bot_member_for_guild(runtime, guild)
+
+
+async def _bot_member_for_guild(runtime: DiscordToolRuntime, guild: Any) -> Any:
     if guild is None:
         return getattr(runtime.bot, "user", None)
     member = getattr(guild, "me", None)
@@ -1029,7 +1103,32 @@ async def _bot_member(runtime: DiscordToolRuntime) -> Any:
             member = getter(bot_id)
             if member is not None:
                 return member
+        fetcher = getattr(guild, "fetch_member", None)
+        if callable(fetcher):
+            with contextlib.suppress(Exception):
+                return await fetcher(bot_id)
     return bot_user
+
+
+def _guild_for_channel(runtime: DiscordToolRuntime, channel: Any) -> Any:
+    if channel is None:
+        return None
+    guild = getattr(channel, "guild", None)
+    if guild is not None:
+        return guild
+    channel_id = _id(channel)
+    current = getattr(runtime.message, "guild", None)
+    if current is not None and any(_id(item) == channel_id for item in _iter_guild_channels(current, include_threads=True)):
+        return current
+    for item in getattr(getattr(runtime, "bot", None), "guilds", None) or []:
+        if any(_id(guild_channel) == channel_id for guild_channel in _iter_guild_channels(item, include_threads=True)):
+            return item
+    guild_id = getattr(channel, "guild_id", None)
+    if guild_id is not None:
+        for item in [current, *(getattr(getattr(runtime, "bot", None), "guilds", None) or [])]:
+            if _id(item) == int(guild_id):
+                return item
+    return None
 
 
 async def _resolve_member(guild: Any, user_id: int) -> Any:

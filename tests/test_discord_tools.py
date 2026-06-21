@@ -11,7 +11,9 @@ from aibrain.discord_tools import (
     DISCORD_TOOL_CONTEXT,
     DiscordToolError,
     DiscordToolRuntime,
+    discord_audit_permissions,
     discord_get_capabilities,
+    discord_get_permissions,
     discord_list_bot_guilds,
     discord_list_members,
     discord_read_channel_history,
@@ -40,6 +42,9 @@ class _Perms:
             "moderate_members",
             "kick_members",
             "ban_members",
+            "connect",
+            "speak",
+            "use_voice_activation",
         ):
             setattr(self, name, values.get(name, False))
 
@@ -151,6 +156,8 @@ class _Guild:
         self.threads = []
         self.roles = [_Role(0), _Role(5), actor.top_role, bot.top_role, target.top_role]
         self.members = {actor.id: actor, bot.id: bot, target.id: target}
+        for item in self.channels:
+            item.guild = self
 
     def get_channel(self, channel_id):
         return next((channel for channel in self.channels if channel.id == channel_id), None)
@@ -226,6 +233,43 @@ def test_capabilities_reports_owner_gate(monkeypatch):
         assert result["actor"]["id"] == ctx.actor.id
         assert result["actor"]["is_owner"] is True
         assert "discord_create_text_channel" in result["owner_only_tools"]
+
+
+def test_get_permissions_works_from_dm_with_guild_and_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(
+        actor_perms=_Perms(administrator=True, view_channel=True),
+        bot_perms=_Perms(view_channel=True, send_messages=True, read_message_history=True),
+    ) as ctx:
+        ctx.message.guild = None
+        ctx.message.channel = SimpleNamespace(id=9_999, name="dm")
+
+        result = asyncio.run(discord_get_permissions(guild_id=ctx.guild.id, channel_id=ctx.channel.id))
+
+        assert result["guild"]["id"] == ctx.guild.id
+        assert result["channel"]["id"] == ctx.channel.id
+        assert result["member"]["id"] == ctx.actor.id
+        assert result["bot_permissions"]["send_messages"] is True
+
+
+def test_audit_permissions_reports_channel_capabilities_from_dm(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(
+        bot_perms=_Perms(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            connect=True,
+            speak=True,
+        )
+    ) as ctx:
+        ctx.message.guild = None
+
+        result = asyncio.run(discord_audit_permissions(guild_id=ctx.guild.id))
+
+        assert result["guild"]["id"] == ctx.guild.id
+        assert result["channels"][0]["can_send"] is True
+        assert result["channels"][0]["can_speak"] is True
 
 
 def test_bot_guild_list_is_owner_only(monkeypatch):
