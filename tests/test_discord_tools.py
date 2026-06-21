@@ -12,12 +12,17 @@ from aibrain.discord_tools import (
     DiscordToolError,
     DiscordToolRuntime,
     discord_audit_permissions,
+    discord_can_do,
     discord_get_capabilities,
+    discord_get_channel_overwrites,
+    discord_get_current_context,
     discord_get_permissions,
     discord_list_bot_guilds,
     discord_list_members,
+    discord_list_voice_states,
     discord_read_channel_history,
     discord_send_channel_message,
+    discord_send_file,
     discord_timeout_member,
     register_discord_tools,
 )
@@ -42,6 +47,10 @@ class _Perms:
             "moderate_members",
             "kick_members",
             "ban_members",
+            "attach_files",
+            "manage_guild",
+            "view_audit_log",
+            "move_members",
             "connect",
             "speak",
             "use_voice_activation",
@@ -84,6 +93,10 @@ class _Member:
         self.roles = [item for item in self.roles if item.id != role.id]
         self.remove_role_reason = reason
 
+    async def move_to(self, channel, *, reason=None):
+        self.voice_channel = channel
+        self.move_reason = reason
+
 
 class _Message:
     attachments = []
@@ -116,12 +129,16 @@ class _Channel:
         self.permission_map = {}
         self.messages = []
         self.sent = []
+        self.overwrites = {}
+        self.members = []
 
     def permissions_for(self, member):
         return self.permission_map.get(member.id, _Perms())
 
     async def send(self, content, **kwargs):
         message = _Message(10_000 + len(self.sent), self, kwargs.get("author", SimpleNamespace(id=999, name="bot")), content)
+        for key, value in kwargs.items():
+            setattr(message, key, value)
         self.sent.append((content, kwargs))
         return message
 
@@ -270,6 +287,68 @@ def test_audit_permissions_reports_channel_capabilities_from_dm(monkeypatch):
         assert result["guild"]["id"] == ctx.guild.id
         assert result["channels"][0]["can_send"] is True
         assert result["channels"][0]["can_speak"] is True
+
+
+def test_context_and_can_do_report_cross_guild_permissions_from_dm(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(
+        actor_perms=_Perms(administrator=True),
+        bot_perms=_Perms(view_channel=True, send_messages=True, attach_files=True),
+    ) as ctx:
+        ctx.message.guild = None
+        ctx.message.channel = SimpleNamespace(id=9_999, name="dm")
+
+        current = asyncio.run(discord_get_current_context())
+        result = asyncio.run(discord_can_do("send_file", guild_id=ctx.guild.id, channel_id=ctx.channel.id))
+
+        assert current["is_dm"] is True
+        assert result["allowed"] is True
+        assert result["requirements"] == ["view_channel", "send_messages", "attach_files"]
+
+
+def test_send_file_from_dm_owner_to_guild_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(
+        bot_perms=_Perms(view_channel=True, send_messages=True, attach_files=True),
+    ) as ctx:
+        ctx.message.guild = None
+        ctx.message.channel = SimpleNamespace(id=9_999, name="dm")
+
+        result = asyncio.run(discord_send_file("report?.txt", "hello", channel_id=ctx.channel.id, message="sent"))
+
+        assert result["sent"] is True
+        assert result["filename"] == "report_.txt"
+        assert ctx.channel.sent[0][0] == "sent"
+        assert ctx.channel.sent[0][1]["file"].filename == "report_.txt"
+
+
+def test_get_channel_overwrites_serializes_allow_and_deny(monkeypatch):
+    class _Overwrite:
+        def __iter__(self):
+            return iter([("send_messages", True), ("view_channel", False), ("attach_files", None)])
+
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(actor_perms=_Perms(administrator=True), bot_perms=_Perms(view_channel=True)) as ctx:
+        ctx.channel.overwrites = {ctx.bot: _Overwrite()}
+
+        result = asyncio.run(discord_get_channel_overwrites(ctx.channel.id))
+
+        assert result["overwrites"][0]["target"]["id"] == ctx.bot.id
+        assert result["overwrites"][0]["allow"] == ["send_messages"]
+        assert result["overwrites"][0]["deny"] == ["view_channel"]
+
+
+def test_list_voice_states_reports_connected_members(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(bot_perms=_Perms(view_channel=True)) as ctx:
+        ctx.actor.voice = SimpleNamespace(mute=False, deaf=False, self_mute=True, self_deaf=False)
+        ctx.channel.members = [ctx.actor]
+
+        result = asyncio.run(discord_list_voice_states(guild_id=ctx.guild.id))
+
+        assert result["count"] == 1
+        assert result["voice_states"][0]["member"]["id"] == ctx.actor.id
+        assert result["voice_states"][0]["self_mute"] is True
 
 
 def test_bot_guild_list_is_owner_only(monkeypatch):

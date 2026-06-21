@@ -198,6 +198,44 @@ async def test_grillo_runtime_ingests_diary_slots_and_context_packet(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_grillo_runtime_splits_profile_blob_into_clean_reflections(tmp_path):
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=None,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        user_text=(
+            "This applies to all chats, always Some things about me: "
+            "My name is LO, a male. I am an Adult Erotica Author. "
+            "I prefer crude direct language. 500 words minimum length."
+        ),
+        assistant_text="Noted.",
+        source="discord",
+    )
+
+    slots = await runtime.store.list_slots("discord:guild:alpha", "user-alpha")
+    packet = await runtime.build_context_packet(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        persona_name="Neuro-sama",
+    )
+    by_slot = {slot.slot_name: slot.items for slot in slots}
+    all_items = [item for slot in slots for item in slot.items]
+    relationship_text = "\n".join(packet.relationship_memory)
+
+    assert any("My name is LO" in item for item in by_slot["user_facts"])
+    assert any("Adult Erotica Author" in item for item in by_slot["user_facts"])
+    assert any("crude direct language" in item for item in by_slot["preferences"])
+    assert not any("This applies to all chats" in item for item in all_items)
+    assert all(len(item) <= 180 for item in all_items)
+    assert "This applies to all chats" not in relationship_text
+    assert "Preference signal:" not in relationship_text
+
+
+@pytest.mark.asyncio
 async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_participant(tmp_path):
     provider = HashEmbeddingProvider(dimensions=32)
     vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)

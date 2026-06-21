@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import inspect
 import os
+import re
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,11 +43,16 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_list_members",
     "discord_search_members",
     "discord_get_member",
+    "discord_get_current_context",
     "discord_get_permissions",
+    "discord_can_do",
     "discord_audit_permissions",
+    "discord_get_channel_overwrites",
+    "discord_get_audit_log",
     "discord_read_channel_history",
     "discord_search_channel_messages",
     "discord_send_channel_message",
+    "discord_send_file",
     "discord_edit_own_message",
     "discord_fetch_message",
     "discord_delete_message",
@@ -65,7 +72,15 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_unban_user",
     "discord_add_member_role",
     "discord_remove_member_role",
+    "discord_list_voice_states",
+    "discord_move_member_voice",
+    "discord_disconnect_member_voice",
     *OWNER_ONLY_TOOL_NAMES[2:],
+    "discord_list_invites",
+    "discord_delete_invite",
+    "discord_create_poll",
+    "discord_end_poll",
+    "discord_list_emojis_stickers",
 ]
 
 
@@ -260,6 +275,31 @@ async def discord_get_member(user_id: int) -> dict[str, Any]:
     return {"member": _serialize_member(member)}
 
 
+async def discord_get_current_context() -> dict[str, Any]:
+    """Return the active Discord message context, bot identity, and real permissions for this turn."""
+    runtime = _runtime()
+    message = runtime.message
+    channel = getattr(message, "channel", None)
+    guild = getattr(message, "guild", None) or _guild_for_channel(runtime, channel)
+    actor = await _actor_member_for_guild(runtime, guild)
+    bot_member = await _bot_member_for_guild(runtime, guild)
+    actor_perms = _permissions_for(channel, actor) if channel is not None and actor is not None else getattr(actor, "guild_permissions", None)
+    bot_perms = _permissions_for(channel, bot_member) if channel is not None and bot_member is not None else getattr(bot_member, "guild_permissions", None)
+    return {
+        "message_id": _id(message),
+        "is_dm": getattr(message, "guild", None) is None,
+        "guild": _serialize_guild(guild) if guild is not None else None,
+        "channel": _serialize_channel(channel) if channel is not None else None,
+        "actor": _serialize_member(actor) if hasattr(actor, "guild_permissions") else _serialize_user(actor),
+        "bot": _serialize_member(bot_member) if hasattr(bot_member, "guild_permissions") else _serialize_user(bot_member),
+        "actor_is_owner": _is_owner(runtime),
+        "actor_is_admin": _is_admin(actor),
+        "actor_permissions": _serialize_permissions(actor_perms),
+        "bot_permissions": _serialize_permissions(bot_perms),
+        "tool_channel_ids": sorted(_csv_ints("DISCORD_BRAIN_TOOL_CHANNEL_IDS")),
+    }
+
+
 async def discord_get_permissions(
     channel_id: int | None = None,
     user_id: int | None = None,
@@ -288,6 +328,50 @@ async def discord_get_permissions(
         "bot_guild_permissions": _serialize_permissions(getattr(bot_member, "guild_permissions", None)),
         "member_permissions": _serialize_permissions(_permissions_for(channel, member)) if channel is not None and member is not None else {},
         "bot_permissions": _serialize_permissions(_permissions_for(channel, bot_member)) if channel is not None else {},
+    }
+
+
+async def discord_can_do(
+    action: str,
+    channel_id: int | None = None,
+    user_id: int | None = None,
+    guild_id: int | None = None,
+) -> dict[str, Any]:
+    """Dry-run whether the requester and bot can perform a Discord action; no state is changed."""
+    runtime = _runtime()
+    normalized = action.strip().lower().replace("-", "_").replace(" ", "_")
+    requirements = _action_requirements(normalized)
+    channel = await _resolve_channel(runtime, channel_id) if channel_id is not None else getattr(runtime.message, "channel", None)
+    channel_guild = _guild_for_channel(runtime, channel) if channel is not None else None
+    guild = await _resolve_guild(runtime, guild_id) if guild_id is not None else (channel_guild or getattr(runtime.message, "guild", None))
+    actor = await _actor_member_for_guild(runtime, guild)
+    bot_member = await _bot_member_for_guild(runtime, guild)
+    target_member = await _resolve_member(guild, user_id) if guild is not None and user_id is not None else None
+    actor_perms = _permissions_for(channel, actor) if channel is not None and actor is not None else getattr(actor, "guild_permissions", None)
+    bot_perms = _permissions_for(channel, bot_member) if channel is not None and bot_member is not None else getattr(bot_member, "guild_permissions", None)
+    owner = _is_owner(runtime)
+    actor_missing = [] if owner else [permission for permission in requirements if not _perm(actor_perms, permission)]
+    bot_missing = [permission for permission in requirements if not _perm(bot_perms, permission)]
+    hierarchy_ok = True
+    hierarchy_reason = None
+    if target_member is not None and normalized in {"timeout_member", "kick_member", "ban_member", "add_member_role", "remove_member_role", "move_voice", "disconnect_voice"}:
+        try:
+            _require_member_hierarchy(runtime, target_member, require_actor=not owner)
+        except DiscordToolError as exc:
+            hierarchy_ok = False
+            hierarchy_reason = str(exc)
+    return {
+        "action": normalized,
+        "requirements": requirements,
+        "guild": _serialize_guild(guild) if guild is not None else None,
+        "channel": _serialize_channel(channel) if channel is not None else None,
+        "target_member": _serialize_member(target_member) if target_member is not None else None,
+        "actor_allowed": not actor_missing and hierarchy_ok,
+        "bot_allowed": not bot_missing and hierarchy_ok,
+        "allowed": not actor_missing and not bot_missing and hierarchy_ok,
+        "actor_missing": actor_missing,
+        "bot_missing": bot_missing,
+        "hierarchy_reason": hierarchy_reason,
     }
 
 
@@ -336,6 +420,50 @@ async def discord_audit_permissions(
         "channels": channels,
         "channel_count": len(channels),
     }
+
+
+async def discord_get_channel_overwrites(channel_id: int) -> dict[str, Any]:
+    """Admin/owner: read channel permission overwrites for debugging server sandboxing."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "read channel overwrites")
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "read channel overwrites", "view_channel")
+    overwrites = []
+    for target, overwrite in getattr(channel, "overwrites", {}).items():
+        overwrites.append(
+            {
+                "target": _serialize_overwrite_target(target),
+                "allow": [name for name, value in overwrite if value is True],
+                "deny": [name for name, value in overwrite if value is False],
+            }
+        )
+    return {"channel": _serialize_channel(channel), "overwrites": overwrites, "count": len(overwrites)}
+
+
+async def discord_get_audit_log(
+    guild_id: int | None = None,
+    limit: int = 10,
+    action: str | None = None,
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    """Admin/owner: read recent guild audit-log entries when the bot has view_audit_log."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "read audit log")
+    guild = await _resolve_guild(runtime, guild_id)
+    await _require_bot_guild_permission_for_guild(runtime, guild, "view_audit_log")
+    actor = await _actor_member_for_guild(runtime, guild)
+    if not _is_owner(runtime) and not _perm(getattr(actor, "guild_permissions", None), "view_audit_log"):
+        raise DiscordToolError("Current user lacks view_audit_log.")
+    method = getattr(guild, "audit_logs", None)
+    if not callable(method):
+        raise DiscordToolError("Guild runtime does not expose audit_logs().")
+    action_value = _audit_log_action(action) if action else None
+    limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_AUDIT_LOG_LIMIT", 25))
+    target_user = await _fetch_user(runtime, user_id) if user_id is not None else None
+    entries = []
+    async for entry in method(limit=limit, action=action_value, user=target_user):
+        entries.append(_serialize_audit_log_entry(entry))
+    return {"guild": _serialize_guild(guild), "entries": entries, "count": len(entries)}
 
 
 async def discord_read_channel_history(
@@ -404,6 +532,32 @@ async def discord_send_channel_message(
         sent = await _call_discord(channel.send, content, allowed_mentions=allowed_mentions)
     await _audit_action(runtime, "discord_send_channel_message", _id(sent), {"channel_id": _id(channel)})
     return {"sent": True, "message": _serialize_message(sent)}
+
+
+async def discord_send_file(
+    filename: str,
+    content: str,
+    channel_id: int | None = None,
+    message: str | None = None,
+    spoiler: bool = False,
+    allow_user_mentions: bool = False,
+) -> dict[str, Any]:
+    """Send a generated text file to a channel the requester and bot can both post attachments in."""
+    runtime = _runtime()
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "send file", "view_channel", "send_messages", "attach_files")
+    max_bytes = _env_int("DISCORD_BRAIN_TOOL_FILE_MAX_BYTES", 512_000)
+    body = content.encode("utf-8", errors="replace")[:max_bytes]
+    clean_name = _safe_filename(filename, default="discord-export.txt")
+    allowed_mentions = discord.AllowedMentions(users=allow_user_mentions, roles=False, everyone=False, replied_user=False)
+    sent = await _call_discord(
+        channel.send,
+        content=_bounded_optional(message, _env_int("DISCORD_BRAIN_TOOL_SEND_MAX_CHARS", 1900)),
+        file=discord.File(io.BytesIO(body), filename=clean_name, spoiler=bool(spoiler)),
+        allowed_mentions=allowed_mentions,
+    )
+    await _audit_action(runtime, "discord_send_file", _id(sent), {"channel_id": _id(channel), "filename": clean_name, "bytes": len(body)})
+    return {"sent": True, "message": _serialize_message(sent), "filename": clean_name, "bytes": len(body)}
 
 
 async def discord_edit_own_message(channel_id: int, message_id: int, content: str) -> dict[str, Any]:
@@ -683,6 +837,64 @@ async def discord_remove_member_role(user_id: int, role_id: int, reason: str | N
     return {"role_removed": True, "user_id": user_id, "role": _serialize_role(role)}
 
 
+async def discord_list_voice_states(guild_id: int | None = None, channel_id: int | None = None, limit: int = 100) -> dict[str, Any]:
+    """List members currently connected to voice channels the bot can inspect."""
+    runtime = _runtime()
+    guild = await _resolve_guild(runtime, guild_id)
+    limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_LIST_LIMIT", 100))
+    voice_states = []
+    for channel in _iter_guild_channels(guild, include_threads=False):
+        if channel_id is not None and _id(channel) != int(channel_id):
+            continue
+        members = list(getattr(channel, "members", None) or [])
+        if not members:
+            continue
+        perms = _permissions_for(channel, await _bot_member_for_guild(runtime, guild))
+        if not _perm(perms, "view_channel"):
+            continue
+        for member in members:
+            if len(voice_states) >= limit:
+                break
+            state = getattr(member, "voice", None)
+            voice_states.append(
+                {
+                    "channel": _serialize_channel(channel),
+                    "member": _serialize_member(member),
+                    "mute": getattr(state, "mute", None),
+                    "deaf": getattr(state, "deaf", None),
+                    "self_mute": getattr(state, "self_mute", None),
+                    "self_deaf": getattr(state, "self_deaf", None),
+                }
+            )
+    return {"guild": _serialize_guild(guild), "voice_states": voice_states, "count": len(voice_states)}
+
+
+async def discord_move_member_voice(user_id: int, channel_id: int, reason: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Move a member to another voice channel after confirmation."""
+    runtime = _runtime()
+    _require_confirm(runtime, confirm, "move_member_voice")
+    guild = _require_guild(runtime)
+    await _require_moderation(runtime, "move_members", user_id)
+    member = await _resolve_member(guild, user_id)
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "move voice member", "view_channel", "connect", "move_members")
+    await _call_discord(member.move_to, channel, reason=_bounded_optional(reason, 512))
+    await _audit_action(runtime, "discord_move_member_voice", user_id, {"channel_id": channel_id, "reason": reason})
+    return {"moved": True, "user_id": user_id, "channel": _serialize_channel(channel)}
+
+
+async def discord_disconnect_member_voice(user_id: int, reason: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Disconnect a member from voice after confirmation."""
+    runtime = _runtime()
+    _require_confirm(runtime, confirm, "disconnect_member_voice")
+    guild = _require_guild(runtime)
+    await _require_moderation(runtime, "move_members", user_id)
+    member = await _resolve_member(guild, user_id)
+    await _call_discord(member.move_to, None, reason=_bounded_optional(reason, 512))
+    await _audit_action(runtime, "discord_disconnect_member_voice", user_id, {"reason": reason})
+    return {"disconnected": True, "user_id": user_id}
+
+
 async def discord_create_text_channel(
     name: str,
     category_id: int | None = None,
@@ -915,6 +1127,114 @@ async def discord_create_invite(
         "url": getattr(invite, "url", str(invite)),
         "max_age": max_age,
         "max_uses": max_uses,
+    }
+
+
+async def discord_list_invites(guild_id: int | None = None, channel_id: int | None = None, limit: int = 100) -> dict[str, Any]:
+    """Admin/owner: list guild or channel invites when the bot has manage_guild/create_instant_invite visibility."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "list invites")
+    limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_INVITE_LIMIT", 100))
+    if channel_id is not None:
+        channel = await _resolve_channel(runtime, channel_id)
+        await _require_channel_permissions(runtime, channel, "list invites", "view_channel", "create_instant_invite")
+        method = getattr(channel, "invites", None)
+        if not callable(method):
+            raise DiscordToolError("Channel runtime does not expose invites().")
+        invites = await method()
+        guild = _guild_for_channel(runtime, channel)
+    else:
+        guild = await _resolve_guild(runtime, guild_id)
+        await _require_bot_guild_permission_for_guild(runtime, guild, "manage_guild")
+        method = getattr(guild, "invites", None)
+        if not callable(method):
+            raise DiscordToolError("Guild runtime does not expose invites().")
+        invites = await method()
+        channel = None
+    return {
+        "guild": _serialize_guild(guild) if guild is not None else None,
+        "channel": _serialize_channel(channel) if channel is not None else None,
+        "invites": [_serialize_invite(invite) for invite in list(invites)[:limit]],
+        "count": len(invites),
+    }
+
+
+async def discord_delete_invite(invite_code: str, reason: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Admin/owner: delete an invite by code after confirmation."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "delete invite")
+    _require_confirm(runtime, confirm, "delete_invite")
+    code = invite_code.strip().rsplit("/", 1)[-1]
+    if not code:
+        raise DiscordToolError("invite_code is required.")
+    fetcher = getattr(runtime.bot, "fetch_invite", None)
+    if not callable(fetcher):
+        raise DiscordToolError("Bot runtime does not expose fetch_invite().")
+    invite = await fetcher(code)
+    guild = getattr(invite, "guild", None)
+    if guild is not None:
+        await _require_bot_guild_permission_for_guild(runtime, guild, "manage_guild")
+    await _call_discord(invite.delete, reason=_bounded_optional(reason, 512))
+    await _audit_action(runtime, "discord_delete_invite", code, {"reason": reason})
+    return {"deleted": True, "code": code, "guild": _serialize_guild(guild) if guild is not None else None}
+
+
+async def discord_create_poll(
+    question: str,
+    answers: list[str],
+    channel_id: int | None = None,
+    duration_hours: int = 24,
+    multiple: bool = False,
+) -> dict[str, Any]:
+    """Create a Discord poll in a channel the requester and bot can send messages in."""
+    runtime = _runtime()
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "create poll", "view_channel", "send_messages")
+    if not hasattr(discord, "Poll"):
+        raise DiscordToolError("This discord.py build does not expose Poll support.")
+    cleaned_answers = [_bounded_text(answer.strip(), 80) for answer in answers if answer and answer.strip()]
+    if len(cleaned_answers) < 2:
+        raise DiscordToolError("Polls require at least two answers.")
+    poll = discord.Poll(_bounded_text(question.strip(), 300), timedelta(hours=_clamp(duration_hours, 1, 168)), multiple=bool(multiple))
+    for answer in cleaned_answers[:10]:
+        poll.add_answer(text=answer)
+    sent = await _call_discord(channel.send, poll=poll)
+    await _audit_action(runtime, "discord_create_poll", _id(sent), {"channel_id": _id(channel), "answers": len(cleaned_answers[:10])})
+    return {"created": True, "message": _serialize_message(sent), "poll": _serialize_poll(getattr(sent, "poll", poll))}
+
+
+async def discord_end_poll(channel_id: int, message_id: int, confirm: bool = False) -> dict[str, Any]:
+    """End a poll message after confirmation."""
+    runtime = _runtime()
+    _require_confirm(runtime, confirm, "end_poll")
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "end poll", "view_channel", "send_messages", "read_message_history")
+    message = await channel.fetch_message(message_id)
+    poll = getattr(message, "poll", None)
+    if poll is None:
+        raise DiscordToolError("Message does not contain a poll.")
+    if hasattr(message, "end_poll"):
+        updated = await _call_discord(message.end_poll)
+    else:
+        poll.end()
+        updated = await _call_discord(message.edit, poll=poll)
+    await _audit_action(runtime, "discord_end_poll", message_id, {"channel_id": channel_id})
+    return {"ended": True, "message": _serialize_message(updated or message), "poll": _serialize_poll(getattr(updated or message, "poll", poll))}
+
+
+async def discord_list_emojis_stickers(guild_id: int | None = None, limit: int = 100) -> dict[str, Any]:
+    """List guild emojis and stickers so reactions/content can use real server assets."""
+    runtime = _runtime()
+    guild = await _resolve_guild(runtime, guild_id)
+    limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_LIST_LIMIT", 100))
+    emojis = list(getattr(guild, "emojis", None) or [])[:limit]
+    stickers = list(getattr(guild, "stickers", None) or [])[:limit]
+    return {
+        "guild": _serialize_guild(guild),
+        "emojis": [_serialize_emoji(emoji) for emoji in emojis],
+        "stickers": [_serialize_sticker(sticker) for sticker in stickers],
+        "emoji_count": len(getattr(guild, "emojis", None) or []),
+        "sticker_count": len(getattr(guild, "stickers", None) or []),
     }
 
 
@@ -1210,14 +1530,20 @@ async def _require_channel_permissions(
     action: str,
     *permissions: str,
 ) -> None:
-    guild = getattr(runtime.message, "guild", None)
-    if guild is None:
-        current = getattr(runtime.message, "channel", None)
-        if _id(current) != _id(channel):
-            raise DiscordToolError("DM context can only use the current DM channel.")
+    guild = _guild_for_channel(runtime, channel) or getattr(runtime.message, "guild", None)
+    current = getattr(runtime.message, "channel", None)
+    if getattr(runtime.message, "guild", None) is None and _id(current) != _id(channel):
+        _require_owner(runtime, action)
+        bot_member = await _bot_member_for_guild(runtime, guild)
+        bot_perms = _permissions_for(channel, bot_member)
+        for permission in permissions:
+            if not _perm(bot_perms, permission):
+                raise DiscordToolError(f"Bot lacks {permission} to {action} in #{_name(channel)}.")
         return
-    actor = await _actor_member(runtime)
-    bot_member = await _bot_member(runtime)
+    if guild is None:
+        return
+    actor = await _actor_member_for_guild(runtime, guild)
+    bot_member = await _bot_member_for_guild(runtime, guild)
     actor_perms = _permissions_for(channel, actor)
     bot_perms = _permissions_for(channel, bot_member)
     owner = _is_owner(runtime)
@@ -1229,7 +1555,12 @@ async def _require_channel_permissions(
 
 
 async def _require_bot_guild_permission(runtime: DiscordToolRuntime, permission: str) -> None:
-    bot_member = await _bot_member(runtime)
+    guild = getattr(runtime.message, "guild", None)
+    await _require_bot_guild_permission_for_guild(runtime, guild, permission)
+
+
+async def _require_bot_guild_permission_for_guild(runtime: DiscordToolRuntime, guild: Any, permission: str) -> None:
+    bot_member = await _bot_member_for_guild(runtime, guild)
     bot_perms = getattr(bot_member, "guild_permissions", None)
     if not _perm(bot_perms, permission):
         raise DiscordToolError(f"Bot lacks {permission}.")
@@ -1392,6 +1723,47 @@ def _permissions_for(channel: Any, member: Any) -> Any:
     return getattr(member, "guild_permissions", None)
 
 
+def _action_requirements(action: str) -> list[str]:
+    requirements = {
+        "read": ["view_channel", "read_message_history"],
+        "read_history": ["view_channel", "read_message_history"],
+        "send": ["view_channel", "send_messages"],
+        "send_message": ["view_channel", "send_messages"],
+        "send_file": ["view_channel", "send_messages", "attach_files"],
+        "react": ["view_channel", "read_message_history", "add_reactions"],
+        "create_thread": ["view_channel", "create_public_threads"],
+        "manage_messages": ["view_channel", "read_message_history", "manage_messages"],
+        "manage_threads": ["view_channel", "manage_threads"],
+        "manage_channels": ["manage_channels"],
+        "manage_roles": ["manage_roles"],
+        "create_invite": ["view_channel", "create_instant_invite"],
+        "manage_webhooks": ["view_channel", "manage_webhooks"],
+        "audit_log": ["view_audit_log"],
+        "list_invites": ["manage_guild"],
+        "timeout_member": ["moderate_members"],
+        "kick_member": ["kick_members"],
+        "ban_member": ["ban_members"],
+        "move_voice": ["move_members"],
+        "disconnect_voice": ["move_members"],
+    }
+    if action in requirements:
+        return requirements[action]
+    if not hasattr(discord.Permissions.none(), action):
+        raise DiscordToolError(f"Unknown Discord action or permission: {action}")
+    return [action]
+
+
+def _audit_log_action(action: str) -> Any:
+    normalized = action.strip().lower()
+    audit_log_action = getattr(discord, "AuditLogAction", None)
+    if audit_log_action is None:
+        raise DiscordToolError("This discord.py build does not expose AuditLogAction.")
+    for name, value in inspect.getmembers(audit_log_action):
+        if name.lower() == normalized:
+            return value
+    raise DiscordToolError(f"Unknown audit log action: {action}")
+
+
 def _perm(permissions: Any, name: str) -> bool:
     if permissions is None:
         return False
@@ -1401,6 +1773,14 @@ def _perm(permissions: Any, name: str) -> bool:
 def _channel_is_allowed(channel: Any) -> bool:
     allowed = _csv_ints("DISCORD_BRAIN_TOOL_CHANNEL_IDS")
     return not allowed or _id(channel) in allowed
+
+
+def _safe_filename(filename: str, *, default: str) -> str:
+    value = os.path.basename((filename or default).strip()) or default
+    value = re.sub(r"[^A-Za-z0-9._ -]", "_", value).strip(" .")
+    if not value:
+        value = default
+    return value[:120]
 
 
 def _serialize_guild(guild: Any) -> dict[str, Any]:
@@ -1507,6 +1887,105 @@ def _serialize_webhook(webhook: Any) -> dict[str, Any]:
     }
 
 
+def _serialize_invite(invite: Any) -> dict[str, Any]:
+    channel = getattr(invite, "channel", None)
+    guild = getattr(invite, "guild", None)
+    inviter = getattr(invite, "inviter", None)
+    expires_at = getattr(invite, "expires_at", None)
+    created_at = getattr(invite, "created_at", None)
+    return {
+        "code": getattr(invite, "code", None),
+        "url": getattr(invite, "url", None),
+        "guild_id": _id(guild) or getattr(invite, "guild_id", None),
+        "channel_id": _id(channel) or getattr(invite, "channel_id", None),
+        "channel_name": _name(channel),
+        "inviter": _serialize_user(inviter),
+        "uses": getattr(invite, "uses", None),
+        "max_uses": getattr(invite, "max_uses", None),
+        "max_age": getattr(invite, "max_age", None),
+        "temporary": getattr(invite, "temporary", None),
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else None,
+        "expires_at": expires_at.isoformat() if hasattr(expires_at, "isoformat") else None,
+    }
+
+
+def _serialize_audit_log_entry(entry: Any) -> dict[str, Any]:
+    created_at = getattr(entry, "created_at", None)
+    action = getattr(entry, "action", None)
+    return {
+        "id": _id(entry),
+        "action": getattr(action, "name", str(action)),
+        "user": _serialize_user(getattr(entry, "user", None)),
+        "target_id": _id(getattr(entry, "target", None)),
+        "target": _name(getattr(entry, "target", None)) or str(getattr(entry, "target", ""))[:120],
+        "reason": getattr(entry, "reason", None),
+        "changes": [_serialize_audit_change(change) for change in list(getattr(entry, "changes", None) or [])[:20]],
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else None,
+    }
+
+
+def _serialize_audit_change(change: Any) -> dict[str, Any]:
+    return {
+        "attribute": getattr(change, "attribute", None),
+        "before": _bounded_text(str(getattr(change, "before", None)), 300),
+        "after": _bounded_text(str(getattr(change, "after", None)), 300),
+    }
+
+
+def _serialize_overwrite_target(target: Any) -> dict[str, Any]:
+    kind = "role" if hasattr(target, "permissions") else "member" if hasattr(target, "guild_permissions") else type(target).__name__
+    return {"id": _id(target), "name": _name(target) or str(target), "type": kind}
+
+
+def _serialize_emoji(emoji: Any) -> dict[str, Any]:
+    return {
+        "id": _id(emoji),
+        "name": _name(emoji),
+        "animated": getattr(emoji, "animated", None),
+        "available": getattr(emoji, "available", None),
+        "managed": getattr(emoji, "managed", None),
+        "require_colons": getattr(emoji, "require_colons", None),
+        "text": str(emoji),
+    }
+
+
+def _serialize_sticker(sticker: Any) -> dict[str, Any]:
+    return {
+        "id": _id(sticker),
+        "name": _name(sticker),
+        "description": getattr(sticker, "description", None),
+        "format": str(getattr(sticker, "format", "")),
+        "url": getattr(sticker, "url", None),
+    }
+
+
+def _serialize_poll(poll: Any) -> dict[str, Any] | None:
+    if poll is None:
+        return None
+    question = getattr(poll, "question", None)
+    answers = []
+    for answer in list(getattr(poll, "answers", None) or [])[:20]:
+        answers.append(
+            {
+                "id": getattr(answer, "id", None),
+                "text": getattr(getattr(answer, "media", None), "text", None) or getattr(answer, "text", None),
+                "votes": getattr(answer, "vote_count", None),
+            }
+        )
+    expires_at = getattr(poll, "expires_at", None)
+    finalized = getattr(poll, "is_finalized", None)
+    if callable(finalized):
+        finalized = finalized()
+    return {
+        "question": getattr(question, "text", None) or str(question),
+        "multiple": getattr(poll, "multiple", None),
+        "answers": answers,
+        "total_votes": getattr(poll, "total_votes", None),
+        "expires_at": expires_at.isoformat() if hasattr(expires_at, "isoformat") else None,
+        "finalized": bool(finalized),
+    }
+
+
 def _serialize_permissions(permissions: Any) -> dict[str, bool]:
     if permissions is None:
         return {}
@@ -1518,17 +1997,21 @@ def _serialize_permissions(permissions: Any) -> dict[str, bool]:
         "view_channel",
         "read_message_history",
         "send_messages",
+        "attach_files",
         "manage_messages",
         "manage_channels",
         "manage_roles",
+        "manage_guild",
         "manage_threads",
         "manage_webhooks",
+        "view_audit_log",
         "create_instant_invite",
         "add_reactions",
         "create_public_threads",
         "moderate_members",
         "kick_members",
         "ban_members",
+        "move_members",
         "connect",
         "speak",
         "use_voice_activation",

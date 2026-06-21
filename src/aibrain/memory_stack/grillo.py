@@ -654,7 +654,7 @@ class GrilloRuntime:
 
         relationship_memory: list[str] = []
         for slot in slots:
-            relationship_memory.extend(f"{slot.slot_name}: {item}" for item in slot.items[:8])
+            relationship_memory.extend(f"{slot.slot_name}: {item}" for item in _memory_slot_items(slot.items))
 
         packet = GrilloContextPacket(
             scope_key=scope_key,
@@ -703,23 +703,25 @@ class GrilloRuntime:
         for turn in turns:
             if turn.role != "user":
                 continue
-            text = _compact(turn.content, 500)
-            for candidate_type, summary, tags, confidence in _classify_memory_signal(text):
-                candidates.append(
-                    GrilloCandidate(
-                        candidate_id=str(uuid4()),
-                        scope_key=turn.scope_key,
-                        participant_key=turn.participant_key,
-                        type=candidate_type,
-                        content=text,
-                        summary=summary,
-                        confidence=confidence,
-                        tags=tags,
-                        source_turn_ids=[turn.turn_id],
+            for text in _memory_signal_fragments(turn.content):
+                if not text:
+                    continue
+                text = _compact(text, 260)
+                for candidate_type, summary, tags, confidence in _classify_memory_signal(text):
+                    candidates.append(
+                        GrilloCandidate(
+                            candidate_id=str(uuid4()),
+                            scope_key=turn.scope_key,
+                            participant_key=turn.participant_key,
+                            type=candidate_type,
+                            content=text,
+                            summary=summary,
+                            confidence=confidence,
+                            tags=tags,
+                            source_turn_ids=[turn.turn_id],
+                        )
                     )
-                )
         return _dedupe_candidates(candidates)
-
     async def _write_diary(
         self,
         scope_key: str,
@@ -825,6 +827,74 @@ class GrilloRuntime:
         )
 
 
+def _memory_signal_fragments(text: str) -> list[str]:
+    value = _clean_memory_text(text)
+    if not value:
+        return []
+    fragments: list[str] = []
+    for part in re.split(r"[\r\n]+|[;\u2022]+|\s+-\s+", value):
+        part = part.strip(" ,")
+        if not part:
+            continue
+        fragments.extend(_split_memory_part(part))
+    return _dedupe([_compact(fragment, 180) for fragment in fragments])[:10]
+
+
+def _memory_slot_items(items: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for item in items:
+        fragments = _memory_signal_fragments(str(item))
+        cleaned.extend(fragments[:3] if fragments else [_compact(_clean_memory_text(str(item)), 180)])
+    return _dedupe(cleaned)[:8]
+
+
+def _clean_memory_text(text: str) -> str:
+    value = re.sub(r"<@!?\d+>", "", text or "")
+    value = re.sub(r"@\S+", "", value)
+    value = re.sub(
+        r"\b(?:Preference signal|Durable fact signal|Relationship signal|Goal or project signal|Boundary signal|Open thread signal|Conversation thread):\s*",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(r"\bThis applies to all chats,?\s*always\b", "", value, flags=re.I)
+    value = re.sub(r"\bSome things about me:\s*", "", value, flags=re.I)
+    value = re.sub(r"\s+", " ", value).strip(" :-")
+    return value
+
+
+def _split_memory_part(text: str) -> list[str]:
+    markers = (
+        "My name is",
+        "I am",
+        "I'm",
+        "I prefer",
+        "I like",
+        "I love",
+        "I hate",
+        "I dislike",
+        "I use",
+        "I have",
+        "I work",
+        "I want",
+        "I need",
+        "Do not",
+        "Don't",
+        "Never",
+        "Stop",
+        "Remind me",
+        "Follow up",
+        "Next time",
+    )
+    pattern = r"(?=\b(?:" + "|".join(re.escape(marker) for marker in markers) + r")\b)"
+    chunks = [chunk.strip(" .,:") for chunk in re.split(pattern, text) if chunk.strip(" .,:")]
+    out: list[str] = []
+    for chunk in chunks or [text.strip(" .,:")]:
+        sentences = [item.strip(" .,:") for item in re.split(r"(?<=[.!?])\s+", chunk) if item.strip(" .,:")]
+        out.extend(sentences or [chunk])
+    return out
+
+
 def _classify_memory_signal(text: str) -> list[tuple[CandidateType, str, list[str], float]]:
     value = text.strip()
     lower = value.lower()
@@ -839,9 +909,9 @@ def _classify_memory_signal(text: str) -> list[tuple[CandidateType, str, list[st
     ]
     for candidate_type, pattern, label, tags, confidence in rules:
         if pattern.search(lower):
-            out.append((candidate_type, f"{label}: {_compact(value, 220)}", tags, confidence))
+            out.append((candidate_type, f"{label}: {_compact(value, 180)}", tags, confidence))
     if not out and len(value) >= 120:
-        out.append(("thread", f"Conversation thread: {_compact(value, 220)}", ["thread"], 0.55))
+        out.append(("thread", f"Conversation thread: {_compact(value, 180)}", ["thread"], 0.55))
     return out
 
 
