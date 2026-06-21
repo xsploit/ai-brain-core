@@ -15,7 +15,7 @@ import sys
 import wave
 from array import array
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1021,6 +1021,8 @@ class DiscordBrainBot(commands.Bot):
                 f"`{prefix} grillo export [query]` - DM your server-user GRILLO memory packet as a text file",
                 f"`{prefix} ladybug search <query>` - search scoped graph facts",
                 f"`{prefix} ladybug export <query>` - DM scoped graph facts as a text file",
+                f"`{prefix} ladybug relationships` - show GRILLO/Ladybug relationship graph status",
+                f"`{prefix} ladybug relationships export` - DM relationship graph, diary, slots, and emotion state",
                 "Mention me, DM me, or use the configured response mode for normal chat.",
             ]
             await ctx.reply("\n".join(lines), mention_author=False)
@@ -1513,6 +1515,43 @@ class DiscordBrainBot(commands.Bot):
             )
             content = _format_ladybug_export(scope=scope, query=query, facts=facts)
             await _send_text_file(ctx, "ladybug-graph-export.txt", content)
+
+        @ladybug.group(name="relationships", aliases=["relationship", "rel", "profile"], invoke_without_command=True)
+        async def ladybug_relationships(ctx: commands.Context) -> None:
+            stack = self.brain.memory_stack
+            runtime = stack.grillo if stack is not None else None
+            if stack is None or runtime is None:
+                await ctx.reply("GRILLO relationship memory is not enabled.", mention_author=False)
+                return
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
+            participant = str(ctx.author.id)
+            snapshot = await _relationship_memory_snapshot(stack, runtime, scope, participant)
+            await ctx.reply(
+                _format_relationship_graph_status(
+                    scope=scope,
+                    graph_backend=type(stack.graph_store).__name__,
+                    snapshot=snapshot,
+                )[: self.max_reply_chars],
+                mention_author=False,
+            )
+
+        @ladybug_relationships.command(name="export")
+        async def ladybug_relationships_export(ctx: commands.Context) -> None:
+            stack = self.brain.memory_stack
+            runtime = stack.grillo if stack is not None else None
+            if stack is None or runtime is None:
+                await ctx.reply("GRILLO relationship memory is not enabled.", mention_author=False)
+                return
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
+            participant = str(ctx.author.id)
+            snapshot = await _relationship_memory_snapshot(stack, runtime, scope, participant)
+            content = _format_relationship_graph_export(
+                scope=scope,
+                participant=participant,
+                graph_backend=type(stack.graph_store).__name__,
+                snapshot=snapshot,
+            )
+            await _send_text_file(ctx, "ladybug-relationship-graph-export.txt", content)
 
         self.add_command(help_command)
         self.add_command(status)
@@ -2093,6 +2132,254 @@ def _dedupe_strings(values: list[str]) -> list[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+async def _relationship_memory_snapshot(stack: Any, runtime: Any, scope: str, participant: str) -> dict[str, Any]:
+    graph_task = _export_relationship_graph(
+        stack.graph_store,
+        scope,
+        limit=_env_int("DISCORD_BRAIN_RELATIONSHIP_GRAPH_EXPORT_LIMIT", 75),
+    )
+    (
+        graph,
+        profile,
+        slots,
+        diary,
+        candidates,
+        emotion,
+        archival,
+    ) = await asyncio.gather(
+        graph_task,
+        runtime.store.get_relationship_profile(scope),
+        runtime.store.list_slots(scope, participant),
+        runtime.store.list_diary(scope, participant, limit=_env_int("DISCORD_BRAIN_RELATIONSHIP_EXPORT_DIARY", 25)),
+        runtime.store.list_candidates(scope, participant, limit=_env_int("DISCORD_BRAIN_RELATIONSHIP_EXPORT_CANDIDATES", 50)),
+        runtime.store.get_emotion_state(scope),
+        runtime.store.list_archival_memories(scope, limit=_env_int("DISCORD_BRAIN_RELATIONSHIP_EXPORT_ARCHIVAL", 25)),
+    )
+    return {
+        "graph": graph,
+        "profile": profile,
+        "slots": slots,
+        "diary": diary,
+        "candidates": candidates,
+        "emotion": emotion,
+        "archival": archival,
+    }
+
+
+async def _export_relationship_graph(graph_store: Any, scope: str, *, limit: int) -> dict[str, Any]:
+    exporter = getattr(graph_store, "export_relationship_graph", None)
+    if exporter is not None:
+        try:
+            result = exporter(scope, limit=limit)
+            if hasattr(result, "__await__"):
+                result = await result
+            return _relationship_graph_result(scope, result)
+        except Exception as exc:
+            return _relationship_graph_result(scope, {"error": f"{type(exc).__name__}: {exc}"})
+    getter = getattr(graph_store, "get_relationship_profile_graph", None)
+    if getter is not None:
+        try:
+            result = getter(scope)
+            if hasattr(result, "__await__"):
+                result = await result
+            return _relationship_graph_result(scope, {"profile": result})
+        except Exception as exc:
+            return _relationship_graph_result(scope, {"error": f"{type(exc).__name__}: {exc}"})
+    return _relationship_graph_result(scope, {})
+
+
+def _relationship_graph_result(scope: str, result: Any) -> dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    return {
+        "scope_key": str(payload.get("scope_key") or scope),
+        "profile": payload.get("profile"),
+        "relationship_facts": payload.get("relationship_facts") if isinstance(payload.get("relationship_facts"), list) else [],
+        "participants": payload.get("participants") if isinstance(payload.get("participants"), list) else [],
+        "error": str(payload.get("error") or ""),
+    }
+
+
+def _format_relationship_graph_status(*, scope: str, graph_backend: str, snapshot: dict[str, Any]) -> str:
+    graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
+    profile = snapshot.get("profile")
+    graph_profile = graph.get("profile")
+    graph_facts = graph.get("relationship_facts") or []
+    participants = graph.get("participants") or []
+    emotion = snapshot.get("emotion") if isinstance(snapshot.get("emotion"), dict) else {}
+    diary = snapshot.get("diary") if isinstance(snapshot.get("diary"), list) else []
+    lines = [
+        "Ladybug relationship graph",
+        f"scope: `{scope}`",
+        f"graph backend: `{graph_backend}`",
+        (
+            "ladybug mirror: "
+            f"profile=`{bool(graph_profile)}` relationship_facts=`{len(graph_facts)}` participants=`{len(participants)}`"
+        ),
+        (
+            "grillo store: "
+            f"profile=`{bool(profile)}` slots=`{len(snapshot.get('slots') or [])}` "
+            f"diary=`{len(diary)}` candidates=`{len(snapshot.get('candidates') or [])}` "
+            f"archival=`{len(snapshot.get('archival') or [])}`"
+        ),
+    ]
+    if graph.get("error"):
+        lines.append(f"ladybug error: `{_compact(str(graph['error']), 180)}`")
+    if profile is not None:
+        lines.append(
+            "relationship: "
+            f"`{_profile_value(profile, 'relationship_stage', 'new')}` mood=`{_profile_value(profile, 'mood', 'unknown')}` "
+            f"trust=`{_profile_value(profile, 'trust', 0)}` respect=`{_profile_value(profile, 'respect', 0)}` "
+            f"turns=`{_profile_value(profile, 'turn_count', 0)}`"
+        )
+    intensities = emotion.get("intensities") or {}
+    if intensities:
+        rendered = ", ".join(f"{name}={value}" for name, value in list(intensities.items())[:8])
+        lines.append(f"emotion: `{rendered}`")
+    if diary:
+        lines.append(f"latest diary: `{_compact(str(_profile_value(diary[0], 'summary', '')), 220)}`")
+    return "\n".join(lines)
+
+
+def _format_relationship_graph_export(
+    *,
+    scope: str,
+    participant: str,
+    graph_backend: str,
+    snapshot: dict[str, Any],
+) -> str:
+    graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
+    profile = snapshot.get("profile")
+    emotion = snapshot.get("emotion") if isinstance(snapshot.get("emotion"), dict) else {}
+    lines = [
+        "Ladybug relationship graph export",
+        f"scope: {scope}",
+        f"participant: {participant}",
+        f"graph backend: {graph_backend}",
+        "",
+        "== Ladybug Mirror ==",
+        f"error: {graph.get('error') or ''}",
+        "profile:",
+        _json_dump(_public_dict(graph.get("profile"))),
+        "relationship_facts:",
+    ]
+    graph_facts = graph.get("relationship_facts") or []
+    if graph_facts:
+        lines.extend(f"- {_compact(str(_profile_value(fact, 'text', fact)), 800)}" for fact in graph_facts)
+    else:
+        lines.append("(none)")
+    lines.extend(["participants:"])
+    participants = graph.get("participants") or []
+    if participants:
+        lines.extend(f"- {_json_dump(_public_dict(participant_row))}" for participant_row in participants)
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "== GRILLO Relationship Profile =="])
+    if profile is not None:
+        profile_dict = _public_dict(profile)
+        lines.extend(
+            [
+                f"profile_id: {profile_dict.get('profile_id', '')}",
+                f"stage: {profile_dict.get('relationship_stage', '')}",
+                f"mood: {profile_dict.get('mood', '')}",
+                f"trust: {profile_dict.get('trust', '')}",
+                f"attraction: {profile_dict.get('attraction', '')}",
+                f"respect: {profile_dict.get('respect', '')}",
+                f"irritation: {profile_dict.get('irritation', '')}",
+                f"jealousy: {profile_dict.get('jealousy', '')}",
+                f"guard: {profile_dict.get('guard', '')}",
+                f"turn_count: {profile_dict.get('turn_count', '')}",
+                f"last_seen_at: {profile_dict.get('last_seen_at', '')}",
+                f"summary: {profile_dict.get('summary', '')}",
+                f"diary_entry: {profile_dict.get('diary_entry', '')}",
+                "facts:",
+            ]
+        )
+        facts = profile_dict.get("facts") or []
+        lines.extend(f"- {fact}" for fact in facts) if facts else lines.append("(none)")
+        for name in ("tone_preferences", "interaction_style", "boundaries", "active_threads"):
+            values = profile_dict.get(name) or []
+            lines.append(f"{name}:")
+            lines.extend(f"- {value}" for value in values) if values else lines.append("(none)")
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "== Emotion State ==", _json_dump(emotion), "", "== Slots =="])
+    slots = snapshot.get("slots") if isinstance(snapshot.get("slots"), list) else []
+    if slots:
+        for slot in slots:
+            lines.append(f"{_profile_value(slot, 'slot_name', '')}:")
+            items = _profile_value(slot, "items", []) or []
+            lines.extend(f"- {item}" for item in items) if items else lines.append("(empty)")
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "== Diary =="])
+    diary = snapshot.get("diary") if isinstance(snapshot.get("diary"), list) else []
+    if diary:
+        for entry in diary:
+            lines.extend(
+                [
+                    f"- {_profile_value(entry, 'created_at', '')} [{_profile_value(entry, 'beat_type', '')}]",
+                    f"  summary: {_profile_value(entry, 'summary', '')}",
+                    f"  thought: {_profile_value(entry, 'personal_thought', '')}",
+                ]
+            )
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "== Candidates =="])
+    candidates = snapshot.get("candidates") if isinstance(snapshot.get("candidates"), list) else []
+    if candidates:
+        for candidate in candidates:
+            lines.extend(
+                [
+                    (
+                        f"- {_profile_value(candidate, 'created_at', '')} "
+                        f"[{_profile_value(candidate, 'type', '')}] "
+                        f"score={_profile_value(candidate, 'confidence', 0)} "
+                        f"promoted={_profile_value(candidate, 'promoted', False)}"
+                    ),
+                    f"  {_profile_value(candidate, 'summary', '')}",
+                ]
+            )
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "== Archival Memory =="])
+    archival = snapshot.get("archival") if isinstance(snapshot.get("archival"), list) else []
+    if archival:
+        lines.extend(
+            f"- {item.get('created_at', '')}: {item.get('text', '')}"
+            for item in archival
+            if isinstance(item, dict)
+        )
+    else:
+        lines.append("(none)")
+    return "\n".join(lines)
+
+
+def _public_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if is_dataclass(value):
+        return asdict(value)
+    raw = getattr(value, "__dict__", None)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _profile_value(value: Any, key: str, default: Any = "") -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, indent=2, default=str)
 
 
 def _format_ladybug_export(*, scope: str, query: str, facts: list[Any]) -> str:

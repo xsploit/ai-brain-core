@@ -324,6 +324,51 @@ class LadybugGraphMemoryStore:
                 return profile if isinstance(profile, dict) else dict(profile)
         return None
 
+    async def export_relationship_graph(self, scope_key: str, *, limit: int = 50) -> dict[str, Any]:
+        return await asyncio.to_thread(self._export_relationship_graph_sync, scope_key, limit)
+
+    def _export_relationship_graph_sync(self, scope_key: str, limit: int) -> dict[str, Any]:
+        bounded_limit = max(1, min(int(limit), 200))
+        profile = self._get_relationship_profile_graph_sync(scope_key)
+        facts = self._query_nodes(
+            """
+            MATCH (f:RelationshipFact)
+            WHERE f.scope_key = $scope_key
+            RETURN f
+            ORDER BY f.updated_at DESC
+            LIMIT $limit
+            """,
+            {"scope_key": scope_key, "limit": bounded_limit},
+            "f",
+        )
+        participants = self._query_nodes(
+            """
+            MATCH (p:RelationshipProfile)-[:RELATIONSHIP_WITH_PARTICIPANT]->(participant:Participant)
+            WHERE p.scope_key = $scope_key
+            RETURN participant
+            LIMIT $limit
+            """,
+            {"scope_key": scope_key, "limit": bounded_limit},
+            "participant",
+        )
+        return {
+            "scope_key": scope_key,
+            "profile": profile,
+            "relationship_facts": facts,
+            "participants": participants,
+        }
+
+    def _query_nodes(self, cypher: str, params: dict[str, Any], key: str) -> list[dict[str, Any]]:
+        result = self.conn.execute(cypher, params).rows_as_dict()
+        rows: list[dict[str, Any]] = []
+        while result.has_next():
+            row = result.get_next()
+            if not isinstance(row, dict):
+                continue
+            value = row.get(key, row)
+            rows.append(value if isinstance(value, dict) else dict(value))
+        return rows
+
     def close(self) -> None:
         close = getattr(self.conn, "close", None)
         if close:

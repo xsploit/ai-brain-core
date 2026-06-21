@@ -17,6 +17,8 @@ from aibrain.discord_bot import (
     _format_summary_transcript,
     _format_tavily_search_result,
     _format_grillo_export,
+    _format_relationship_graph_export,
+    _format_relationship_graph_status,
     _grillo_scope_for_message,
     _message_text,
     _model_choice_description,
@@ -1045,6 +1047,76 @@ def test_grillo_export_uses_current_record_fields():
     assert "[preference]" in content
     assert "[user] Subsect" in content
     assert "prefers exports" in content
+
+
+def test_relationship_graph_status_and_export_include_grillo_and_ladybug_sections():
+    snapshot = {
+        "graph": {
+            "profile": {"relationship_stage": "familiar"},
+            "relationship_facts": [{"text": "Subsect likes graph visibility."}],
+            "participants": [{"id": "123", "login": "subsect"}],
+            "error": "",
+        },
+        "profile": SimpleNamespace(
+            profile_id="relationship:123",
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            attraction=2,
+            respect=8,
+            irritation=1,
+            jealousy=0,
+            guard=9,
+            turn_count=42,
+            last_seen_at="2026-06-21T12:00:00+00:00",
+            summary="Subsect wants memory receipts.",
+            diary_entry="I should show my receipts.",
+            facts=["Subsect wants relationship graph export."],
+            tone_preferences=["direct"],
+            interaction_style=["fast"],
+            boundaries=[],
+            active_threads=["memory debugging"],
+        ),
+        "slots": [SimpleNamespace(slot_name="relationship_state", items=["trust is high"])],
+        "diary": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:01:00+00:00",
+                beat_type="relationship",
+                summary="Memory visibility improved.",
+                personal_thought="This makes the graph inspectable.",
+            )
+        ],
+        "candidates": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:02:00+00:00",
+                type="preference",
+                confidence=0.9,
+                promoted=True,
+                summary="User wants graph receipts.",
+            )
+        ],
+        "emotion": {"intensities": {"focus": 0.8}, "updated_at": "2026-06-21T12:03:00+00:00"},
+        "archival": [{"created_at": "2026-06-21T12:04:00+00:00", "text": "archive note"}],
+    }
+
+    status = _format_relationship_graph_status(
+        scope="discord:dm:123:persona:neuro-sama",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+    export = _format_relationship_graph_export(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+
+    assert "relationship_facts=`1`" in status
+    assert "emotion: `focus=0.8`" in status
+    assert "== Ladybug Mirror ==" in export
+    assert "== GRILLO Relationship Profile ==" in export
+    assert "Subsect wants relationship graph export." in export
+    assert "trust is high" in export
 
 
 def test_scoped_ladybug_facts_filter_by_raw_event_scope(monkeypatch):

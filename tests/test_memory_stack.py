@@ -755,6 +755,13 @@ async def test_ladybug_adapter_smoke_when_installed(tmp_path):
     assert profile is not None
     assert profile["relationship_stage"] == "familiar"
     assert profile["mood"] == "focused"
+    relationship_export = await graph.export_relationship_graph("discord:guild:persona:neuro")
+
+    assert relationship_export["profile"]["relationship_stage"] == "familiar"
+    assert [fact["text"] for fact in relationship_export["relationship_facts"]] == [
+        "LO expects GRILLO relationship memory."
+    ]
+    assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:lo"]
 
 
 @pytest.mark.asyncio
