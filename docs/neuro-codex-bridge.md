@@ -126,6 +126,7 @@ Current subsystems already present:
 - Model list, model switching, and metadata export for admin/owner use.
 - Bot pause/resume, bot-to-bot response toggle, and heartbeat controls.
 - Letta-style heartbeat autonomy can choose from a bounded action menu: channel message, owner DM, allowlisted user DM, Codex bridge queue, or noop.
+- Owner Discord turns expose `discord_queue_codex_request` so Neuro can hand off concrete self-upgrade/debug/review tasks to Codex without raw shell access.
 
 ## Authority Model
 

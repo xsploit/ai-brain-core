@@ -12,10 +12,13 @@ from typing import Any
 
 import discord
 
+from .codex_bridge import CodexBridgeQueue
+
 
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
 
 OWNER_ONLY_TOOL_NAMES = [
+    "discord_queue_codex_request",
     "discord_list_bot_guilds",
     "discord_get_application_info",
     "discord_create_text_channel",
@@ -34,6 +37,7 @@ OWNER_ONLY_TOOL_NAMES = [
 
 DISCORD_AGENT_TOOL_NAMES = [
     "discord_get_capabilities",
+    "discord_queue_codex_request",
     "discord_list_bot_guilds",
     "discord_get_guild",
     "discord_get_bot_user",
@@ -76,7 +80,7 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_list_voice_states",
     "discord_move_member_voice",
     "discord_disconnect_member_voice",
-    *OWNER_ONLY_TOOL_NAMES[2:],
+    *OWNER_ONLY_TOOL_NAMES[3:],
     "discord_list_invites",
     "discord_delete_invite",
     "discord_create_poll",
@@ -123,6 +127,60 @@ async def discord_get_capabilities() -> dict[str, Any]:
             "send_chars": _env_int("DISCORD_BRAIN_TOOL_SEND_MAX_CHARS", 1900),
             "list_items": _env_int("DISCORD_BRAIN_TOOL_LIST_LIMIT", 100),
         },
+    }
+
+
+async def discord_queue_codex_request(prompt: str, route: str = "codex") -> dict[str, Any]:
+    """Owner-only: queue a bounded Codex bridge request for Neuro self-upgrades, bugfixes, or reviews."""
+    runtime = _runtime()
+    _require_owner(runtime, "queue Codex bridge request")
+    prompt = _bounded_text(prompt, _env_int("DISCORD_BRAIN_CODEX_BRIDGE_PROMPT_MAX_CHARS", 6000))
+    if not prompt:
+        raise DiscordToolError("prompt is required.")
+    route = str(route or "codex").strip().lower()
+    if route not in {"codex", "harness"}:
+        raise DiscordToolError("route must be codex or harness.")
+    queue = getattr(runtime.bot, "codex_bridge", None) or CodexBridgeQueue.from_env()
+    if not queue.enabled:
+        raise DiscordToolError("Codex bridge is disabled. Set DISCORD_BRAIN_CODEX_BRIDGE_ENABLED=true.")
+    if queue.is_paused():
+        raise DiscordToolError("Codex bridge queue is paused.")
+
+    message = runtime.message
+    author = getattr(message, "author", None)
+    guild = getattr(message, "guild", None)
+    channel = getattr(message, "channel", None)
+    recent_messages: list[dict[str, Any]] = []
+    context_builder = getattr(runtime.bot, "_context_for_message", None)
+    if callable(context_builder):
+        with contextlib.suppress(Exception):
+            context = context_builder(message)
+            recent = context.get("recent_messages") if isinstance(context, dict) else None
+            if isinstance(recent, list):
+                recent_messages = recent[-8:]
+
+    delivery_mode = "harness_brain" if route == "harness" else "thread_heartbeat"
+    path = queue.enqueue(
+        requester_id=_id(author) or "unknown",
+        requester_name=_name(author) or "unknown",
+        guild_id=_id(guild),
+        channel_id=_id(channel),
+        message_id=_id(message),
+        prompt=prompt,
+        intent="harness" if route == "harness" else "ask_codex",
+        authority_mode="manual_owner",
+        authority_reason="owner Discord turn authorized Neuro Codex tool request",
+        delivery_mode=delivery_mode,
+        recent_messages=recent_messages,
+        harness_agent="claude",
+        harness_permission_profile="inspect",
+    )
+    return {
+        "queued": True,
+        "file": path.name,
+        "delivery_mode": delivery_mode,
+        "queue_root": str(queue.root),
+        "message": "Queued one Codex bridge request. Codex will process one queued request on the next bridge checkpoint.",
     }
 
 

@@ -20,6 +20,7 @@ from aibrain.discord_tools import (
     discord_list_bot_guilds,
     discord_list_members,
     discord_list_voice_states,
+    discord_queue_codex_request,
     discord_read_channel_history,
     discord_send_channel_message,
     discord_send_file,
@@ -27,6 +28,7 @@ from aibrain.discord_tools import (
     discord_timeout_member,
     register_discord_tools,
 )
+from aibrain.codex_bridge import CodexBridgeQueue
 from aibrain.tools import ToolRegistry
 
 
@@ -229,6 +231,7 @@ def test_register_discord_tools_exposes_agentic_suite():
     register_discord_tools(registry)
 
     assert set(DISCORD_AGENT_TOOL_NAMES).issubset(registry._tools)
+    assert "discord_queue_codex_request" in registry._tools
     assert "discord_list_bot_guilds" in registry._tools
     assert "discord_create_text_channel" in registry._tools
     assert "discord_get_capabilities" in registry._tools
@@ -363,6 +366,36 @@ def test_bot_guild_list_is_owner_only(monkeypatch):
         result = asyncio.run(discord_list_bot_guilds())
 
         assert result["guilds"][0]["id"] == ctx.guild.id
+
+
+def test_codex_queue_request_is_owner_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "999")
+    with _tool_context() as ctx:
+        ctx.runtime_bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True)
+
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_queue_codex_request("add a feature"))
+
+
+def test_codex_queue_request_writes_bridge_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context() as ctx:
+        ctx.runtime_bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")
+        ctx.runtime_bot._context_for_message = lambda message: {
+            "recent_messages": [{"author": "actor", "content": "please upgrade yourself"}]
+        }
+
+        result = asyncio.run(discord_queue_codex_request("add a better status panel", route="codex"))
+
+        files = ctx.runtime_bot.codex_bridge.pending_files()
+        assert result["queued"] is True
+        assert result["delivery_mode"] == "thread_heartbeat"
+        assert result["file"] == files[0].name
+        payload = files[0].read_text(encoding="utf-8")
+        assert '"authority"' in payload
+        assert '"mode": "manual_owner"' in payload
+        assert "add a better status panel" in payload
+        assert "please upgrade yourself" in payload
 
 
 def test_list_members_requires_admin_or_owner_and_members_intent():
