@@ -110,6 +110,36 @@ class GrilloSlot:
 
 
 @dataclass(slots=True)
+class GrilloRelationshipProfile:
+    profile_id: str
+    scope_key: str
+    persona_id: str = "unknown"
+    participant_keys: list[str] = field(default_factory=list)
+    relationship_stage: str = "new"
+    mood: str = "guarded"
+    trust: int = 4
+    attraction: int = 1
+    respect: int = 4
+    irritation: int = 1
+    jealousy: int = 0
+    guard: int = 16
+    turn_count: int = 0
+    last_seen_at: str | None = None
+    last_diary_turn_count: int = 0
+    last_action_tag: str = "none"
+    facts: list[str] = field(default_factory=list)
+    summary: str = ""
+    diary_entry: str = ""
+    diary_history: list[str] = field(default_factory=list)
+    affect_state: dict[str, Any] = field(default_factory=dict)
+    tone_preferences: list[str] = field(default_factory=list)
+    interaction_style: list[str] = field(default_factory=list)
+    boundaries: list[str] = field(default_factory=list)
+    active_threads: list[str] = field(default_factory=list)
+    updated_at: str | None = None
+
+
+@dataclass(slots=True)
 class GrilloContextPacket:
     scope_key: str
     participant_key: str
@@ -236,6 +266,35 @@ class SQLiteGrilloStore:
                     source_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL,
                     UNIQUE(scope_key, participant_key, slot_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS grillo_relationship_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL UNIQUE,
+                    persona_id TEXT NOT NULL,
+                    participant_keys_json TEXT NOT NULL DEFAULT '[]',
+                    relationship_stage TEXT NOT NULL,
+                    mood TEXT NOT NULL,
+                    trust INTEGER NOT NULL,
+                    attraction INTEGER NOT NULL,
+                    respect INTEGER NOT NULL,
+                    irritation INTEGER NOT NULL,
+                    jealousy INTEGER NOT NULL,
+                    guard INTEGER NOT NULL,
+                    turn_count INTEGER NOT NULL,
+                    last_seen_at TEXT,
+                    last_diary_turn_count INTEGER NOT NULL,
+                    last_action_tag TEXT NOT NULL,
+                    facts_json TEXT NOT NULL DEFAULT '[]',
+                    summary TEXT NOT NULL,
+                    diary_entry TEXT NOT NULL,
+                    diary_history_json TEXT NOT NULL DEFAULT '[]',
+                    affect_state_json TEXT NOT NULL DEFAULT '{}',
+                    tone_preferences_json TEXT NOT NULL DEFAULT '[]',
+                    interaction_style_json TEXT NOT NULL DEFAULT '[]',
+                    boundaries_json TEXT NOT NULL DEFAULT '[]',
+                    active_threads_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS grillo_activity (
@@ -464,6 +523,79 @@ class SQLiteGrilloStore:
             ).fetchall()
         return [_row_to_slot(row) for row in rows]
 
+    async def upsert_relationship_profile(
+        self,
+        profile: GrilloRelationshipProfile,
+    ) -> GrilloRelationshipProfile:
+        if not profile.updated_at:
+            profile.updated_at = utc_now()
+        await asyncio.to_thread(self._upsert_relationship_profile_sync, profile)
+        return profile
+
+    def _upsert_relationship_profile_sync(self, profile: GrilloRelationshipProfile) -> None:
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT INTO grillo_relationship_profiles (
+                    profile_id, scope_key, persona_id, participant_keys_json,
+                    relationship_stage, mood, trust, attraction, respect, irritation,
+                    jealousy, guard, turn_count, last_seen_at, last_diary_turn_count,
+                    last_action_tag, facts_json, summary, diary_entry, diary_history_json,
+                    affect_state_json, tone_preferences_json, interaction_style_json,
+                    boundaries_json, active_threads_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    persona_id = excluded.persona_id,
+                    participant_keys_json = excluded.participant_keys_json,
+                    relationship_stage = excluded.relationship_stage,
+                    mood = excluded.mood,
+                    trust = excluded.trust,
+                    attraction = excluded.attraction,
+                    respect = excluded.respect,
+                    irritation = excluded.irritation,
+                    jealousy = excluded.jealousy,
+                    guard = excluded.guard,
+                    turn_count = excluded.turn_count,
+                    last_seen_at = excluded.last_seen_at,
+                    last_diary_turn_count = excluded.last_diary_turn_count,
+                    last_action_tag = excluded.last_action_tag,
+                    facts_json = excluded.facts_json,
+                    summary = excluded.summary,
+                    diary_entry = excluded.diary_entry,
+                    diary_history_json = excluded.diary_history_json,
+                    affect_state_json = excluded.affect_state_json,
+                    tone_preferences_json = excluded.tone_preferences_json,
+                    interaction_style_json = excluded.interaction_style_json,
+                    boundaries_json = excluded.boundaries_json,
+                    active_threads_json = excluded.active_threads_json,
+                    updated_at = excluded.updated_at
+                """,
+                _relationship_profile_params(profile),
+            )
+
+    async def get_relationship_profile(self, scope_key: str) -> GrilloRelationshipProfile | None:
+        return await asyncio.to_thread(self._get_relationship_profile_sync, scope_key)
+
+    def _get_relationship_profile_sync(self, scope_key: str) -> GrilloRelationshipProfile | None:
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT * FROM grillo_relationship_profiles WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+        return _row_to_relationship_profile(row) if row else None
+
+    async def list_relationship_profiles(self, limit: int = 50) -> list[GrilloRelationshipProfile]:
+        return await asyncio.to_thread(self._list_relationship_profiles_sync, limit)
+
+    def _list_relationship_profiles_sync(self, limit: int) -> list[GrilloRelationshipProfile]:
+        with self._lock:
+            rows = self._connect().execute(
+                "SELECT * FROM grillo_relationship_profiles ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_relationship_profile(row) for row in rows]
+
     async def append_activity(
         self,
         *,
@@ -532,12 +664,14 @@ class GrilloRuntime:
         *,
         store: SQLiteGrilloStore,
         vector_store: VectorRecallStore | None = None,
+        relationship_graph_store: Any | None = None,
         reflector: GrilloReflector | None = None,
         auto_promote_threshold: float = 0.7,
         max_slot_items: int = 24,
     ):
         self.store = store
         self.vector_store = vector_store
+        self.relationship_graph_store = relationship_graph_store
         self.reflector = reflector
         self.auto_promote_threshold = auto_promote_threshold
         self.max_slot_items = max_slot_items
@@ -709,10 +843,11 @@ class GrilloRuntime:
         beat_type: str,
         turns: list[GrilloTurn],
     ) -> dict[str, Any]:
-        slots, diary, candidates = await asyncio.gather(
+        slots, diary, candidates, relationship_profile = await asyncio.gather(
             self.store.list_slots(scope_key, participant_key),
             self.store.list_diary(scope_key, participant_key, limit=6),
             self.store.list_candidates(scope_key, participant_key, limit=12),
+            self.store.get_relationship_profile(scope_key),
         )
         return {
             "scope_key": scope_key,
@@ -723,6 +858,11 @@ class GrilloRuntime:
             "memory_slots": [_slot_to_reflection_dict(slot) for slot in slots],
             "recent_diary": [_diary_to_reflection_dict(entry) for entry in diary],
             "recent_candidates": [_candidate_to_reflection_dict(candidate) for candidate in candidates],
+            "relationship_profile": (
+                _relationship_profile_to_reflection_dict(relationship_profile)
+                if relationship_profile is not None
+                else None
+            ),
         }
 
     async def _apply_reflection(
@@ -765,8 +905,55 @@ class GrilloRuntime:
             updates=_as_list(reflection.get("slots")),
             candidates=stored_candidates,
         )
+        await self._apply_relationship_updates(
+            scope_key=scope_key,
+            participant_key=participant_key,
+            reflection=reflection,
+            turns=turns,
+            diary=stored_diary,
+        )
         promoted = await self._promote_candidates(scope_key, participant_key, stored_candidates)
         return stored_candidates, stored_diary, _dedupe_slots([*explicit_slots, *promoted])
+
+    async def _apply_relationship_updates(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        reflection: dict[str, Any],
+        turns: list[GrilloTurn],
+        diary: GrilloDiaryEntry | None,
+    ) -> GrilloRelationshipProfile | None:
+        profile_patch = reflection.get("relationship_profile") or reflection.get("relationship")
+        patches = _as_list(reflection.get("profile_patches"))
+        if not isinstance(profile_patch, dict) and not patches:
+            return None
+        existing = await self.store.get_relationship_profile(scope_key)
+        profile = existing or _default_relationship_profile(scope_key, participant_key)
+        profile.participant_keys = _dedupe([*profile.participant_keys, participant_key])
+        profile.turn_count = max(profile.turn_count, len(turns))
+        profile.last_seen_at = turns[-1].created_at if turns else utc_now()
+        if isinstance(profile_patch, dict):
+            _merge_relationship_profile(profile, profile_patch)
+        for raw_patch in patches:
+            _apply_profile_patch(profile, raw_patch)
+        if diary is not None:
+            profile.diary_entry = diary.personal_thought
+            profile.diary_history = _dedupe([*profile.diary_history, diary.personal_thought])[-24:]
+            profile.last_diary_turn_count = profile.turn_count
+        profile.updated_at = utc_now()
+        stored = await self.store.upsert_relationship_profile(profile)
+        await self._sync_relationship_profile_graph(stored)
+        return stored
+
+    async def _sync_relationship_profile_graph(self, profile: GrilloRelationshipProfile) -> None:
+        target = self.relationship_graph_store
+        sync = getattr(target, "upsert_relationship_profile", None) if target is not None else None
+        if sync is None:
+            return
+        result = sync(profile)
+        if hasattr(result, "__await__"):
+            await result
 
     async def _apply_slot_updates(
         self,
@@ -826,11 +1013,12 @@ class GrilloRuntime:
         persona_name: str = "assistant",
         top_k: int = 5,
     ) -> GrilloContextPacket:
-        turns, slots, diary, candidates = await asyncio.gather(
+        turns, slots, diary, candidates, relationship_profile = await asyncio.gather(
             self.store.list_turns(scope_key, participant_key, limit=10),
             self.store.list_slots(scope_key, participant_key),
             self.store.list_diary(scope_key, participant_key, limit=4),
             self.store.list_candidates(scope_key, participant_key, limit=8),
+            self.store.get_relationship_profile(scope_key),
         )
         recalled: list[dict[str, Any]] = []
         if self.vector_store is not None and (query or current_turn_text).strip():
@@ -847,6 +1035,8 @@ class GrilloRuntime:
             ]
 
         relationship_memory: list[str] = []
+        if relationship_profile is not None:
+            relationship_memory.extend(_format_relationship_profile(relationship_profile))
         for slot in slots:
             relationship_memory.extend(f"{slot.slot_name}: {item}" for item in _memory_slot_items(slot.items))
 
@@ -1159,6 +1349,24 @@ def _format_turn(turn: GrilloTurn) -> str:
     return f"{author} ({turn.role}): {_compact(turn.content, 360)}"
 
 
+def _format_relationship_profile(profile: GrilloRelationshipProfile) -> list[str]:
+    items = [
+        f"stage={profile.relationship_stage or 'new'} mood={profile.mood or 'guarded'}",
+        (
+            "scores="
+            f"trust:{profile.trust} respect:{profile.respect} attraction:{profile.attraction} "
+            f"irritation:{profile.irritation} jealousy:{profile.jealousy} guard:{profile.guard}"
+        ),
+        f"summary={profile.summary}" if profile.summary else "",
+        f"known_facts={json.dumps(profile.facts[-12:])}" if profile.facts else "",
+        f"tone_preferences={json.dumps(profile.tone_preferences[-8:])}" if profile.tone_preferences else "",
+        f"interaction_style={json.dumps(profile.interaction_style[-8:])}" if profile.interaction_style else "",
+        f"boundaries={json.dumps(profile.boundaries[-8:])}" if profile.boundaries else "",
+        f"active_threads={json.dumps(profile.active_threads[-8:])}" if profile.active_threads else "",
+    ]
+    return [item for item in items if item]
+
+
 def _turn_to_reflection_dict(turn: GrilloTurn) -> dict[str, Any]:
     return {
         "turn_id": turn.turn_id,
@@ -1200,6 +1408,120 @@ def _candidate_to_reflection_dict(candidate: GrilloCandidate) -> dict[str, Any]:
         "promoted": candidate.promoted,
         "created_at": candidate.created_at,
     }
+
+
+def _relationship_profile_to_reflection_dict(profile: GrilloRelationshipProfile) -> dict[str, Any]:
+    return {
+        "profile_id": profile.profile_id,
+        "scope_key": profile.scope_key,
+        "persona_id": profile.persona_id,
+        "participant_keys": profile.participant_keys,
+        "relationship_stage": profile.relationship_stage,
+        "mood": profile.mood,
+        "trust": profile.trust,
+        "attraction": profile.attraction,
+        "respect": profile.respect,
+        "irritation": profile.irritation,
+        "jealousy": profile.jealousy,
+        "guard": profile.guard,
+        "turn_count": profile.turn_count,
+        "last_seen_at": profile.last_seen_at,
+        "last_diary_turn_count": profile.last_diary_turn_count,
+        "last_action_tag": profile.last_action_tag,
+        "facts": profile.facts[-12:],
+        "summary": profile.summary,
+        "diary_entry": profile.diary_entry,
+        "diary_history": profile.diary_history[-8:],
+        "affect_state": profile.affect_state,
+        "tone_preferences": profile.tone_preferences,
+        "interaction_style": profile.interaction_style,
+        "boundaries": profile.boundaries,
+        "active_threads": profile.active_threads,
+        "updated_at": profile.updated_at,
+    }
+
+
+def _default_relationship_profile(scope_key: str, participant_key: str) -> GrilloRelationshipProfile:
+    return GrilloRelationshipProfile(
+        profile_id=f"relationship:{scope_key}",
+        scope_key=scope_key,
+        persona_id=_parse_scope_persona_id(scope_key),
+        participant_keys=[participant_key] if participant_key else [],
+        affect_state={
+            "arousal": 0.18,
+            "dominance": 0,
+            "label": "guarded",
+            "lastEmotion": "neutral",
+            "updatedAt": None,
+            "valence": 0,
+        },
+    )
+
+
+def _merge_relationship_profile(profile: GrilloRelationshipProfile, raw: dict[str, Any]) -> None:
+    text_fields = {
+        "relationship_stage": ("relationship_stage", "relationshipStage", "stage"),
+        "mood": ("mood",),
+        "last_action_tag": ("last_action_tag", "lastActionTag", "actionTag"),
+        "summary": ("summary",),
+        "diary_entry": ("diary_entry", "diaryEntry", "rikoDiaryEntry"),
+    }
+    for attr, keys in text_fields.items():
+        value = _first_present(raw, keys)
+        if value is not None:
+            setattr(profile, attr, _compact(str(value), 800 if attr in {"summary", "diary_entry"} else 120))
+    int_fields = {
+        "trust": ("trust",),
+        "attraction": ("attraction",),
+        "respect": ("respect",),
+        "irritation": ("irritation",),
+        "jealousy": ("jealousy",),
+        "guard": ("guard",),
+        "turn_count": ("turn_count", "turnCount"),
+        "last_diary_turn_count": ("last_diary_turn_count", "lastDiaryTurnCount"),
+    }
+    for attr, keys in int_fields.items():
+        value = _first_present(raw, keys)
+        if value is not None:
+            setattr(profile, attr, _clamp_int(value, 0, 10_000 if attr.endswith("count") else 100, getattr(profile, attr)))
+    delta_fields = {
+        "trust": ("trustDelta", "trust_delta"),
+        "attraction": ("attractionDelta", "attraction_delta"),
+        "respect": ("respectDelta", "respect_delta"),
+        "irritation": ("irritationDelta", "irritation_delta"),
+        "jealousy": ("jealousyDelta", "jealousy_delta"),
+        "guard": ("guardDelta", "guard_delta"),
+    }
+    for attr, keys in delta_fields.items():
+        value = _first_present(raw, keys)
+        if value is not None:
+            setattr(profile, attr, _clamp_int(getattr(profile, attr) + safe_float(value, 0), 0, 100, getattr(profile, attr)))
+    facts = _string_list(_first_present(raw, ("facts", "storedFacts")))
+    if facts:
+        profile.facts = _dedupe([*profile.facts, *[_compact(fact, 260) for fact in facts]])[-80:]
+    for attr in ("tone_preferences", "interaction_style", "boundaries", "active_threads"):
+        values = _string_list(_first_present(raw, (attr, _camel(attr))))
+        if values:
+            setattr(profile, attr, _dedupe([*getattr(profile, attr), *values])[-40:])
+    affect_state = _first_present(raw, ("affect_state", "affectState"))
+    if isinstance(affect_state, dict):
+        profile.affect_state = {**profile.affect_state, **affect_state}
+
+
+def _apply_profile_patch(profile: GrilloRelationshipProfile, raw: Any) -> None:
+    if not isinstance(raw, dict):
+        return
+    field = str(raw.get("field") or "").strip()
+    if field not in {"tone_preferences", "interaction_style", "boundaries", "active_threads"}:
+        return
+    value = _compact(str(raw.get("value") or "").strip(), 260)
+    if not value:
+        return
+    current = list(getattr(profile, field))
+    if str(raw.get("operation") or "add").strip().lower() == "remove":
+        setattr(profile, field, [item for item in current if item != value])
+    else:
+        setattr(profile, field, _dedupe([*current, value])[-40:])
 
 
 def _candidate_from_reflection(
@@ -1319,6 +1641,31 @@ def _string_list(value: Any) -> list[str]:
     return out
 
 
+def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in raw:
+            return raw[key]
+    return None
+
+
+def _clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
+    parsed = int(round(safe_float(value, fallback)))
+    return max(minimum, min(maximum, parsed))
+
+
+def _camel(value: str) -> str:
+    parts = value.split("_")
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+def _parse_scope_persona_id(scope_key: str) -> str:
+    parts = scope_key.split(":")
+    if "persona" not in parts:
+        return "unknown"
+    index = parts.index("persona")
+    return ":".join(parts[index + 1 :]) or "unknown"
+
+
 def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
@@ -1343,6 +1690,45 @@ def _json_list(value: str) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item).strip()]
+
+
+def _json_obj(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _relationship_profile_params(profile: GrilloRelationshipProfile) -> tuple[Any, ...]:
+    return (
+        profile.profile_id,
+        profile.scope_key,
+        profile.persona_id,
+        json.dumps(profile.participant_keys),
+        profile.relationship_stage,
+        profile.mood,
+        profile.trust,
+        profile.attraction,
+        profile.respect,
+        profile.irritation,
+        profile.jealousy,
+        profile.guard,
+        profile.turn_count,
+        profile.last_seen_at,
+        profile.last_diary_turn_count,
+        profile.last_action_tag,
+        json.dumps(profile.facts),
+        profile.summary,
+        profile.diary_entry,
+        json.dumps(profile.diary_history),
+        json.dumps(profile.affect_state),
+        json.dumps(profile.tone_preferences),
+        json.dumps(profile.interaction_style),
+        json.dumps(profile.boundaries),
+        json.dumps(profile.active_threads),
+        profile.updated_at,
+    )
 
 
 def _row_to_turn(row: sqlite3.Row) -> GrilloTurn:
@@ -1399,5 +1785,36 @@ def _row_to_slot(row: sqlite3.Row) -> GrilloSlot:
         slot_name=row["slot_name"],
         items=_json_list(row["items_json"]),
         source_candidate_ids=_json_list(row["source_candidate_ids_json"]),
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_relationship_profile(row: sqlite3.Row) -> GrilloRelationshipProfile:
+    return GrilloRelationshipProfile(
+        profile_id=row["profile_id"],
+        scope_key=row["scope_key"],
+        persona_id=row["persona_id"],
+        participant_keys=_json_list(row["participant_keys_json"]),
+        relationship_stage=row["relationship_stage"],
+        mood=row["mood"],
+        trust=int(row["trust"]),
+        attraction=int(row["attraction"]),
+        respect=int(row["respect"]),
+        irritation=int(row["irritation"]),
+        jealousy=int(row["jealousy"]),
+        guard=int(row["guard"]),
+        turn_count=int(row["turn_count"]),
+        last_seen_at=row["last_seen_at"],
+        last_diary_turn_count=int(row["last_diary_turn_count"]),
+        last_action_tag=row["last_action_tag"],
+        facts=_json_list(row["facts_json"]),
+        summary=row["summary"],
+        diary_entry=row["diary_entry"],
+        diary_history=_json_list(row["diary_history_json"]),
+        affect_state=_json_obj(row["affect_state_json"]),
+        tone_preferences=_json_list(row["tone_preferences_json"]),
+        interaction_style=_json_list(row["interaction_style_json"]),
+        boundaries=_json_list(row["boundaries_json"]),
+        active_threads=_json_list(row["active_threads_json"]),
         updated_at=row["updated_at"],
     )

@@ -80,7 +80,11 @@ class HybridMemoryStack:
             backend=vector_backend,
         )
         grillo_store = SQLiteGrilloStore(raw_log_path)
-        grillo = GrilloRuntime(store=grillo_store, vector_store=vector_store)
+        grillo = GrilloRuntime(
+            store=grillo_store,
+            vector_store=vector_store,
+            relationship_graph_store=graph_store,
+        )
         return cls(raw_log=raw_log, graph_store=graph_store, vector_store=vector_store, grillo=grillo)
 
     async def append_event(

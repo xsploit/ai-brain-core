@@ -8,6 +8,7 @@ from aibrain.embeddings import HashEmbeddingProvider
 from aibrain.memory_stack import (
     GRILLOMemoryWorker,
     GrilloRuntime,
+    GrilloRelationshipProfile,
     GraphQuery,
     HybridMemoryStack,
     HybridRetriever,
@@ -253,6 +254,22 @@ async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path)
                     "operation": "merge",
                 },
             ],
+            "relationship_profile": {
+                "relationship_stage": "familiar",
+                "mood": "focused",
+                "trust": 6,
+                "respect": 6,
+                "guard": 12,
+                "summary": "LO wants GRILLO implemented as reflective relationship memory.",
+                "facts": ["LO expects GRILLO to be an AI diary/reflection system."],
+            },
+            "profile_patches": [
+                {
+                    "field": "interaction_style",
+                    "operation": "add",
+                    "value": "Treat corrections about memory architecture as high-signal.",
+                }
+            ],
         }
 
     runtime = GrilloRuntime(
@@ -274,6 +291,7 @@ async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path)
     )
 
     slots = await runtime.store.list_slots("discord:guild:alpha", "user-alpha")
+    profile = await runtime.store.get_relationship_profile("discord:guild:alpha")
     packet = await runtime.build_context_packet(
         scope_key="discord:guild:alpha",
         participant_key="user-alpha",
@@ -286,9 +304,15 @@ async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path)
     assert any("adult erotica author" in item.lower() for item in by_slot["user_facts"])
     assert any("crude direct language" in item for item in by_slot["preferences"])
     assert any("AI diary/reflection system" in item for item in by_slot["relationship_state"])
+    assert profile is not None
+    assert profile.relationship_stage == "familiar"
+    assert profile.mood == "focused"
+    assert profile.trust == 6
+    assert any("high-signal" in item for item in profile.interaction_style)
     assert not any("This applies to all chats" in item for item in all_items)
     assert "This applies to all chats" not in relationship_text
     assert "Preference signal:" not in relationship_text
+    assert "stage=familiar mood=focused" in relationship_text
     assert "pattern-matched labels" in packet.thoughts[0]
 
 
@@ -416,6 +440,28 @@ async def test_ladybug_adapter_smoke_when_installed(tmp_path):
     hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=1))
 
     assert [hit.object for hit in hits] == ["LadybugDB"]
+
+    await graph.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:persona:neuro",
+            scope_key="discord:guild:persona:neuro",
+            persona_id="neuro",
+            participant_keys=["discord:guild:lo"],
+            relationship_stage="familiar",
+            mood="focused",
+            trust=6,
+            respect=7,
+            guard=10,
+            facts=["LO expects GRILLO relationship memory."],
+            summary="LO wants WebWaifu-style GRILLO memory.",
+            updated_at="2026-06-20T00:00:00+00:00",
+        )
+    )
+    profile = await graph.get_relationship_profile_graph("discord:guild:persona:neuro")
+
+    assert profile is not None
+    assert profile["relationship_stage"] == "familiar"
+    assert profile["mood"] == "focused"
 
 
 @pytest.mark.asyncio

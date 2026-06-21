@@ -65,6 +65,8 @@ _GRILLO_REFLECTION_INSTRUCTIONS = "\n".join(
         "Read the JSON payload and return only JSON matching the schema.",
         "Write durable memory candidates for explicit preferences, facts, goals, boundaries, bond signals, and ongoing threads.",
         "Write relationship memory when the turn changes trust, tone, attachment, recurring context, or how the assistant should understand the participant.",
+        "Use relationship_profile for grounded stage, mood, numeric relationship scores, summary, diary, and known facts.",
+        "Use profile_patches for grounded tone_preferences, interaction_style, boundaries, and active_threads.",
         "Write diary entries only when the turn meaningfully changes relationship, mood, goals, or stream/server context.",
         "Diary entries are private first-person reflections from the avatar perspective, not receipts or summaries of every reply.",
         "A good diary personal_thought says how the speaker or chat made the avatar feel, what changed, and what to remember next time.",
@@ -144,8 +146,63 @@ _GRILLO_REFLECTION_SCHEMA: dict[str, Any] = {
                     "required": ["slot_name", "items", "operation"],
                 },
             },
+            "relationship_profile": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "relationship_stage": {"type": "string"},
+                            "mood": {"type": "string"},
+                            "trust": {"type": "number"},
+                            "attraction": {"type": "number"},
+                            "respect": {"type": "number"},
+                            "irritation": {"type": "number"},
+                            "jealousy": {"type": "number"},
+                            "guard": {"type": "number"},
+                            "summary": {"type": "string"},
+                            "diary_entry": {"type": "string"},
+                            "facts": {"type": "array", "items": {"type": "string"}},
+                            "tone_preferences": {"type": "array", "items": {"type": "string"}},
+                            "interaction_style": {"type": "array", "items": {"type": "string"}},
+                            "boundaries": {"type": "array", "items": {"type": "string"}},
+                            "active_threads": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "profile_patches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "enum": [
+                                "tone_preferences",
+                                "interaction_style",
+                                "boundaries",
+                                "active_threads",
+                            ],
+                        },
+                        "operation": {"type": "string", "enum": ["add", "remove"]},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["field", "operation", "value"],
+                },
+            },
         },
-        "required": ["done", "notes", "candidates", "diary", "slots"],
+        "required": [
+            "done",
+            "notes",
+            "candidates",
+            "diary",
+            "slots",
+            "relationship_profile",
+            "profile_patches",
+        ],
     },
 }
 
@@ -340,6 +397,7 @@ class Brain:
             "memory_slots": context.get("memory_slots") or [],
             "recent_diary": context.get("recent_diary") or [],
             "recent_candidates": context.get("recent_candidates") or [],
+            "relationship_profile": context.get("relationship_profile"),
         }
         response = await self.structured(
             json.dumps(payload, ensure_ascii=False),
