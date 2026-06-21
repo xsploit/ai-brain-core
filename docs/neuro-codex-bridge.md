@@ -167,6 +167,14 @@ Official Codex app-server protocol facts to anchor future work:
 - Hook notifications include `hook/started` and `hook/completed`-style schemas with `threadId`, optional `turnId`, and `run`.
 - Websocket app-server is marked experimental; the current safest local route is stdio or the existing Codex app heartbeat.
 
+Important correction:
+
+- Do not assume `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, or `Stop` are Codex app-server hook event names.
+- Those names were not present in the local generated Codex app-server schema for this install.
+- The verified app-server hook surface here is `hooks/list` plus hook started/completed notifications.
+- The verified Harness hook surface is the manifest-driven `event` system in `agency_harness brain emit`.
+- If lifecycle shell hooks are added later, verify them against the installed Codex version before granting bridge behavior.
+
 Minimal app-server wake request shape:
 
 ```json
