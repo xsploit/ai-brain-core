@@ -1107,6 +1107,7 @@ class GrilloRuntime:
         last_provider = "runtime-provider"
         last_model = "runtime-model"
         last_notes = ""
+        final_relationship_reflection: dict[str, Any] | None = None
 
         for round_index in range(1, max_rounds + 1):
             raw_result = await self.worker_completion(
@@ -1141,6 +1142,9 @@ class GrilloRuntime:
 
             parsed = _parse_worker_json(raw_text)
             last_notes = _compact(str(parsed.get("notes") or ""), 500)
+            relationship_reflection = _worker_relationship_reflection(parsed)
+            if relationship_reflection:
+                final_relationship_reflection = relationship_reflection
             calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
             if not calls:
                 if writes > 0:
@@ -1258,6 +1262,17 @@ class GrilloRuntime:
                 "trace_id": last_trace_id,
                 **counts,
             }
+
+        if final_relationship_reflection:
+            profile = await self._apply_relationship_updates(
+                scope_key=scope_key,
+                participant_key=participant_key,
+                reflection=final_relationship_reflection,
+                turns=turns,
+                diary=None,
+            )
+            if profile is not None:
+                counts["profile_patches"] += 1
 
         await self.store.append_activity(
             beat_type=beat_type,
@@ -2399,6 +2414,36 @@ def _parse_worker_json(raw_text: str) -> dict[str, Any]:
         if parsed:
             return parsed
     return {}
+
+
+def _worker_relationship_reflection(parsed: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    reflection: dict[str, Any] = {}
+    for key in ("relationship_profile", "relationship"):
+        value = parsed.get(key)
+        if isinstance(value, dict):
+            reflection["relationship_profile" if key == "relationship_profile" else "relationship"] = value
+            break
+    memory = parsed.get("memory")
+    if "relationship" not in reflection and "relationship_profile" not in reflection and isinstance(memory, dict):
+        relationship_keys = (
+            "relationship_stage",
+            "relationshipStage",
+            "stage",
+            "mood",
+            "actionTag",
+            "trustDelta",
+            "trust_delta",
+            "summary",
+            "rikoDiaryEntry",
+        )
+        if _first_present(memory, relationship_keys) is not None:
+            reflection["relationship"] = memory
+    patches = _as_list(parsed.get("profile_patches"))
+    if patches:
+        reflection["profile_patches"] = patches
+    return reflection or None
 
 
 def _normalize_worker_tool_calls(parsed: dict[str, Any], source_turn_ids: list[str]) -> list[dict[str, Any]]:

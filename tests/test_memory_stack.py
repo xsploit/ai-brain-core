@@ -439,7 +439,23 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
                 "meta": {"provider": "test", "model": "worker-test"},
             }
         assert any("core.worker_memory_read" in message["content"] for message in request["messages"])
-        return {"text": json.dumps({"done": True, "notes": "done", "toolCalls": []})}
+        return {
+            "text": json.dumps(
+                {
+                    "done": True,
+                    "notes": "done",
+                    "toolCalls": [],
+                    "relationship": {
+                        "relationshipStage": "rapport_building",
+                        "mood": "warm",
+                        "trustDelta": 2,
+                        "summary": "LO's direct correction moved the relationship from guarded parity checking into warmer trust.",
+                        "rikoDiaryEntry": "I feel more trusted after proving the worker loop is real.",
+                        "facts": ["LO treats one-to-one GRILLO parity as a trust requirement."],
+                    },
+                }
+            )
+        }
 
     store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
     await store.upsert_relationship_profile(
@@ -495,8 +511,13 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
         for item in slot.items
     )
     assert profile is not None
+    assert profile.relationship_stage == "rapport_building"
+    assert profile.mood == "warm"
+    assert profile.trust == 7
+    assert "warmer trust" in profile.summary
+    assert "GRILLO parity" in profile.facts[-1]
     assert any("literal architecture requirements" in item for item in profile.interaction_style)
-    assert profile.diary_entry.startswith("I should treat LO's correction")
+    assert profile.diary_entry.startswith("I feel more trusted")
     assert emotion["intensities"]["focused"] == 0.82
     assert archival and "worker loop" in archival[0]["text"]
     assert any("serious relationship signal" in entry.personal_thought for entry in diary)
