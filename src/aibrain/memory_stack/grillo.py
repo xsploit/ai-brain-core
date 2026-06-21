@@ -2276,6 +2276,8 @@ def _build_backend_worker_system_prompt() -> str:
             "First read or search memory if needed. Then call write tools.",
             "Do not return done=true until at least one write tool has succeeded in this beat.",
             "If there is no durable slot/profile update, write a core.worker_diary_write reflection about why the beat did or did not change the relationship state.",
+            'When done, return {"done":true,"toolCalls":[],"relationship":{...},"notes":"short status"}.',
+            "relationship must use the WebWaifu legacy merge shape when useful: actionTag,mood,trustDelta,attractionDelta,respectDelta,irritationDelta,jealousyDelta,guardDelta,facts,summary,rikoDiaryEntry.",
         ]
     )
 

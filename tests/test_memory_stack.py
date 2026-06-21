@@ -372,7 +372,9 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
     async def worker_completion(request):
         seen_requests.append(request)
         if len(seen_requests) == 1:
+            system = request["messages"][0]["content"]
             prompt = request["messages"][1]["content"]
+            assert "relationship must use the WebWaifu legacy merge shape" in system
             assert "Canonical GRILLO context packet" in prompt
             assert "stage=familiar mood=guarded" in prompt
             assert "I already feel guarded but invested around LO." in prompt
