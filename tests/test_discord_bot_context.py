@@ -25,6 +25,7 @@ from aibrain.discord_bot import (
     _text_attachment_context,
     _time_context,
     _tts_spoken_text,
+    _voice_opus_bitrate,
     build_discord_voice_clip,
     limit_pcm_s16le_peak,
     waveform_base64_from_pcm_s16le,
@@ -879,6 +880,25 @@ def test_discord_voice_clip_uses_current_text_only(monkeypatch):
     assert brain.texts == ["first reply", "second reply"]
 
 
+def test_discord_voice_clip_uses_brain_speak_by_default(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    class FailIsolatedPiper:
+        def __init__(self, config):
+            raise AssertionError("isolated Piper must be opt-in")
+
+    monkeypatch.delenv("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", raising=False)
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    monkeypatch.setattr(discord_bot_module, "PiperExecutableTTS", FailIsolatedPiper)
+    brain = _RecordingTTSBrain()
+    brain.tts = SimpleNamespace(config=TTSConfig(provider="piper_process"))
+
+    asyncio.run(build_discord_voice_clip(brain, "default reply", voice="neuro-sama"))
+
+    assert brain.texts == ["default reply"]
+
+
 def test_discord_voice_clip_isolates_piper_process_provider(monkeypatch):
     async def fake_encode(pcm, sample_rate):
         return b"ogg-data"
@@ -900,8 +920,15 @@ def test_discord_voice_clip_isolates_piper_process_provider(monkeypatch):
 
     monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
     monkeypatch.setattr(discord_bot_module, "PiperExecutableTTS", FakeIsolatedPiper)
+    monkeypatch.setenv("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", "true")
     brain = SimpleNamespace(tts=SimpleNamespace(config=TTSConfig(provider="piper_process")), speak=fail_speak)
 
     asyncio.run(build_discord_voice_clip(brain, "isolated reply", voice="neuro-sama"))
 
     assert FakeIsolatedPiper.instances[0].calls == [("isolated reply", {"voice": "neuro-sama"})]
+
+
+def test_discord_voice_opus_bitrate_defaults_to_discord_client_shape(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_VOICE_OPUS_BITRATE", raising=False)
+
+    assert _voice_opus_bitrate() == "32k"

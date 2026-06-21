@@ -1652,7 +1652,7 @@ async def build_discord_voice_clip(brain: Brain, text: str, *, voice: str | None
 
 
 def _discord_voice_clip_tts_provider(brain: Brain) -> PiperExecutableTTS | None:
-    if not _env_bool("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", True):
+    if not _env_bool("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", False):
         return None
     config = getattr(getattr(brain, "tts", None), "config", None)
     if config is not None and getattr(config, "provider", None) == "piper_process":
@@ -1812,10 +1812,10 @@ def limit_pcm_s16le_peak(pcm: bytes, *, target_peak: float = 0.82) -> bytes:
 
 
 def _voice_opus_bitrate() -> str:
-    value = os.getenv("DISCORD_BRAIN_VOICE_OPUS_BITRATE", "64k").strip()
+    value = os.getenv("DISCORD_BRAIN_VOICE_OPUS_BITRATE", "32k").strip()
     if re.fullmatch(r"\d+[kKmM]?", value):
         return value
-    return "64k"
+    return "32k"
 
 
 def _ffmpeg_executable() -> str:
