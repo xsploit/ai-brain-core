@@ -171,6 +171,30 @@ class _FakeRawLog:
         return [SimpleNamespace(id="event-1")]
 
 
+class _FakeMatchingRawLog:
+    def __init__(self, event_id: str = "event-1"):
+        self.event_id = event_id
+        self.calls = []
+
+    async def list_thread_events_matching(
+        self,
+        *,
+        thread_ids,
+        thread_like_patterns,
+        persona_id,
+        limit=100,
+    ):
+        self.calls.append(
+            {
+                "thread_ids": thread_ids,
+                "thread_like_patterns": thread_like_patterns,
+                "persona_id": persona_id,
+                "limit": limit,
+            }
+        )
+        return [SimpleNamespace(id=self.event_id)]
+
+
 class _FakeModelBot:
     def __init__(self, current_model: str):
         self.current_model = current_model
@@ -1032,6 +1056,58 @@ def test_scoped_ladybug_facts_filter_by_raw_event_scope(monkeypatch):
     )
 
     assert [fact.id for fact in facts] == ["in-scope"]
+
+
+def test_scoped_ladybug_facts_include_dm_persona_raw_thread(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_LADYBUG_GLOBAL_COMMANDS", raising=False)
+    raw_log = _FakeMatchingRawLog()
+    stack = SimpleNamespace(graph_store=_FakeGraphStore(), raw_log=raw_log)
+
+    facts = asyncio.run(
+        _scoped_ladybug_facts(
+            stack,
+            "discord:dm:123:persona:neuro-sama",
+            "scope",
+            top_k=10,
+            include_expired=True,
+        )
+    )
+
+    assert [fact.id for fact in facts] == ["in-scope"]
+    assert raw_log.calls == [
+        {
+            "thread_ids": ["discord:dm:123:persona:neuro-sama", "discord:dm:123"],
+            "thread_like_patterns": [],
+            "persona_id": "neuro-sama",
+            "limit": 1000,
+        }
+    ]
+
+
+def test_scoped_ladybug_facts_include_guild_user_raw_threads(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_LADYBUG_GLOBAL_COMMANDS", raising=False)
+    raw_log = _FakeMatchingRawLog()
+    stack = SimpleNamespace(graph_store=_FakeGraphStore(), raw_log=raw_log)
+
+    facts = asyncio.run(
+        _scoped_ladybug_facts(
+            stack,
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "scope",
+            top_k=10,
+            include_expired=True,
+        )
+    )
+
+    assert [fact.id for fact in facts] == ["in-scope"]
+    assert raw_log.calls == [
+        {
+            "thread_ids": ["discord:guild:222:user:123:persona:neuro-sama"],
+            "thread_like_patterns": ["discord:guild:222:channel:%:user:123"],
+            "persona_id": "neuro-sama",
+            "limit": 1000,
+        }
+    ]
 
 
 def test_gateway_model_ids_are_chat_models_and_embeddings_are_not():

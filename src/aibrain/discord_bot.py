@@ -2036,9 +2036,63 @@ async def _scoped_ladybug_facts(
     raw_log = getattr(stack, "raw_log", None)
     if raw_log is None:
         return []
-    events = await raw_log.list_thread_events(scope, limit=_env_int("DISCORD_BRAIN_LADYBUG_SCOPE_EVENT_LIMIT", 1000))
-    event_ids = {event.id for event in events}
+    event_ids = await _scoped_raw_event_ids(
+        raw_log,
+        scope,
+        limit=_env_int("DISCORD_BRAIN_LADYBUG_SCOPE_EVENT_LIMIT", 1000),
+    )
     return [fact for fact in facts if getattr(fact, "source_event_id", None) in event_ids][:top_k]
+
+
+async def _scoped_raw_event_ids(raw_log: Any, scope: str, *, limit: int) -> set[str]:
+    thread_ids, thread_like_patterns, persona_id = _discord_raw_event_selectors(scope)
+    matching = getattr(raw_log, "list_thread_events_matching", None)
+    if matching is not None:
+        events = await matching(
+            thread_ids=thread_ids,
+            thread_like_patterns=thread_like_patterns,
+            persona_id=persona_id,
+            limit=limit,
+        )
+    else:
+        batches = await asyncio.gather(
+            *(raw_log.list_thread_events(thread_id, limit=limit) for thread_id in thread_ids)
+        )
+        events = [event for batch in batches for event in batch]
+    event_ids = {event.id for event in events}
+    return event_ids
+
+
+def _discord_raw_event_selectors(scope: str) -> tuple[list[str], list[str], str | None]:
+    thread_ids = [scope]
+    thread_like_patterns: list[str] = []
+    persona_id: str | None = None
+    dm_match = re.fullmatch(r"discord:dm:(?P<user_id>[^:]+):persona:(?P<persona_id>.+)", scope)
+    if dm_match:
+        thread_ids.append(f"discord:dm:{dm_match.group('user_id')}")
+        persona_id = dm_match.group("persona_id")
+        return _dedupe_strings(thread_ids), thread_like_patterns, persona_id
+    guild_match = re.fullmatch(
+        r"discord:guild:(?P<guild_id>[^:]+):user:(?P<user_id>[^:]+):persona:(?P<persona_id>.+)",
+        scope,
+    )
+    if guild_match:
+        guild_id = guild_match.group("guild_id")
+        user_id = guild_match.group("user_id")
+        thread_like_patterns.append(f"discord:guild:{guild_id}:channel:%:user:{user_id}")
+        persona_id = guild_match.group("persona_id")
+    return _dedupe_strings(thread_ids), thread_like_patterns, persona_id
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def _format_ladybug_export(*, scope: str, query: str, facts: list[Any]) -> str:

@@ -81,6 +81,53 @@ async def test_raw_log_appends_and_lists_thread_events(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_raw_log_lists_matching_thread_events(tmp_path):
+    store = SQLiteRawEventStore(tmp_path / "brain.sqlite3")
+    await store.append(
+        RawEvent(
+            id="event-dm",
+            event_type="message",
+            actor="user",
+            thread_id="discord:dm:123",
+            persona_id="neuro-sama",
+            content="dm hello",
+            created_at="2026-06-21T00:00:00+00:00",
+        )
+    )
+    await store.append(
+        RawEvent(
+            id="event-guild-user",
+            event_type="message",
+            actor="user",
+            thread_id="discord:guild:222:channel:333:user:123",
+            persona_id="neuro-sama",
+            content="guild hello",
+            created_at="2026-06-21T00:00:01+00:00",
+        )
+    )
+    await store.append(
+        RawEvent(
+            id="event-other-persona",
+            event_type="message",
+            actor="user",
+            thread_id="discord:guild:222:channel:444:user:123",
+            persona_id="other",
+            content="wrong persona",
+            created_at="2026-06-21T00:00:02+00:00",
+        )
+    )
+
+    events = await store.list_thread_events_matching(
+        thread_ids=["discord:dm:123"],
+        thread_like_patterns=["discord:guild:222:channel:%:user:123"],
+        persona_id="neuro-sama",
+        limit=10,
+    )
+
+    assert [event.id for event in events] == ["event-dm", "event-guild-user"]
+
+
+@pytest.mark.asyncio
 async def test_grillo_worker_extracts_temporal_fact_and_indexes_recall(tmp_path):
     provider = HashEmbeddingProvider(dimensions=32)
     graph = SQLiteTemporalGraphStore(tmp_path / "brain.sqlite3")

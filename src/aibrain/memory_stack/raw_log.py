@@ -110,6 +110,57 @@ class SQLiteRawEventStore:
             ).fetchall()
         return [_row_to_event(row) for row in reversed(rows)]
 
+    async def list_thread_events_matching(
+        self,
+        *,
+        thread_ids: list[str] | None = None,
+        thread_like_patterns: list[str] | None = None,
+        persona_id: str | None = None,
+        limit: int = 100,
+    ) -> list[RawEvent]:
+        return await asyncio.to_thread(
+            self._list_thread_events_matching_sync,
+            thread_ids or [],
+            thread_like_patterns or [],
+            persona_id,
+            limit,
+        )
+
+    def _list_thread_events_matching_sync(
+        self,
+        thread_ids: list[str],
+        thread_like_patterns: list[str],
+        persona_id: str | None,
+        limit: int,
+    ) -> list[RawEvent]:
+        predicates: list[str] = []
+        params: list[Any] = []
+        if thread_ids:
+            placeholders = ", ".join("?" for _ in thread_ids)
+            predicates.append(f"thread_id IN ({placeholders})")
+            params.extend(thread_ids)
+        for pattern in thread_like_patterns:
+            predicates.append("thread_id LIKE ?")
+            params.append(pattern)
+        where = " OR ".join(predicates)
+        if not where:
+            where = "thread_id IS NOT NULL"
+        if persona_id:
+            where = f"({where}) AND persona_id = ?"
+            params.append(persona_id)
+        params.append(max(limit, 1))
+        with self._lock:
+            rows = self._connect().execute(
+                f"""
+                SELECT * FROM brain_raw_events
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_event(row) for row in reversed(rows)]
+
     def close(self) -> None:
         with self._lock:
             conn = self._conn
