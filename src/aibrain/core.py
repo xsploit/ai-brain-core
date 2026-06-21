@@ -763,6 +763,7 @@ class Brain:
         files: list[FileInput | dict[str, Any] | str] | None = None,
         **response_options: Any,
     ) -> BrainResponse:
+        response_options.pop("memory_stack_record", True)
         if output_model is None and json_schema is None:
             raise ValueError("structured() requires output_model or json_schema")
         if json_schema is not None:

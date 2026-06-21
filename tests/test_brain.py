@@ -137,6 +137,25 @@ async def test_default_vercel_mode_uses_local_state_without_remote_conversation(
 
 
 @pytest.mark.asyncio
+async def test_structured_consumes_memory_stack_record_option(tmp_path):
+    client = FakeOpenAI()
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", default_model="openai/test"),
+        client=client,
+    )
+
+    response = await brain.structured(
+        "extract json",
+        json_schema={"name": "test_schema", "schema": {"type": "object"}, "strict": False},
+        memory_stack_record=False,
+    )
+
+    assert response.text == "ok"
+    call = client.responses.calls[0]
+    assert "memory_stack_record" not in call
+
+
+@pytest.mark.asyncio
 async def test_local_tool_loop_continuation_does_not_use_previous_response_id(tmp_path):
     client = FakeOpenAI()
 

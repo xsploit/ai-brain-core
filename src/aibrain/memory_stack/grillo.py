@@ -2423,6 +2423,7 @@ def _turn_to_reflection_dict(turn: GrilloTurn) -> dict[str, Any]:
         "channel_id": turn.channel_id,
         "interface_path": turn.interface_path,
         "source": turn.source,
+        "metadata": turn.metadata,
         "created_at": turn.created_at,
     }
 

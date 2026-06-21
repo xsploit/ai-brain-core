@@ -239,6 +239,49 @@ def test_discord_message_context_and_prompt_include_local_time(monkeypatch):
     assert "Message sent at: 2026-06-19T09:15:00-07:00" in prompt
 
 
+def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.channel.name = "bot-chat"
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name="LO",
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime()
+    brain = _FakeBrain()
+    brain.memory_stack = SimpleNamespace(grillo=grillo)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert brain.kwargs["thread_id"] == "discord:guild:222:channel:456:user:123"
+    assert grillo.calls[0]["scope_key"] == "discord:guild:222:channel:456"
+    assert grillo.calls[0]["participant_key"] == "123"
+    assert "author_id: 123" in brain.prompt
+    assert "author_username: subsect" in brain.prompt
+    assert "author_display_name: SUBSECT" in brain.prompt
+    metadata = grillo.ingests[0]["metadata"]
+    assert metadata["author_id"] == 123
+    assert metadata["author_username"] == "subsect"
+    assert metadata["author_display_name"] == "SUBSECT"
+    assert metadata["guild_id"] == 222
+    assert metadata["channel_id"] == 456
+
+
 def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))

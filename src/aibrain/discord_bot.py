@@ -208,8 +208,61 @@ def _scope_for_message(message: discord.Message) -> str:
     return ThreadPolicy.discord_channel(message.guild.id, message.channel.id)
 
 
+def _thread_id_for_message(message: discord.Message) -> str:
+    scope = _scope_for_message(message)
+    if message.guild is None or isinstance(message.channel, discord.Thread):
+        return scope
+    return f"{scope}:user:{message.author.id}"
+
+
 def _display_name(user: discord.abc.User) -> str:
     return getattr(user, "display_name", None) or getattr(user, "global_name", None) or str(user)
+
+
+def _discord_message_metadata(message: discord.Message) -> dict[str, Any]:
+    author = message.author
+    guild = message.guild
+    channel = message.channel
+    reference = getattr(message, "reference", None)
+    resolved = getattr(reference, "resolved", None) if reference is not None else None
+    return {
+        "message_id": getattr(message, "id", None),
+        "author_id": getattr(author, "id", None),
+        "author_username": getattr(author, "name", None) or str(author),
+        "author_display_name": getattr(author, "display_name", None) or _display_name(author),
+        "author_global_name": getattr(author, "global_name", None),
+        "author_mention": getattr(author, "mention", None),
+        "author_is_bot": bool(getattr(author, "bot", False)),
+        "guild_id": getattr(guild, "id", None) if guild else None,
+        "guild_name": getattr(guild, "name", None) if guild else None,
+        "channel_id": getattr(channel, "id", None),
+        "channel_name": getattr(channel, "name", None) or "dm",
+        "channel_type": type(channel).__name__,
+        "is_dm": guild is None,
+        "message_created_at": message.created_at.isoformat() if getattr(message, "created_at", None) else None,
+        "jump_url": getattr(message, "jump_url", None),
+        "mentioned_user_ids": [getattr(user, "id", None) for user in getattr(message, "mentions", [])],
+        "reference_message_id": getattr(reference, "message_id", None) if reference is not None else None,
+        "reply_to_author_id": (
+            getattr(getattr(resolved, "author", None), "id", None) if resolved is not None else None
+        ),
+    }
+
+
+def _discord_metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
+    keys = [
+        "author_id",
+        "author_username",
+        "author_display_name",
+        "author_global_name",
+        "author_is_bot",
+        "guild_id",
+        "guild_name",
+        "channel_id",
+        "channel_name",
+        "message_id",
+    ]
+    return [f"{key}: {metadata[key]}" for key in keys if metadata.get(key) is not None]
 
 
 def _message_text(message: discord.Message) -> str:
@@ -1240,14 +1293,17 @@ class DiscordBrainBot(commands.Bot):
 
     def _context_for_message(self, message: discord.Message) -> dict[str, Any]:
         scope = _scope_for_message(message)
+        metadata = _discord_message_metadata(message)
         return {
             "scope": scope,
+            "thread_id": _thread_id_for_message(message),
             "guild_id": message.guild.id if message.guild else None,
             "guild": message.guild.name if message.guild else None,
             "channel_id": message.channel.id,
             "channel": getattr(message.channel, "name", "dm"),
             "author_id": message.author.id,
             "author": _display_name(message.author),
+            "discord_metadata": metadata,
             **_time_context(message.created_at),
             "recent_messages": self.recent_by_scope.get(scope, [])[-8:],
         }
@@ -1268,7 +1324,8 @@ class DiscordBrainBot(commands.Bot):
         prompt_cache_key: str | None = None,
         prompt_cache_retention: str | None = None,
     ) -> None:
-        scope = thread_id_override or _scope_for_message(message)
+        scope = _scope_for_message(message)
+        thread_id = thread_id_override or _thread_id_for_message(message)
         token = None
         tool_token = None
         buffer = ""
@@ -1305,7 +1362,7 @@ class DiscordBrainBot(commands.Bot):
             async with message.channel.typing():
                 async for event in self.brain.stream(
                     prompt,
-                    thread_id=scope,
+                    thread_id=thread_id,
                     persona=persona,
                     images=images,
                     use_memory=(
@@ -1352,11 +1409,14 @@ class DiscordBrainBot(commands.Bot):
         persona_name: str | None = None,
     ) -> str:
         discord_context = self._context_for_message(message)
+        metadata_block = "\n".join(_discord_metadata_prompt_lines(discord_context["discord_metadata"]))
         prompt = (
             f"Discord message from {_display_name(message.author)} in "
             f"{discord_context['guild'] or 'DM'}#{discord_context['channel']}:\n"
             f"Local date/time ({discord_context['local_timezone']}): {discord_context['local_now']}\n"
-            f"Message sent at: {discord_context['message_local_created_at'] or discord_context['message_created_at']}\n\n"
+            f"Message sent at: {discord_context['message_local_created_at'] or discord_context['message_created_at']}\n"
+            "Discord metadata for this speaker and channel:\n"
+            f"{metadata_block}\n\n"
             f"{user_text}"
         )
         if one_shot_pre_prompt:
@@ -1407,10 +1467,7 @@ class DiscordBrainBot(commands.Bot):
                 channel_id=str(message.channel.id),
                 interface_path=f"discord/{message.guild.id if message.guild else 'dm'}/{message.channel.id}",
                 source="discord",
-                metadata={
-                    "guild_id": message.guild.id if message.guild else None,
-                    "author_id": message.author.id,
-                },
+                metadata=_discord_message_metadata(message),
                 run_tick=True,
             )
         )
