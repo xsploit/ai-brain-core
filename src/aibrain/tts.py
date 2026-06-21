@@ -100,6 +100,9 @@ class TTSConfig(BaseModel):
     process_idle_timeout: float = Field(
         default_factory=lambda: _env_float("PIPER_PROCESS_IDLE_TIMEOUT", 0.15)
     )
+    process_synthesis_idle_timeout: float = Field(
+        default_factory=lambda: _env_float("PIPER_PROCESS_SYNTHESIS_IDLE_TIMEOUT", 0.75)
+    )
     process_first_chunk_timeout: float = 10.0
     process_pool_max: int = Field(default_factory=lambda: _env_int("PIPER_PROCESS_POOL_MAX", 4))
     warmup_on_start: bool = True
@@ -262,17 +265,25 @@ class PiperProcessTTS(PiperExecutableTTS):
 
     async def synthesize(self, text: str, **options: Any) -> TTSAudio:
         runtime_config = tts_config_for_voice(self.config, options.get("voice"))
-        key = tts_config_process_key(runtime_config)
+        stream_config = runtime_config.model_copy(
+            update={
+                "process_idle_timeout": max(
+                    runtime_config.process_idle_timeout,
+                    runtime_config.process_synthesis_idle_timeout,
+                )
+            }
+        )
+        key = tts_config_process_key(stream_config)
         lock = await self._process_lock(key)
         chunks: list[TTSChunk] = []
         async with lock:
             await self._close_process(key)
             try:
                 index = 0
-                for segment in split_tts_text(text, runtime_config):
+                for segment in split_tts_text(text, stream_config):
                     async for chunk in self._stream_process(
                         segment,
-                        config=runtime_config,
+                        config=stream_config,
                         start_index=index,
                     ):
                         chunks.append(chunk)
@@ -282,12 +293,12 @@ class PiperProcessTTS(PiperExecutableTTS):
         voice_name = (
             chunks[0].voice
             if chunks and chunks[0].voice
-            else tts_voice_name(runtime_config) or options.get("voice")
+            else tts_voice_name(stream_config) or options.get("voice")
         )
         return TTSAudio(
             audio=b"".join(chunk.audio for chunk in chunks),
-            sample_rate=chunks[0].sample_rate if chunks else runtime_config.resolved_sample_rate(),
-            encoding=chunks[0].encoding if chunks else runtime_config.output_format,
+            sample_rate=chunks[0].sample_rate if chunks else stream_config.resolved_sample_rate(),
+            encoding=chunks[0].encoding if chunks else stream_config.output_format,
             voice=voice_name,
         )
 

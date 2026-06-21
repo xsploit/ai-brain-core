@@ -242,6 +242,11 @@ def test_piper_idle_timeout_env_override(monkeypatch):
     assert TTSConfig(provider="null").process_idle_timeout == 0.7
 
 
+def test_piper_synthesis_idle_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("PIPER_PROCESS_SYNTHESIS_IDLE_TIMEOUT", "1.25")
+    assert TTSConfig(provider="null").process_synthesis_idle_timeout == 1.25
+
+
 def test_discover_piper_voices_uses_env_roots_and_manifests(tmp_path, monkeypatch):
     manifest_model = tmp_path / "manifest_voice.onnx"
     manifest_config = tmp_path / "manifest_voice.onnx.json"
@@ -453,15 +458,18 @@ class ConcurrentFakePiperProcess(PiperProcessTTS):
 
 
 class RecordingFreshStreamPiperProcess(PiperProcessTTS):
-    def __init__(self):
-        super().__init__(TTSConfig(provider="null"))
+    def __init__(self, config: TTSConfig | None = None):
+        super().__init__(config or TTSConfig(provider="null"))
         self.calls = []
+        self.idle_timeouts = []
 
     async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        runtime_config = config or self.config
         self.calls.append(text)
+        self.idle_timeouts.append(runtime_config.process_idle_timeout)
         yield TTSChunk(
             audio=text.encode(),
-            sample_rate=22050,
+            sample_rate=runtime_config.resolved_sample_rate(),
             index=start_index,
             final=True,
             text=text,
@@ -525,12 +533,19 @@ async def test_piper_process_locks_per_voice(tmp_path):
 
 @pytest.mark.asyncio
 async def test_piper_process_synthesize_uses_fresh_streaming_process():
-    provider = RecordingFreshStreamPiperProcess()
+    provider = RecordingFreshStreamPiperProcess(
+        TTSConfig(
+            provider="null",
+            process_idle_timeout=0.05,
+            process_synthesis_idle_timeout=0.6,
+        )
+    )
 
     first = await provider.synthesize("previous response")
     second = await provider.synthesize("new response")
 
     assert provider.calls == ["previous response", "new response"]
+    assert provider.idle_timeouts == [0.6, 0.6]
     assert first.audio == b"previous response"
     assert second.audio == b"new response"
 
