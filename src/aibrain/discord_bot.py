@@ -235,6 +235,15 @@ def _thread_id_for_message(message: discord.Message) -> str:
     return f"{scope}:user:{message.author.id}"
 
 
+def _scope_for_channel(channel: Any) -> str:
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return f"discord:heartbeat:{getattr(channel, 'id', 'unknown')}"
+    if isinstance(channel, discord.Thread):
+        return ThreadPolicy.discord_thread(guild.id, channel.id)
+    return ThreadPolicy.discord_channel(guild.id, channel.id)
+
+
 def _display_name(user: discord.abc.User) -> str:
     return getattr(user, "display_name", None) or getattr(user, "global_name", None) or str(user)
 
@@ -843,6 +852,14 @@ class DiscordBrainBot(commands.Bot):
         )
         self.heartbeat_chance = max(0.0, min(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_CHANCE", 0.08)))
         self.heartbeat_tts_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_TTS", False)
+        self.heartbeat_autonomy_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_AUTONOMY_ENABLED", True)
+        self.heartbeat_allow_owner_dm = _env_bool("DISCORD_BRAIN_HEARTBEAT_ALLOW_OWNER_DM", True)
+        self.heartbeat_dm_user_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS")
+        self.heartbeat_action_cooldown_seconds = max(
+            0.0,
+            _env_float("DISCORD_BRAIN_HEARTBEAT_ACTION_COOLDOWN_SECONDS", 1800.0),
+        )
+        self.heartbeat_action_last_at: dict[str, float] = {}
         self.heartbeat_task: asyncio.Task | None = None
         self._install_commands()
 
@@ -1250,7 +1267,11 @@ class DiscordBrainBot(commands.Bot):
                         f"channels: {channels}",
                         f"interval seconds: `{self.heartbeat_min_interval_seconds:.0f}-{self.heartbeat_interval_seconds:.0f}`",
                         f"chance: `{self.heartbeat_chance:.2f}`",
+                        f"autonomy: `{self.heartbeat_autonomy_enabled}`",
                         f"voice clip: `{self.heartbeat_tts_enabled}`",
+                        f"owner DM: `{self.heartbeat_allow_owner_dm}`",
+                        f"allowlisted DM users: `{len(self.heartbeat_dm_user_ids)}`",
+                        f"action cooldown seconds: `{self.heartbeat_action_cooldown_seconds:.0f}`",
                         f"task running: `{self.heartbeat_task is not None and not self.heartbeat_task.done()}`",
                     ]
                 ),
@@ -1283,8 +1304,9 @@ class DiscordBrainBot(commands.Bot):
             if channel is None:
                 await ctx.reply("heartbeat has no configured channel.", mention_author=False)
                 return
-            await self._send_heartbeat_message(channel)
-            await ctx.reply("heartbeat tick sent.", mention_author=False)
+            result = await self._run_heartbeat_tick(channel)
+            suffix = f" `{result}`" if result else ""
+            await ctx.reply(f"heartbeat tick sent.{suffix}", mention_author=False)
 
         @commands.group(name="codex", invoke_without_command=True)
         async def codex_bridge(ctx: commands.Context) -> None:
@@ -1950,7 +1972,7 @@ class DiscordBrainBot(commands.Bot):
             if channel is None:
                 continue
             try:
-                await self._send_heartbeat_message(channel)
+                await self._run_heartbeat_tick(channel)
             except Exception:
                 self.logger.exception("Discord heartbeat tick failed")
 
@@ -1974,6 +1996,168 @@ class DiscordBrainBot(commands.Bot):
         with contextlib.suppress(Exception):
             return await self.fetch_channel(channel_id)
         return None
+
+    async def _run_heartbeat_tick(self, channel: Any) -> str:
+        if not getattr(self, "heartbeat_autonomy_enabled", True):
+            await self._send_heartbeat_message(channel)
+            return "send_channel_message"
+        decision = await self._build_heartbeat_decision(channel)
+        action = _heartbeat_action_name(decision.get("action"))
+        if action == "noop":
+            self.logger.info("Discord heartbeat chose noop: %s", decision.get("reason", ""))
+            return "noop"
+        if action == "send_channel_message":
+            text = _heartbeat_decision_text(decision, _env_int("DISCORD_BRAIN_HEARTBEAT_MAX_CHARS", 240))
+            if not text:
+                text = await self._build_heartbeat_text(channel)
+            await channel.send(text)
+            await self._maybe_send_heartbeat_tts(channel, text)
+            return "send_channel_message"
+        if action in {"dm_owner", "dm_user"}:
+            target_id = self._heartbeat_dm_target(action, decision)
+            if target_id is None:
+                return f"{action}:rejected"
+            cooldown_key = f"{action}:{target_id}"
+            if not self._heartbeat_action_ready(cooldown_key):
+                return f"{action}:cooldown"
+            text = _heartbeat_decision_text(decision, _env_int("DISCORD_BRAIN_HEARTBEAT_DM_MAX_CHARS", 800))
+            if not text:
+                return f"{action}:empty"
+            await self._send_heartbeat_dm(target_id, text)
+            self._mark_heartbeat_action(cooldown_key)
+            return action
+        if action == "queue_codex":
+            if not self.codex_bridge.enabled or self.codex_bridge.is_paused():
+                return "queue_codex:disabled"
+            cooldown_key = "queue_codex"
+            if not self._heartbeat_action_ready(cooldown_key):
+                return "queue_codex:cooldown"
+            prompt = str(decision.get("codex_prompt") or decision.get("prompt") or "").strip()
+            if not prompt:
+                return "queue_codex:empty"
+            self._queue_heartbeat_codex_request(channel, prompt)
+            self._mark_heartbeat_action(cooldown_key)
+            return "queue_codex"
+        return "unknown"
+
+    async def _build_heartbeat_decision(self, channel: Any) -> dict[str, Any]:
+        prompt = self._heartbeat_autonomy_prompt(channel)
+        buffer = ""
+        async for event in self.brain.stream(
+            prompt,
+            thread_id=f"discord:heartbeat:autonomy:{getattr(channel, 'id', 'unknown')}",
+            persona=self.persona,
+            use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_HEARTBEAT_MEMORY_TOP_K", 3)),
+            tool_names=[],
+            stateless=True,
+            memory_query_text="heartbeat autonomy",
+            memory_event_text="",
+            history_text=prompt,
+        ):
+            if event.type == "text.delta":
+                buffer += event.data.get("text", "")
+            elif event.type == "error":
+                raise RuntimeError(event.data.get("message", "heartbeat autonomy failed"))
+        decision = _parse_heartbeat_decision(buffer)
+        if decision is not None:
+            return decision
+        return {
+            "action": "send_channel_message",
+            "message": buffer.strip(),
+            "reason": "model returned text instead of JSON",
+        }
+
+    def _heartbeat_autonomy_prompt(self, channel: Any) -> str:
+        channel_id = getattr(channel, "id", "unknown")
+        channel_name = getattr(channel, "name", "dm")
+        guild = getattr(channel, "guild", None)
+        guild_name = getattr(guild, "name", None) or "DM"
+        scope = _scope_for_channel(channel)
+        recent = self.recent_by_scope.get(scope, [])[-8:]
+        recent_lines = _recent_messages_prompt_lines(recent, current_message_id=None)
+        actions = ["send_channel_message", "noop"]
+        if self.heartbeat_allow_owner_dm and self.owner_users:
+            actions.append("dm_owner")
+        if self.heartbeat_dm_user_ids:
+            actions.append("dm_user")
+        if self.codex_bridge.enabled and not self.codex_bridge.is_paused():
+            actions.append("queue_codex")
+        action_text = ", ".join(actions)
+        owner_ids = ", ".join(str(user_id) for user_id in sorted(self.owner_users)) or "none"
+        dm_ids = ", ".join(str(user_id) for user_id in sorted(self.heartbeat_dm_user_ids)) or "none"
+        return "\n".join(
+            [
+                "You are Neuro-sama during an autonomous Discord heartbeat.",
+                "Choose exactly one action from the allowed action menu.",
+                "Return only one JSON object and no markdown.",
+                "",
+                f"Allowed actions: {action_text}",
+                f"Current channel: {guild_name}#{channel_name} ({channel_id})",
+                f"Owner DM targets: {owner_ids}",
+                f"Allowlisted non-owner DM targets: {dm_ids}",
+                "",
+                "JSON shape:",
+                '{"action":"send_channel_message|dm_owner|dm_user|queue_codex|noop","message":"short text to send","target_user_id":"optional discord id","codex_prompt":"optional bounded upgrade/debug request","reason":"short private reason"}',
+                "",
+                "Rules:",
+                "- Prefer noop if nothing is worth doing.",
+                "- Use send_channel_message to casually shoot the breeze in the configured heartbeat channel.",
+                "- Use dm_owner only for useful upgrade ideas, self-checks, or funny low-frequency check-ins.",
+                "- Use dm_user only for an allowlisted target_user_id.",
+                "- Use queue_codex only for a concrete bounded bot improvement/debug/review task.",
+                "- Keep messages concise, no mass mentions, no commands, no fake claims that work already happened.",
+                "",
+                "[Recent local context:]",
+                *(recent_lines or ["(none)"]),
+                "[End recent local context]",
+            ]
+        )
+
+    def _heartbeat_dm_target(self, action: str, decision: dict[str, Any]) -> int | None:
+        raw_target = str(decision.get("target_user_id") or "").strip()
+        target_id = int(raw_target) if raw_target.isdigit() else None
+        if action == "dm_owner":
+            if not self.heartbeat_allow_owner_dm or not self.owner_users:
+                return None
+            return target_id if target_id in self.owner_users else sorted(self.owner_users)[0]
+        if target_id is None or target_id not in self.heartbeat_dm_user_ids:
+            return None
+        return target_id
+
+    def _heartbeat_action_ready(self, key: str) -> bool:
+        cooldown = getattr(self, "heartbeat_action_cooldown_seconds", 0.0)
+        if cooldown <= 0:
+            return True
+        now = asyncio.get_running_loop().time()
+        last_at = self.heartbeat_action_last_at.get(key)
+        return last_at is None or now - last_at >= cooldown
+
+    def _mark_heartbeat_action(self, key: str) -> None:
+        self.heartbeat_action_last_at[key] = asyncio.get_running_loop().time()
+
+    async def _send_heartbeat_dm(self, user_id: int, text: str) -> None:
+        user = self.get_user(user_id)
+        if user is None:
+            user = await self.fetch_user(user_id)
+        await user.send(text)
+
+    def _queue_heartbeat_codex_request(self, channel: Any, prompt: str) -> Path:
+        guild = getattr(channel, "guild", None)
+        actor = getattr(self, "user", None)
+        return self.codex_bridge.enqueue(
+            requester_id=getattr(actor, "id", "neuro-heartbeat"),
+            requester_name=_display_name(actor) if actor is not None else getattr(self.persona, "name", "Neuro-sama"),
+            guild_id=getattr(guild, "id", None),
+            channel_id=getattr(channel, "id", None),
+            prompt=prompt,
+            intent="implement",
+            authority_mode="autonomous_neuro",
+            authority_reason="autonomous Neuro heartbeat selected a bounded Codex request",
+            delivery_mode="thread_heartbeat",
+            recent_messages=list(self.recent_by_scope.get(_scope_for_channel(channel), [])[-8:]),
+            harness_agent="claude",
+            harness_permission_profile="inspect",
+        )
 
     async def _build_heartbeat_text(self, channel: Any) -> str:
         prompt = (
@@ -2673,6 +2857,48 @@ def _embed_text(text: str, limit: int) -> str:
         return "`none`"
     compacted = re.sub(r"\s+", " ", compacted) if "\n" not in compacted else compacted
     return compacted if len(compacted) <= limit else compacted[: limit - 1].rstrip() + "..."
+
+
+def _heartbeat_action_name(action: Any) -> str:
+    value = str(action or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "channel": "send_channel_message",
+        "send": "send_channel_message",
+        "message": "send_channel_message",
+        "dm": "dm_owner",
+        "owner_dm": "dm_owner",
+        "dm_subby": "dm_owner",
+        "codex": "queue_codex",
+        "upgrade": "queue_codex",
+        "none": "noop",
+        "no_op": "noop",
+    }
+    return aliases.get(value, value or "send_channel_message")
+
+
+def _parse_heartbeat_decision(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    with contextlib.suppress(json.JSONDecodeError):
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    with contextlib.suppress(json.JSONDecodeError):
+        data = json.loads(raw[start : end + 1])
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _heartbeat_decision_text(decision: dict[str, Any], limit: int) -> str:
+    text = str(decision.get("message") or decision.get("text") or "").strip()
+    if not text:
+        return ""
+    text = _compact(text, max(1, limit))
+    return re.sub(r"@(everyone|here)", "@\u200b\\1", text, flags=re.I)
 
 
 def _format_relationship_graph_export(

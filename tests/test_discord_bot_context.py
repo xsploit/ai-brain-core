@@ -25,6 +25,7 @@ from aibrain.discord_bot import (
     _message_text,
     _model_choice_description,
     _ordered_model_choices,
+    _parse_heartbeat_decision,
     _ping_reply,
     _ping_target_mention,
     _read_attachment_bytes,
@@ -38,6 +39,7 @@ from aibrain.discord_bot import (
     limit_pcm_s16le_peak,
     waveform_base64_from_pcm_s16le,
 )
+from aibrain.codex_bridge import CodexBridgeQueue
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
 from aibrain.tts import TTSAudio, TTSConfig
 
@@ -59,6 +61,15 @@ class _FakeChannel:
 
     def typing(self):
         return _TypingContext()
+
+    async def send(self, content):
+        self.sent.append(content)
+
+
+class _FakeUser:
+    def __init__(self, user_id=123):
+        self.id = user_id
+        self.sent = []
 
     async def send(self, content):
         self.sent.append(content)
@@ -117,6 +128,19 @@ class _FakeBrain:
         self.prompt = prompt
         self.kwargs = kwargs
         yield SimpleNamespace(type="text.delta", data={"text": "ok"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeDecisionBrain:
+    memory_stack = None
+
+    def __init__(self, text):
+        self.text = text
+        self.prompt = None
+
+    async def stream(self, prompt, **kwargs):
+        self.prompt = prompt
+        yield SimpleNamespace(type="text.delta", data={"text": self.text})
         yield SimpleNamespace(type="response.done", data={})
 
 
@@ -935,6 +959,91 @@ def test_send_heartbeat_message_posts_text_without_voice_by_default():
 
     assert text == "ok"
     assert channel.sent == ["ok"]
+
+
+def test_parse_heartbeat_decision_extracts_json_object():
+    decision = _parse_heartbeat_decision('sure\n{"action":"dm_owner","message":"yo"}\n')
+
+    assert decision == {"action": "dm_owner", "message": "yo"}
+
+
+def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"send_channel_message","message":"yo @everyone"}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    result = asyncio.run(bot._run_heartbeat_tick(channel))
+
+    assert result == "send_channel_message"
+    assert channel.sent == ["yo @\u200beveryone"]
+
+
+def test_autonomous_heartbeat_can_dm_owner(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"dm_owner","target_user_id":"123","message":"I have an upgrade idea."}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    user = _FakeUser(123)
+    bot.get_user = lambda user_id: user if user_id == 123 else None
+
+    result = asyncio.run(bot._run_heartbeat_tick(_FakeChannel()))
+
+    assert result == "dm_owner"
+    assert user.sent == ["I have an upgrade idea."]
+
+
+def test_autonomous_heartbeat_can_queue_codex_request(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain(
+        '{"action":"queue_codex","codex_prompt":"Review the heartbeat autonomy slice and suggest one improvement."}'
+    )
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999, display_name="Neuro-sama"))
+
+    result = asyncio.run(bot._run_heartbeat_tick(_FakeChannel()))
+
+    files = bot.codex_bridge.pending_files()
+    assert result == "queue_codex"
+    assert len(files) == 1
+    payload = discord_bot_module.json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["authority"]["mode"] == "autonomous_neuro"
+    assert payload["prompt"] == "Review the heartbeat autonomy slice and suggest one improvement."
 
 
 def test_bot_interactions_enabled_requires_not_ignored_and_responding():

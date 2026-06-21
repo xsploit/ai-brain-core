@@ -125,6 +125,7 @@ Current subsystems already present:
 - Ladybug graph export and relationship dashboard UI.
 - Model list, model switching, and metadata export for admin/owner use.
 - Bot pause/resume, bot-to-bot response toggle, and heartbeat controls.
+- Letta-style heartbeat autonomy can choose from a bounded action menu: channel message, owner DM, allowlisted user DM, Codex bridge queue, or noop.
 
 ## Authority Model
 
@@ -293,7 +294,8 @@ The `!codex` group should not be exposed as an LLM-callable Brain tool. It is a 
 ## Safety Rules
 
 - Owner/admin only for manual bridge commands.
-- Autonomous Neuro heartbeat can enqueue only if bridge is enabled, not paused, and rate limit allows it.
+- Autonomous Neuro heartbeat can enqueue only if bridge is enabled, not paused, and cooldown allows it.
+- Autonomous DMs are limited to owners by default; non-owner DMs require `DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS`.
 - Every request must include requester, channel, guild, and message metadata when available.
 - Queue processing is one request per heartbeat.
 - Codex must write outbox results before archiving inbox files.
