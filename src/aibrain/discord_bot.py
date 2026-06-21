@@ -26,6 +26,7 @@ import httpx
 from discord.ext import commands
 
 from . import Brain, BrainConfig, ImageInput, MemoryPolicy, MemoryStackConfig, Persona, ThreadPolicy
+from .codex_bridge import CodexBridgeQueue
 from .env import load_env_file
 from .discord_tools import (
     DISCORD_AGENT_TOOL_NAMES,
@@ -539,6 +540,7 @@ def _build_command_prefix(command_prefix_text: str):
         stripped = message.content.strip()
         if (
             stripped.startswith("!help")
+            or stripped.startswith("!codex")
             or stripped.startswith("!jb")
             or stripped.startswith("!bot")
             or stripped.startswith("!model")
@@ -831,6 +833,7 @@ class DiscordBrainBot(commands.Bot):
         self.tts_voice = os.getenv("DISCORD_BRAIN_TTS_VOICE") or os.getenv("AIBRAIN_TTS_VOICE") or os.getenv("PIPER_VOICE")
         self.send_tts_replies = _env_bool("DISCORD_BRAIN_TTS_REPLIES", DEFAULT_TTS_REPLIES)
         self.logger = logging.getLogger("aibrain.discord")
+        self.codex_bridge = CodexBridgeQueue.from_env()
         self.heartbeat_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_ENABLED", False)
         self.heartbeat_channel_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS")
         self.heartbeat_min_interval_seconds = max(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_MIN_INTERVAL_SECONDS", 60.0))
@@ -943,6 +946,8 @@ class DiscordBrainBot(commands.Bot):
             or stripped == "!help"
             or stripped == "!jb"
             or stripped.startswith("!jb ")
+            or stripped == "!codex"
+            or stripped.startswith("!codex ")
             or stripped == "!bot"
             or stripped.startswith("!bot ")
             or stripped == "!pause"
@@ -1063,6 +1068,53 @@ class DiscordBrainBot(commands.Bot):
                 lines.append(f"{key}: `{metadata[key]}`")
         await ctx.reply("\n".join(lines)[: self.max_reply_chars], mention_author=False)
 
+    async def _queue_codex_bridge_request(self, ctx: commands.Context, *, route: str, prompt: str) -> None:
+        if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+            return
+        prompt = prompt.strip()
+        route = (route or "codex").strip().lower()
+        if route not in {"codex", "harness"}:
+            await ctx.reply("usage: `!codex route <codex|harness> <prompt>`", mention_author=False)
+            return
+        if not prompt:
+            usage = "`!codex ask <prompt>`" if route == "codex" else "`!codex route <codex|harness> <prompt>`"
+            await ctx.reply(f"usage: {usage}", mention_author=False)
+            return
+        if not self.codex_bridge.enabled:
+            await ctx.reply(
+                "Codex bridge is disabled. Set `DISCORD_BRAIN_CODEX_BRIDGE_ENABLED=true` to queue requests.",
+                mention_author=False,
+            )
+            return
+        if self.codex_bridge.is_paused():
+            await ctx.reply("Codex bridge queue is paused. Use `!codex resume` first.", mention_author=False)
+            return
+        message = ctx.message
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        scope = _scope_for_message(message)
+        recent_messages = list(self.recent_by_scope.get(scope, [])[-8:])
+        delivery_mode = "harness_brain" if route == "harness" else "thread_heartbeat"
+        path = self.codex_bridge.enqueue(
+            requester_id=ctx.author.id,
+            requester_name=_display_name(ctx.author),
+            guild_id=getattr(guild, "id", None),
+            channel_id=getattr(channel, "id", None),
+            message_id=getattr(message, "id", None),
+            prompt=prompt,
+            intent="harness" if route == "harness" else "ask_codex",
+            authority_mode="manual_owner" if self._is_owner_user(ctx.author) else "manual_admin",
+            authority_reason=f"authorized Discord !codex {route} command",
+            delivery_mode=delivery_mode,
+            recent_messages=recent_messages,
+            harness_agent="claude",
+            harness_permission_profile="inspect",
+        )
+        await ctx.reply(
+            f"queued Codex bridge request `{path.name}` via `{delivery_mode}`.",
+            mention_author=False,
+        )
+
     async def _send_tts_voice_message(self, ctx: commands.Context, text: str) -> None:
         if not text.strip():
             await ctx.reply("usage: `!say <text>`", mention_author=False)
@@ -1119,6 +1171,7 @@ class DiscordBrainBot(commands.Bot):
                 "`!tts toggle` - toggle voice clips on normal replies",
                 "`!summary [limit]` - summarize recent channel messages with Remember/Export buttons",
                 "`!search <query>` - explicit Tavily web search",
+                "`!codex status` / `!codex ask <prompt>` - admin Codex bridge queue",
                 "`!heartbeat` - show optional autonomous heartbeat status",
                 f"`{prefix} status` - show model, thread, state, and memory stack",
                 f"`{prefix} remember <text>` - save a durable memory",
@@ -1232,6 +1285,81 @@ class DiscordBrainBot(commands.Bot):
                 return
             await self._send_heartbeat_message(channel)
             await ctx.reply("heartbeat tick sent.", mention_author=False)
+
+        @commands.group(name="codex", invoke_without_command=True)
+        async def codex_bridge(ctx: commands.Context) -> None:
+            if ctx.invoked_subcommand is not None:
+                return
+            await codex_status(ctx)
+
+        @codex_bridge.command(name="status")
+        async def codex_status(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+                return
+            status = self.codex_bridge.status()
+            await ctx.reply(
+                "\n".join(
+                    [
+                        f"enabled: `{status.enabled}`",
+                        f"paused: `{status.paused}`",
+                        f"root: `{status.root}`",
+                        f"pending: `{status.inbox_count}`",
+                        f"outbox: `{status.outbox_count}`",
+                        f"archived: `{status.archive_count}`",
+                        f"oldest: `{status.oldest_request or 'none'}`",
+                        f"last result: `{status.last_result or 'none'}`",
+                    ]
+                ),
+                mention_author=False,
+            )
+
+        @codex_bridge.command(name="features")
+        async def codex_features(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+                return
+            await ctx.reply(
+                "\n".join(
+                    [
+                        "Codex bridge features:",
+                        "- queue bounded requests into this Codex thread",
+                        "- attach requester/guild/channel/message metadata",
+                        "- include local recent-message buffer as context",
+                        "- optional explicit Harness route with inspect profile only",
+                        "- pause/resume/clear queue controls",
+                        "- no normal-chat user routing, no arbitrary shell command surface",
+                    ]
+                ),
+                mention_author=False,
+            )
+
+        @codex_bridge.command(name="ask")
+        async def codex_ask(ctx: commands.Context, *, prompt: str = "") -> None:
+            await self._queue_codex_bridge_request(ctx, route="codex", prompt=prompt)
+
+        @codex_bridge.command(name="route")
+        async def codex_route(ctx: commands.Context, route: str = "", *, prompt: str = "") -> None:
+            await self._queue_codex_bridge_request(ctx, route=route, prompt=prompt)
+
+        @codex_bridge.command(name="pause")
+        async def codex_pause(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+                return
+            self.codex_bridge.set_paused(True, actor_id=ctx.author.id)
+            await ctx.reply("Codex bridge queue paused.", mention_author=False)
+
+        @codex_bridge.command(name="resume")
+        async def codex_resume(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+                return
+            self.codex_bridge.set_paused(False, actor_id=ctx.author.id)
+            await ctx.reply("Codex bridge queue resumed.", mention_author=False)
+
+        @codex_bridge.command(name="clear")
+        async def codex_clear(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "Codex bridge"):
+                return
+            count = self.codex_bridge.clear_pending(actor_id=ctx.author.id)
+            await ctx.reply(f"archived `{count}` pending Codex bridge request(s).", mention_author=False)
 
         @commands.command(name="recall")
         async def recall(ctx: commands.Context, *, query: str) -> None:
@@ -1684,6 +1812,7 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(ladybug)
         self.add_command(grillo)
         self.add_command(heartbeat)
+        self.add_command(codex_bridge)
 
     def _record_recent(self, message: discord.Message) -> None:
         scope = _scope_for_message(message)

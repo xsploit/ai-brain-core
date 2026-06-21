@@ -882,6 +882,7 @@ def test_pause_command_messages_are_still_commands():
     bot.command_prefix_text = "!brain"
 
     assert bot._is_command_message(SimpleNamespace(content="!pause")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!codex ask build bridge")) is True
     assert bot._is_command_message(SimpleNamespace(content="!resume")) is True
     assert bot._is_command_message(SimpleNamespace(content="!unpause")) is True
     assert bot._is_command_message(SimpleNamespace(content="!grillo debug")) is True
