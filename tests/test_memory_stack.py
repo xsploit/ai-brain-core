@@ -456,6 +456,51 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
 
 
 @pytest.mark.asyncio
+async def test_grillo_worker_noop_falls_back_to_diary_write(tmp_path):
+    async def worker_completion(request):
+        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+
+    result = await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="Remember that my name is Subby and the channel move confused context.",
+        assistant_text="Got it, I should remember that across channels.",
+        source="discord",
+        channel_id="222",
+    )
+
+    diary = await store.list_diary(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+    candidates = await store.list_candidates(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+    turns = await store.list_turns(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+
+    assert result[0].channel_id == "222"
+    assert diary
+    assert "Subby" in diary[0].personal_thought
+    assert candidates
+    assert any("Subby" in candidate.content for candidate in candidates)
+    assert all(turn.channel_id == "222" for turn in turns)
+
+
+@pytest.mark.asyncio
 async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_participant(tmp_path):
     provider = HashEmbeddingProvider(dimensions=32)
     vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)

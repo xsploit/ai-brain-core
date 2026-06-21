@@ -981,12 +981,22 @@ class GrilloRuntime:
                 return {"ok": True, "candidates": 0, "diary": 0, "slots": 0}
             if self.worker_completion is not None:
                 try:
-                    return await self._run_worker_beat_tick(
+                    result = await self._run_worker_beat_tick(
                         scope_key=scope_key,
                         participant_key=participant_key,
                         beat_type=beat_type,
                         turns=turns,
                     )
+                    if not self._worker_result_needs_fallback(result):
+                        return result
+                    fallback = await self._run_fallback_extractor_tick(
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        beat_type=beat_type,
+                        turns=turns,
+                        reason=str(result.get("no_op_reason") or "worker_no_writes"),
+                    )
+                    return {**result, "fallback": fallback}
                 except Exception as exc:
                     await self.store.append_activity(
                         beat_type="grillo_worker_failed",
@@ -1012,31 +1022,68 @@ class GrilloRuntime:
                         metadata={"error": str(exc)},
                     )
 
-            candidates = await self._extract_candidates(turns)
-            stored_candidates = [await self.store.append_candidate(candidate) for candidate in candidates]
-            diary = await self._write_diary(scope_key, participant_key, beat_type, turns, stored_candidates)
-            promoted = await self._promote_candidates(scope_key, participant_key, stored_candidates)
-            if self.vector_store is not None:
-                await self._index_semantic(turns, stored_candidates, diary)
-            await self.store.append_activity(
-                beat_type=beat_type,
+            return await self._run_fallback_extractor_tick(
                 scope_key=scope_key,
                 participant_key=participant_key,
-                summary=f"GRILLO tick wrote {len(stored_candidates)} candidates, 1 diary entry, {len(promoted)} slots.",
-                metadata={
-                    "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
-                    "diary_id": diary.diary_id,
-                    "slot_names": [slot.slot_name for slot in promoted],
-                },
+                beat_type=beat_type,
+                turns=turns,
             )
-            return {
-                "ok": True,
-                "candidates": len(stored_candidates),
-                "diary": 1,
-                "slots": len(promoted),
+
+    @staticmethod
+    def _worker_result_needs_fallback(result: dict[str, Any]) -> bool:
+        if not result.get("ok", False):
+            return False
+        writes = int(result.get("writes") or 0)
+        if writes > 0:
+            return False
+        write_counts = (
+            "candidates",
+            "diary",
+            "slots",
+            "profile_patches",
+            "emotion_updates",
+            "archival",
+        )
+        return not any(int(result.get(key) or 0) > 0 for key in write_counts)
+
+    async def _run_fallback_extractor_tick(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        beat_type: str,
+        turns: list[GrilloTurn],
+        reason: str = "fallback_extractor",
+    ) -> dict[str, Any]:
+        candidates = await self._extract_candidates(turns)
+        stored_candidates = [await self.store.append_candidate(candidate) for candidate in candidates]
+        diary = await self._write_diary(scope_key, participant_key, beat_type, turns, stored_candidates)
+        promoted = await self._promote_candidates(scope_key, participant_key, stored_candidates)
+        if self.vector_store is not None:
+            await self._index_semantic(turns, stored_candidates, diary)
+        await self.store.append_activity(
+            beat_type=beat_type,
+            scope_key=scope_key,
+            participant_key=participant_key,
+            summary=f"GRILLO fallback extractor wrote {len(stored_candidates)} candidates, 1 diary entry, {len(promoted)} slots.",
+            metadata={
+                "mode": "fallback_extractor",
+                "reason": reason,
                 "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
                 "diary_id": diary.diary_id,
-            }
+                "slot_names": [slot.slot_name for slot in promoted],
+            },
+        )
+        return {
+            "ok": True,
+            "mode": "fallback_extractor",
+            "reason": reason,
+            "candidates": len(stored_candidates),
+            "diary": 1,
+            "slots": len(promoted),
+            "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
+            "diary_id": diary.diary_id,
+        }
 
     async def _run_worker_beat_tick(
         self,
