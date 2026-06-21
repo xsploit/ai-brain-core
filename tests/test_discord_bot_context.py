@@ -800,6 +800,8 @@ def test_pause_command_messages_are_still_commands():
     assert bot._is_command_message(SimpleNamespace(content="!pause")) is True
     assert bot._is_command_message(SimpleNamespace(content="!resume")) is True
     assert bot._is_command_message(SimpleNamespace(content="!unpause")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!grillo debug")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!ladybug search Subby")) is True
 
 
 def test_bot_interactions_enabled_requires_not_ignored_and_responding():

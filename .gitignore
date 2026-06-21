@@ -15,6 +15,7 @@ src/aibrain/voices/
 *.pyc
 *.sqlite
 *.sqlite3
+*.sqlite3.bak-*
 *.ladybug*
 *.turbovec
 *.turbovec.sqlite3

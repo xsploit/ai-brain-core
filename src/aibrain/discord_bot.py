@@ -496,6 +496,8 @@ def _build_command_prefix(command_prefix_text: str):
             or stripped.startswith("!unpause")
             or stripped.startswith("!say")
             or stripped.startswith("!tts")
+            or stripped.startswith("!grillo")
+            or stripped.startswith("!ladybug")
         ):
             prefixes.append("!")
         return commands.when_mentioned_or(*prefixes)(bot, message)
@@ -745,6 +747,10 @@ class DiscordBrainBot(commands.Bot):
             or stripped.startswith("!say ")
             or stripped == "!tts"
             or stripped.startswith("!tts ")
+            or stripped == "!grillo"
+            or stripped.startswith("!grillo ")
+            or stripped == "!ladybug"
+            or stripped.startswith("!ladybug ")
         )
 
     def _is_ignored_bot_message(self, message: discord.Message) -> bool:
@@ -1187,6 +1193,57 @@ class DiscordBrainBot(commands.Bot):
                 top_k=5,
             )
             await ctx.reply(packet.as_prompt_text()[: self.max_reply_chars], mention_author=False)
+
+        @grillo.command(name="debug", aliases=["ctx"])
+        async def grillo_debug(ctx: commands.Context, *, query: str = "") -> None:
+            if not await self._require_admin_or_owner_command(ctx, "GRILLO debug"):
+                return
+            runtime = self.brain.memory_stack.grillo if self.brain.memory_stack else None
+            if runtime is None:
+                await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
+                return
+            scope = _grillo_scope_for_message(ctx.message, self.persona.id)
+            participant = str(ctx.author.id)
+            channel_id = str(ctx.channel.id)
+            packet, turns, candidates, diary, slots, profile = await asyncio.gather(
+                runtime.build_context_packet(
+                    scope_key=scope,
+                    participant_key=participant,
+                    query=query,
+                    channel_id=channel_id,
+                    persona_name=self.persona.name,
+                    top_k=5,
+                ),
+                runtime.store.list_turns(scope, participant, limit=50),
+                runtime.store.list_candidates(scope, participant, limit=50),
+                runtime.store.list_diary(scope, participant, limit=25),
+                runtime.store.list_slots(scope, participant),
+                runtime.store.get_relationship_profile(scope),
+            )
+            lines = [
+                f"user: `{_display_name(ctx.author)}` `{participant}`",
+                f"guild: `{getattr(ctx.guild, 'name', 'dm')}` `{getattr(ctx.guild, 'id', 'dm')}`",
+                f"channel: `{getattr(ctx.channel, 'name', 'dm')}` `{channel_id}`",
+                f"channel scope: `{_scope_for_message(ctx.message)}`",
+                f"grillo scope: `{scope}`",
+                f"turns(last50): `{len(turns)}` candidates(last50): `{len(candidates)}` diary(last25): `{len(diary)}` slots: `{len(slots)}`",
+                (
+                    "profile: "
+                    f"`{profile.relationship_stage}` mood=`{profile.mood}` trust=`{profile.trust}` "
+                    f"respect=`{profile.respect}` turns=`{profile.turn_count}`"
+                    if profile is not None
+                    else "profile: `none`"
+                ),
+                (
+                    "packet: "
+                    f"channel_history=`{len(packet.channel_history)}` "
+                    f"relationship_memory=`{len(packet.relationship_memory)}` "
+                    f"recalled=`{len(packet.recalled_memories)}` thoughts=`{len(packet.thoughts)}`"
+                ),
+            ]
+            if diary:
+                lines.append(f"latest diary: `{_compact(diary[0].summary or diary[0].personal_thought, 220)}`")
+            await ctx.reply("\n".join(lines)[: self.max_reply_chars], mention_author=False)
 
         @grillo.command(name="slots")
         async def grillo_slots(ctx: commands.Context) -> None:
