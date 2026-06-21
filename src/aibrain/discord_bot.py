@@ -833,8 +833,13 @@ class DiscordBrainBot(commands.Bot):
         self.logger = logging.getLogger("aibrain.discord")
         self.heartbeat_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_ENABLED", False)
         self.heartbeat_channel_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS")
-        self.heartbeat_interval_seconds = max(60.0, _env_float("DISCORD_BRAIN_HEARTBEAT_INTERVAL_SECONDS", 900.0))
+        self.heartbeat_min_interval_seconds = max(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_MIN_INTERVAL_SECONDS", 60.0))
+        self.heartbeat_interval_seconds = max(
+            self.heartbeat_min_interval_seconds,
+            _env_float("DISCORD_BRAIN_HEARTBEAT_INTERVAL_SECONDS", 900.0),
+        )
         self.heartbeat_chance = max(0.0, min(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_CHANCE", 0.08)))
+        self.heartbeat_tts_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_TTS", False)
         self.heartbeat_task: asyncio.Task | None = None
         self._install_commands()
 
@@ -1190,8 +1195,9 @@ class DiscordBrainBot(commands.Bot):
                     [
                         f"enabled: `{self.heartbeat_enabled}`",
                         f"channels: {channels}",
-                        f"interval seconds: `{self.heartbeat_interval_seconds:.0f}`",
+                        f"interval seconds: `{self.heartbeat_min_interval_seconds:.0f}-{self.heartbeat_interval_seconds:.0f}`",
                         f"chance: `{self.heartbeat_chance:.2f}`",
+                        f"voice clip: `{self.heartbeat_tts_enabled}`",
                         f"task running: `{self.heartbeat_task is not None and not self.heartbeat_task.done()}`",
                     ]
                 ),
@@ -1224,8 +1230,7 @@ class DiscordBrainBot(commands.Bot):
             if channel is None:
                 await ctx.reply("heartbeat has no configured channel.", mention_author=False)
                 return
-            text = await self._build_heartbeat_text(channel)
-            await channel.send(text)
+            await self._send_heartbeat_message(channel)
             await ctx.reply("heartbeat tick sent.", mention_author=False)
 
         @commands.command(name="recall")
@@ -1804,18 +1809,28 @@ class DiscordBrainBot(commands.Bot):
     async def _heartbeat_loop(self) -> None:
         await self.wait_until_ready()
         while self.heartbeat_enabled and not self.is_closed():
-            await asyncio.sleep(self.heartbeat_interval_seconds)
+            delay = self._next_heartbeat_delay_seconds()
+            self.logger.info("Discord heartbeat scheduled in %.0f seconds", delay)
+            await asyncio.sleep(delay)
             if not self.heartbeat_enabled or getattr(self, "paused", False):
                 continue
             if random.random() > self.heartbeat_chance:
+                self.logger.debug("Discord heartbeat skipped by probability %.3f", self.heartbeat_chance)
                 continue
             channel = await self._heartbeat_channel()
             if channel is None:
                 continue
             try:
-                await channel.send(await self._build_heartbeat_text(channel))
+                await self._send_heartbeat_message(channel)
             except Exception:
                 self.logger.exception("Discord heartbeat tick failed")
+
+    def _next_heartbeat_delay_seconds(self) -> float:
+        minimum = min(self.heartbeat_min_interval_seconds, self.heartbeat_interval_seconds)
+        maximum = max(self.heartbeat_min_interval_seconds, self.heartbeat_interval_seconds)
+        if maximum <= minimum:
+            return maximum
+        return random.uniform(minimum, maximum)
 
     async def _heartbeat_channel(self, *, fallback: Any | None = None) -> Any | None:
         channel_ids = list(self.heartbeat_channel_ids)
@@ -1854,6 +1869,24 @@ class DiscordBrainBot(commands.Bot):
                 raise RuntimeError(event.data.get("message", "heartbeat failed"))
         text = _compact(buffer.strip() or "yo, just checking the vibe.", _env_int("DISCORD_BRAIN_HEARTBEAT_MAX_CHARS", 240))
         return re.sub(r"@(everyone|here)", "@\u200b\\1", text, flags=re.I)
+
+    async def _send_heartbeat_message(self, channel: Any) -> str:
+        text = await self._build_heartbeat_text(channel)
+        await channel.send(text)
+        await self._maybe_send_heartbeat_tts(channel, text)
+        return text
+
+    async def _maybe_send_heartbeat_tts(self, channel: Any, text: str) -> None:
+        if not getattr(self, "heartbeat_tts_enabled", False) or not getattr(self, "discord_token", None) or not text.strip():
+            return
+        try:
+            spoken = _tts_spoken_text(text)[: _env_int("DISCORD_BRAIN_TTS_MAX_CHARS", 1200)]
+            if not spoken:
+                return
+            clip = await build_discord_voice_clip(self.brain, spoken, voice=self.tts_voice)
+            await send_discord_voice_message(channel.id, self.discord_token, clip)
+        except Exception:
+            self.logger.exception("Failed to send Discord heartbeat TTS")
 
     async def _reply_with_brain(
         self,

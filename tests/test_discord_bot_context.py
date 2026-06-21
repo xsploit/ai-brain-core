@@ -891,6 +891,51 @@ def test_pause_command_messages_are_still_commands():
     assert bot._is_command_message(SimpleNamespace(content="!heartbeat tick")) is True
 
 
+def test_heartbeat_delay_uses_random_min_max_window(monkeypatch):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_min_interval_seconds = 60.0
+    bot.heartbeat_interval_seconds = 900.0
+    calls = []
+
+    def fake_uniform(low, high):
+        calls.append((low, high))
+        return 123.0
+
+    monkeypatch.setattr(discord_bot_module.random, "uniform", fake_uniform)
+
+    assert bot._next_heartbeat_delay_seconds() == 123.0
+    assert calls == [(60.0, 900.0)]
+
+
+def test_heartbeat_delay_skips_random_when_window_collapses(monkeypatch):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_min_interval_seconds = 60.0
+    bot.heartbeat_interval_seconds = 60.0
+
+    def fail_uniform(low, high):
+        raise AssertionError("collapsed heartbeat window should not call random.uniform")
+
+    monkeypatch.setattr(discord_bot_module.random, "uniform", fail_uniform)
+
+    assert bot._next_heartbeat_delay_seconds() == 60.0
+
+
+def test_send_heartbeat_message_posts_text_without_voice_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeBrain()
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    text = asyncio.run(bot._send_heartbeat_message(channel))
+
+    assert text == "ok"
+    assert channel.sent == ["ok"]
+
+
 def test_bot_interactions_enabled_requires_not_ignored_and_responding():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.ignore_bots = False
