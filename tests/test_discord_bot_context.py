@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from array import array
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from aibrain.discord_bot import (
     _time_context,
     _tts_spoken_text,
     build_discord_voice_clip,
+    limit_pcm_s16le_peak,
     waveform_base64_from_pcm_s16le,
 )
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
@@ -837,6 +839,17 @@ def test_waveform_base64_from_pcm_s16le_is_bounded():
 
     assert 1 <= len(waveform) <= 256
     assert max(waveform) == 255
+
+
+def test_limit_pcm_s16le_peak_reduces_full_scale_audio():
+    pcm = b"\xff\x7f\x00\x80\x00\x00" * 12
+
+    limited = limit_pcm_s16le_peak(pcm, target_peak=0.5)
+    samples = array("h")
+    samples.frombytes(limited)
+
+    assert max(abs(sample) for sample in samples) <= 16384
+    assert len(limited) == len(pcm)
 
 
 def test_build_discord_voice_clip_encodes_waveform_and_ogg(monkeypatch):

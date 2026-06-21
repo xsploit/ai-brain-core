@@ -1641,6 +1641,10 @@ async def build_discord_voice_clip(brain: Brain, text: str, *, voice: str | None
     isolated = _discord_voice_clip_tts_provider(brain)
     audio = await isolated.synthesize(text, **options) if isolated is not None else await brain.speak(text, **options)
     pcm, sample_rate = _tts_audio_to_pcm_s16le(audio)
+    pcm = limit_pcm_s16le_peak(
+        pcm,
+        target_peak=_env_float("DISCORD_BRAIN_VOICE_TARGET_PEAK", 0.82),
+    )
     duration_secs = _pcm_duration_secs(pcm, sample_rate)
     waveform = waveform_base64_from_pcm_s16le(pcm, sample_rate)
     ogg = await encode_pcm_s16le_to_ogg_opus(pcm, sample_rate)
@@ -1777,7 +1781,7 @@ async def encode_pcm_s16le_to_ogg_opus(pcm: bytes, sample_rate: int) -> bytes:
         "-c:a",
         "libopus",
         "-b:a",
-        "32k",
+        _voice_opus_bitrate(),
         "-f",
         "ogg",
         "pipe:1",
@@ -1789,6 +1793,29 @@ async def encode_pcm_s16le_to_ogg_opus(pcm: bytes, sample_rate: int) -> bytes:
     if process.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
     return stdout
+
+
+def limit_pcm_s16le_peak(pcm: bytes, *, target_peak: float = 0.82) -> bytes:
+    data = pcm[: len(pcm) - (len(pcm) % 2)]
+    if not data:
+        return data
+    samples = _pcm_s16le_samples(data)
+    peak = max(abs(sample) for sample in samples) if samples else 0
+    target = max(0.05, min(1.0, target_peak)) * 32767
+    if peak <= target or peak <= 0:
+        return data
+    scale = target / peak
+    limited = array("h", [max(-32768, min(32767, int(sample * scale))) for sample in samples])
+    if sys.byteorder != "little":
+        limited.byteswap()
+    return limited.tobytes()
+
+
+def _voice_opus_bitrate() -> str:
+    value = os.getenv("DISCORD_BRAIN_VOICE_OPUS_BITRATE", "64k").strip()
+    if re.fullmatch(r"\d+[kKmM]?", value):
+        return value
+    return "64k"
 
 
 def _ffmpeg_executable() -> str:
