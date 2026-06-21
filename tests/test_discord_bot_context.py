@@ -15,6 +15,7 @@ from aibrain.discord_bot import (
     ModelSelectView,
     _build_jb_persona,
     _format_summary_transcript,
+    _format_tavily_search_result,
     _format_grillo_export,
     _grillo_scope_for_message,
     _message_text,
@@ -616,6 +617,27 @@ def test_format_summary_transcript_includes_author_bot_marker_and_content():
     assert "Neuro-sama bot: yo" in transcript
 
 
+def test_format_tavily_search_result_lists_answer_and_sources():
+    text = _format_tavily_search_result(
+        {
+            "query": "discord components v2",
+            "answer": "Components v2 adds layout components.",
+            "results": [
+                {
+                    "title": "Component Reference",
+                    "url": "https://docs.discord.com/developers/components/reference",
+                    "content": "Layout, content, and interactive components.",
+                    "score": 0.91,
+                }
+            ],
+        }
+    )
+
+    assert "Components v2 adds layout components." in text
+    assert "Component Reference" in text
+    assert "https://docs.discord.com/developers/components/reference" in text
+
+
 def test_bot_message_ignore_toggle_keeps_self_guard():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -837,6 +859,8 @@ def test_pause_command_messages_are_still_commands():
     assert bot._is_command_message(SimpleNamespace(content="!grillo debug")) is True
     assert bot._is_command_message(SimpleNamespace(content="!ladybug search Subby")) is True
     assert bot._is_command_message(SimpleNamespace(content="!summary 25")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!search discord ui")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!heartbeat tick")) is True
 
 
 def test_bot_interactions_enabled_requires_not_ignored_and_responding():

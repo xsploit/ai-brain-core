@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import sys
@@ -35,7 +36,7 @@ from .discord_tools import (
 from .memory_stack.contracts import GraphQuery
 from .model_catalog import ModelChoice, list_model_choices
 from .numeric import safe_float
-from .tavily_tools import register_tavily_tools
+from .tavily_tools import TavilyConfigError, register_tavily_tools, tavily_search
 from .tools import ToolRegistry
 from .tts import PiperExecutableTTS, PiperVoice, TTSAudio, discover_piper_voices
 
@@ -310,6 +311,32 @@ def _format_summary_transcript(messages: list[discord.Message]) -> str:
     return "\n".join(lines)
 
 
+def _format_tavily_search_result(result: dict[str, Any]) -> str:
+    query = str(result.get("query") or "").strip()
+    rows = list(result.get("results") or [])[: _env_int("DISCORD_BRAIN_SEARCH_RESULTS", 5)]
+    lines = [f"Search results for `{query or 'query'}`:"]
+    if not rows:
+        answer = str(result.get("answer") or "").strip()
+        return answer or "No search results."
+    answer = str(result.get("answer") or "").strip()
+    if answer:
+        lines.append(_compact(answer, 500))
+    for index, item in enumerate(rows, start=1):
+        title = _compact(str(item.get("title") or item.get("url") or f"result {index}"), 120)
+        url = str(item.get("url") or "").strip()
+        content = _compact(str(item.get("content") or item.get("raw_content") or ""), 260)
+        score = item.get("score")
+        prefix = f"{index}. {title}"
+        if score is not None:
+            prefix += f" `{safe_float(score, 0.0):.2f}`"
+        lines.append(prefix)
+        if url:
+            lines.append(url)
+        if content:
+            lines.append(content)
+    return "\n".join(lines)
+
+
 def _message_content_text(message: discord.Message) -> str:
     return (message.clean_content or message.content or "").strip()
 
@@ -524,6 +551,8 @@ def _build_command_prefix(command_prefix_text: str):
             or stripped.startswith("!grillo")
             or stripped.startswith("!ladybug")
             or stripped.startswith("!summary")
+            or stripped.startswith("!search")
+            or stripped.startswith("!heartbeat")
         ):
             prefixes.append("!")
         return commands.when_mentioned_or(*prefixes)(bot, message)
@@ -698,6 +727,11 @@ class DiscordBrainBot(commands.Bot):
         self.tts_voice = os.getenv("DISCORD_BRAIN_TTS_VOICE") or os.getenv("AIBRAIN_TTS_VOICE") or os.getenv("PIPER_VOICE")
         self.send_tts_replies = _env_bool("DISCORD_BRAIN_TTS_REPLIES", DEFAULT_TTS_REPLIES)
         self.logger = logging.getLogger("aibrain.discord")
+        self.heartbeat_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_ENABLED", False)
+        self.heartbeat_channel_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS")
+        self.heartbeat_interval_seconds = max(60.0, _env_float("DISCORD_BRAIN_HEARTBEAT_INTERVAL_SECONDS", 900.0))
+        self.heartbeat_chance = max(0.0, min(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_CHANCE", 0.08)))
+        self.heartbeat_task: asyncio.Task | None = None
         self._install_commands()
 
     async def setup_hook(self) -> None:
@@ -710,6 +744,10 @@ class DiscordBrainBot(commands.Bot):
             self.logger.warning("Discord model metadata load failed; model command will use fallback/cache", exc_info=True)
 
     async def close(self) -> None:
+        if self.heartbeat_task is not None:
+            self.heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.heartbeat_task
         await self.brain.close()
         await super().close()
 
@@ -724,6 +762,7 @@ class DiscordBrainBot(commands.Bot):
                 type(self.brain.memory_stack.vector_store).__name__ if self.brain.memory_stack.vector_store else None,
                 bool(self.brain.memory_stack.grillo),
             )
+        self._ensure_heartbeat_task()
 
     async def on_message(self, message: discord.Message) -> None:
         if self._is_ignored_bot_message(message):
@@ -816,6 +855,10 @@ class DiscordBrainBot(commands.Bot):
             or stripped.startswith("!summary ")
             or stripped == "!summarize"
             or stripped.startswith("!summarize ")
+            or stripped == "!search"
+            or stripped.startswith("!search ")
+            or stripped == "!heartbeat"
+            or stripped.startswith("!heartbeat ")
         )
 
     def _is_ignored_bot_message(self, message: discord.Message) -> bool:
@@ -966,6 +1009,8 @@ class DiscordBrainBot(commands.Bot):
                 "`!tts voice <voice-id>` - choose a Piper voice",
                 "`!tts toggle` - toggle voice clips on normal replies",
                 "`!summary [limit]` - summarize recent channel messages with Remember/Export buttons",
+                "`!search <query>` - explicit Tavily web search",
+                "`!heartbeat` - show optional autonomous heartbeat status",
                 f"`{prefix} status` - show model, thread, state, and memory stack",
                 f"`{prefix} remember <text>` - save a durable memory",
                 f"`{prefix} recall <query>` - search long-term memory",
@@ -1016,6 +1061,66 @@ class DiscordBrainBot(commands.Bot):
             source_label = f"#{getattr(ctx.channel, 'name', 'dm')} last {limit}"
             view = SummaryActionView(self, ctx.author.id, scope, summary_text, source_label)
             await ctx.reply(summary_text[: self.max_reply_chars], mention_author=False, view=view)
+
+        @commands.command(name="search")
+        async def search(ctx: commands.Context, *, query: str = "") -> None:
+            query = query.strip()
+            if not query:
+                await ctx.reply("usage: `!search <query>`", mention_author=False)
+                return
+            try:
+                result = await tavily_search(query, max_results=_env_int("DISCORD_BRAIN_SEARCH_RESULTS", 5))
+            except TavilyConfigError as exc:
+                await ctx.reply(str(exc), mention_author=False)
+                return
+            lines = _format_tavily_search_result(result)
+            await ctx.reply(lines[: self.max_reply_chars], mention_author=False)
+
+        @commands.group(name="heartbeat", invoke_without_command=True)
+        async def heartbeat(ctx: commands.Context) -> None:
+            channels = ", ".join(f"`{channel_id}`" for channel_id in sorted(self.heartbeat_channel_ids)) or "`none`"
+            await ctx.reply(
+                "\n".join(
+                    [
+                        f"enabled: `{self.heartbeat_enabled}`",
+                        f"channels: {channels}",
+                        f"interval seconds: `{self.heartbeat_interval_seconds:.0f}`",
+                        f"chance: `{self.heartbeat_chance:.2f}`",
+                        f"task running: `{self.heartbeat_task is not None and not self.heartbeat_task.done()}`",
+                    ]
+                ),
+                mention_author=False,
+            )
+
+        @heartbeat.command(name="start")
+        async def heartbeat_start(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "heartbeat control"):
+                return
+            self.heartbeat_enabled = True
+            self._ensure_heartbeat_task()
+            await ctx.reply("heartbeat enabled for configured channels.", mention_author=False)
+
+        @heartbeat.command(name="stop")
+        async def heartbeat_stop(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "heartbeat control"):
+                return
+            self.heartbeat_enabled = False
+            if self.heartbeat_task is not None:
+                self.heartbeat_task.cancel()
+                self.heartbeat_task = None
+            await ctx.reply("heartbeat stopped.", mention_author=False)
+
+        @heartbeat.command(name="tick")
+        async def heartbeat_tick(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "heartbeat control"):
+                return
+            channel = await self._heartbeat_channel(fallback=ctx.channel)
+            if channel is None:
+                await ctx.reply("heartbeat has no configured channel.", mention_author=False)
+                return
+            text = await self._build_heartbeat_text(channel)
+            await channel.send(text)
+            await ctx.reply("heartbeat tick sent.", mention_author=False)
 
         @commands.command(name="recall")
         async def recall(ctx: commands.Context, *, query: str) -> None:
@@ -1413,6 +1518,7 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(status)
         self.add_command(remember)
         self.add_command(summary)
+        self.add_command(search)
         self.add_command(recall)
         self.add_command(jb)
         self.add_command(pause)
@@ -1424,6 +1530,7 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(tts_control)
         self.add_command(ladybug)
         self.add_command(grillo)
+        self.add_command(heartbeat)
 
     def _record_recent(self, message: discord.Message) -> None:
         scope = _scope_for_message(message)
@@ -1535,6 +1642,70 @@ class DiscordBrainBot(commands.Bot):
             elif event.type == "error":
                 raise RuntimeError(event.data.get("message", "summary failed"))
         return buffer.strip() or "No summary generated."
+
+    def _ensure_heartbeat_task(self) -> None:
+        if not self.heartbeat_enabled:
+            return
+        if not self.heartbeat_channel_ids:
+            self.logger.warning("Discord heartbeat enabled but DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS is empty.")
+            return
+        if self.heartbeat_task is not None and not self.heartbeat_task.done():
+            return
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="discord-brain-heartbeat")
+
+    async def _heartbeat_loop(self) -> None:
+        await self.wait_until_ready()
+        while self.heartbeat_enabled and not self.is_closed():
+            await asyncio.sleep(self.heartbeat_interval_seconds)
+            if not self.heartbeat_enabled or getattr(self, "paused", False):
+                continue
+            if random.random() > self.heartbeat_chance:
+                continue
+            channel = await self._heartbeat_channel()
+            if channel is None:
+                continue
+            try:
+                await channel.send(await self._build_heartbeat_text(channel))
+            except Exception:
+                self.logger.exception("Discord heartbeat tick failed")
+
+    async def _heartbeat_channel(self, *, fallback: Any | None = None) -> Any | None:
+        channel_ids = list(self.heartbeat_channel_ids)
+        if not channel_ids and fallback is not None:
+            return fallback
+        if not channel_ids:
+            return None
+        channel_id = random.choice(channel_ids)
+        channel = self.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        with contextlib.suppress(Exception):
+            return await self.fetch_channel(channel_id)
+        return None
+
+    async def _build_heartbeat_text(self, channel: Any) -> str:
+        prompt = (
+            os.getenv("DISCORD_BRAIN_HEARTBEAT_PROMPT")
+            or "Write one short casual Discord message as Neuro-sama. Keep it under 240 characters, no mass mentions, no commands."
+        )
+        buffer = ""
+        async for event in self.brain.stream(
+            prompt,
+            thread_id=f"discord:heartbeat:{getattr(channel, 'id', 'unknown')}",
+            persona=self.persona,
+            use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_HEARTBEAT_MEMORY_TOP_K", 3)),
+            tool_names=[],
+            stateless=True,
+            memory_query_text="heartbeat",
+            memory_event_text="",
+            history_text="heartbeat",
+        ):
+            if event.type == "text.delta":
+                buffer += event.data.get("text", "")
+            elif event.type == "error":
+                raise RuntimeError(event.data.get("message", "heartbeat failed"))
+        text = _compact(buffer.strip() or "yo, just checking the vibe.", _env_int("DISCORD_BRAIN_HEARTBEAT_MAX_CHARS", 240))
+        return re.sub(r"@(everyone|here)", "@\u200b\\1", text, flags=re.I)
 
     async def _reply_with_brain(
         self,
