@@ -1,0 +1,6 @@
+inbox/*.json
+outbox/*.json
+archive/*.json
+state.json
+*.tmp
+
