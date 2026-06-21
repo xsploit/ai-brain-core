@@ -503,9 +503,39 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
 
 
 @pytest.mark.asyncio
-async def test_grillo_worker_noop_falls_back_to_diary_write(tmp_path):
+async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
+    requests = []
+
     async def worker_completion(request):
-        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+        requests.append(request)
+        if len(requests) == 1:
+            return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+        if len(requests) == 2:
+            assert "No write tool has succeeded" in request["messages"][-1]["content"]
+            return {
+                "text": json.dumps(
+                    {
+                        "done": False,
+                        "notes": "forced diary write",
+                        "toolCalls": [
+                            {
+                                "name": "core.worker_diary_write",
+                                "args": {
+                                    "summary": "Subby clarified the cross-channel memory identity issue.",
+                                    "personal_thought": (
+                                        "Subby got frustrated because the bot confused context across channels. "
+                                        "I should remember that he wants the memory worker itself to write reflections, "
+                                        "not a fallback parser pretending it handled the beat."
+                                    ),
+                                    "tags": ["relationship", "memory"],
+                                    "beat_type": "relationship",
+                                },
+                            }
+                        ],
+                    }
+                )
+            }
+        return {"text": json.dumps({"done": True, "notes": "done after write", "toolCalls": []})}
 
     store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
     runtime = GrilloRuntime(
@@ -528,11 +558,6 @@ async def test_grillo_worker_noop_falls_back_to_diary_write(tmp_path):
         "user-alpha",
         limit=4,
     )
-    candidates = await store.list_candidates(
-        "discord:guild:alpha:user:user-alpha:persona:neuro",
-        "user-alpha",
-        limit=4,
-    )
     turns = await store.list_turns(
         "discord:guild:alpha:user:user-alpha:persona:neuro",
         "user-alpha",
@@ -540,11 +565,46 @@ async def test_grillo_worker_noop_falls_back_to_diary_write(tmp_path):
     )
 
     assert result[0].channel_id == "222"
+    assert len(requests) == 3
     assert diary
-    assert "Subby" in diary[0].personal_thought
-    assert candidates
-    assert any("Subby" in candidate.content for candidate in candidates)
+    assert "fallback parser" in diary[0].personal_thought
     assert all(turn.channel_id == "222" for turn in turns)
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
+    async def worker_completion(request):
+        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="This should force the AI worker to write.",
+        assistant_text="I should write memory through GRILLO tools.",
+        source="discord",
+        run_tick=False,
+    )
+
+    result = await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="manual_panel",
+    )
+    diary = await store.list_diary(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+
+    assert result["ok"] is False
+    assert result["no_op_reason"] == "worker_no_writes"
+    assert diary == []
 
 
 @pytest.mark.asyncio

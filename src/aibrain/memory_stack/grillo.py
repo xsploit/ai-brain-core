@@ -981,30 +981,26 @@ class GrilloRuntime:
                 return {"ok": True, "candidates": 0, "diary": 0, "slots": 0}
             if self.worker_completion is not None:
                 try:
-                    result = await self._run_worker_beat_tick(
+                    return await self._run_worker_beat_tick(
                         scope_key=scope_key,
                         participant_key=participant_key,
                         beat_type=beat_type,
                         turns=turns,
                     )
-                    if not self._worker_result_needs_fallback(result):
-                        return result
-                    fallback = await self._run_fallback_extractor_tick(
-                        scope_key=scope_key,
-                        participant_key=participant_key,
-                        beat_type=beat_type,
-                        turns=turns,
-                        reason=str(result.get("no_op_reason") or "worker_no_writes"),
-                    )
-                    return {**result, "fallback": fallback}
                 except Exception as exc:
                     await self.store.append_activity(
                         beat_type="grillo_worker_failed",
                         scope_key=scope_key,
                         participant_key=participant_key,
-                        summary=f"GRILLO worker failed; using fallback reflector: {type(exc).__name__}",
+                        summary=f"GRILLO worker failed without fallback: {type(exc).__name__}",
                         metadata={"error": str(exc)},
                     )
+                    return {
+                        "ok": False,
+                        "mode": "worker_loop",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
             if self.reflector is not None:
                 try:
                     return await self._run_reflection_tick(
@@ -1028,23 +1024,6 @@ class GrilloRuntime:
                 beat_type=beat_type,
                 turns=turns,
             )
-
-    @staticmethod
-    def _worker_result_needs_fallback(result: dict[str, Any]) -> bool:
-        if not result.get("ok", False):
-            return False
-        writes = int(result.get("writes") or 0)
-        if writes > 0:
-            return False
-        write_counts = (
-            "candidates",
-            "diary",
-            "slots",
-            "profile_patches",
-            "emotion_updates",
-            "archival",
-        )
-        return not any(int(result.get(key) or 0) > 0 for key in write_counts)
 
     async def _run_fallback_extractor_tick(
         self,
@@ -1164,13 +1143,41 @@ class GrilloRuntime:
             last_notes = _compact(str(parsed.get("notes") or ""), 500)
             calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
             if not calls:
-                if parsed.get("done") is True:
+                if writes > 0:
                     break
+                messages.append({"role": "assistant", "content": raw_text})
+                if round_index < max_rounds:
+                    await self.store.append_activity(
+                        beat_type=beat_type,
+                        scope_key=scope_key,
+                        participant_key=participant_key,
+                        summary="GRILLO worker returned no write tool calls; forcing an AI write repair round.",
+                        metadata={
+                            "mode": "worker_loop",
+                            "notes": last_notes,
+                            "trace_id": last_trace_id,
+                            "writes": writes,
+                            "done": bool(parsed.get("done")),
+                        },
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Not complete. No write tool has succeeded in this beat. "
+                                "Call core.worker_diary_write now with a grounded private first-person reflection "
+                                "using the recent turn ids. If a durable relationship slot, profile patch, or emotion "
+                                "update is grounded, call those write tools too. Do not return done=true until at least "
+                                "one write tool succeeds."
+                            ),
+                        }
+                    )
+                    continue
                 await self.store.append_activity(
                     beat_type=beat_type,
                     scope_key=scope_key,
                     participant_key=participant_key,
-                    summary="GRILLO worker returned no tool calls before done.",
+                    summary="GRILLO worker failed to write after repair rounds.",
                     metadata={
                         "mode": "worker_loop",
                         "notes": last_notes,
@@ -1179,9 +1186,9 @@ class GrilloRuntime:
                     },
                 )
                 return {
-                    "ok": True,
+                    "ok": False,
                     "mode": "worker_loop",
-                    "no_op_reason": "worker_no_tool_calls" if writes == 0 else None,
+                    "no_op_reason": "worker_no_writes",
                     "writes": writes,
                     "tool_calls": tool_calls,
                     **counts,
@@ -1220,10 +1227,37 @@ class GrilloRuntime:
                     "role": "user",
                     "content": (
                         "Continue this GRILLO beat. Use more worker tools if needed. "
-                        "If complete, return JSON with done=true and toolCalls=[]."
+                        "Only return JSON with done=true and toolCalls=[] after at least one write tool has succeeded."
                     ),
                 }
             )
+
+        if writes == 0:
+            await self.store.append_activity(
+                beat_type=beat_type,
+                scope_key=scope_key,
+                participant_key=participant_key,
+                summary="GRILLO worker exhausted rounds without any write tools succeeding.",
+                metadata={
+                    "mode": "worker_loop",
+                    "notes": last_notes,
+                    "provider": last_provider,
+                    "model": last_model,
+                    "trace_id": last_trace_id,
+                    "writes": writes,
+                    "tool_calls": tool_calls,
+                    **counts,
+                },
+            )
+            return {
+                "ok": False,
+                "mode": "worker_loop",
+                "no_op_reason": "worker_no_writes",
+                "writes": writes,
+                "tool_calls": tool_calls,
+                "trace_id": last_trace_id,
+                **counts,
+            }
 
         await self.store.append_activity(
             beat_type=beat_type,
@@ -2224,7 +2258,9 @@ def _build_backend_worker_system_prompt() -> str:
             '- core.worker_emotion_update args: {"intensities": {"emotion_name": number}, "operation"?: "merge|replace", "last_signal_source"?: string}',
             '- core.worker_memory_insert_archival args: {"text": string}',
             "",
-            "First read or search memory if needed. Then call write tools. When finished, return done=true and toolCalls=[].",
+            "First read or search memory if needed. Then call write tools.",
+            "Do not return done=true until at least one write tool has succeeded in this beat.",
+            "If there is no durable slot/profile update, write a core.worker_diary_write reflection about why the beat did or did not change the relationship state.",
         ]
     )
 
@@ -2334,7 +2370,9 @@ def _build_backend_beat_prompt(
                 ensure_ascii=False,
             ),
             "",
-            "If there is nothing useful to write, return done=true with no toolCalls.",
+            "This beat must be written by the AI worker. Do not finish with zero writes.",
+            "At minimum, call core.worker_diary_write with a grounded private first-person reflection.",
+            "Only after a write tool succeeds may you return done=true with no toolCalls.",
         ]
     )
 
