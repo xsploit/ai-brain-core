@@ -8,6 +8,7 @@ Neuro can act as a Discord-side control plane for bounded requests into this Cod
 
 - Current Codex thread id: `019e53da-7adc-7251-a203-e9da141553f7`
 - Use the Codex app heartbeat with `destination=thread` so wakeups resume this current Codex thread.
+- If a future local app-server client is added, it must resume this thread id before starting turns.
 - Do not create a new Codex thread for bridge work unless Subby explicitly asks.
 - The heartbeat should read this document first, then inspect the queue.
 - If no queued request exists, do not invent work.
@@ -29,6 +30,7 @@ Each inbox file should be JSON:
 
 ```json
 {
+  "schema": "neuro_codex_bridge.request.v1",
   "id": "uuid-or-snowflake",
   "created_at": "2026-06-21T00:00:00-07:00",
   "source": "discord",
@@ -40,6 +42,15 @@ Each inbox file should be JSON:
   "intent": "ask_codex|review|research|harness|implement",
   "priority": "normal",
   "prompt": "What Neuro wants Codex to handle.",
+  "authority": {
+    "mode": "manual_admin|manual_owner|autonomous_neuro",
+    "authorized": true,
+    "reason": "why this request is allowed"
+  },
+  "delivery": {
+    "mode": "thread_heartbeat|codex_app_server|harness_brain",
+    "thread_id": "019e53da-7adc-7251-a203-e9da141553f7"
+  },
   "context": {
     "recent_messages": [],
     "attachments": [],
@@ -49,6 +60,23 @@ Each inbox file should be JSON:
     "agent": "claude",
     "permission_profile": "inspect"
   }
+}
+```
+
+Outbox result files should be JSON:
+
+```json
+{
+  "schema": "neuro_codex_bridge.result.v1",
+  "request_id": "uuid-or-snowflake",
+  "processed_at": "2026-06-21T00:00:00-07:00",
+  "status": "completed|rejected|failed|deferred",
+  "summary": "short human-readable result",
+  "codex_thread_id": "019e53da-7adc-7251-a203-e9da141553f7",
+  "commit": "optional git commit hash",
+  "verification": ["commands or checks run"],
+  "reply_for_discord": "optional safe Discord-facing summary",
+  "details": {}
 }
 ```
 
@@ -124,6 +152,102 @@ Codex-side processing:
 - Prefer read-only analysis unless the request is from Subby/admin and explicitly asks for edits.
 - Do not run Harness `edit` or `full-auto` from an autonomous Neuro request.
 - Write a result to outbox before archiving the inbox file.
+
+## Codex App Server Research
+
+Official Codex app-server protocol facts to anchor future work:
+
+- `codex app-server` is JSON-RPC 2.0 style messaging over stdio, websocket, or unix socket transports.
+- The server requires an `initialize` request first, then an `initialized` notification.
+- To use this existing thread, call `thread/resume` with `threadId: "019e53da-7adc-7251-a203-e9da141553f7"`.
+- To wake Codex in that resumed thread, call `turn/start` with that `threadId` and an `input` array.
+- `turn/start` requires `threadId` and `input`.
+- Text input shape is `{ "type": "text", "text": "..." }`.
+- `hooks/list` exists in the local generated schema and accepts optional `cwds`.
+- Hook notifications include `hook/started` and `hook/completed`-style schemas with `threadId`, optional `turnId`, and `run`.
+- Websocket app-server is marked experimental; the current safest local route is stdio or the existing Codex app heartbeat.
+
+Minimal app-server wake request shape:
+
+```json
+{
+  "method": "thread/resume",
+  "id": 1,
+  "params": {
+    "threadId": "019e53da-7adc-7251-a203-e9da141553f7",
+    "cwd": "C:\\Users\\SUBSECT\\Documents\\GitHub\\Brain"
+  }
+}
+```
+
+```json
+{
+  "method": "turn/start",
+  "id": 2,
+  "params": {
+    "threadId": "019e53da-7adc-7251-a203-e9da141553f7",
+    "cwd": "C:\\Users\\SUBSECT\\Documents\\GitHub\\Brain",
+    "approvalPolicy": "never",
+    "input": [
+      {
+        "type": "text",
+        "text": "Process one authorized Neuro Codex bridge request. Read docs/neuro-codex-bridge.md first."
+      }
+    ]
+  }
+}
+```
+
+Do not build this as the first slice unless the queue heartbeat is insufficient. Direct app-server control is more powerful than queue polling and must keep the same authority model.
+
+## Harness Brain Hooks Research
+
+The local Harness brain hook runner lives under `C:\Users\SUBSECT\Documents\Harness\codex_app_server`.
+
+Current manifest file:
+
+- `C:\Users\SUBSECT\Documents\Harness\codex_app_server\brain.json`
+
+The Harness hook engine supports:
+
+- hook `event` matching, including wildcards
+- hook `condition` matching against `event`, `payload`, and `ts`
+- hook types: `agent`, `shell`, `http`
+- retries and retry delay
+- prompt templating with `{payload}`, `{event}`, and `{ts}`
+
+Useful CLI commands:
+
+```powershell
+Set-Location -LiteralPath "C:\Users\SUBSECT\Documents\Harness"
+$env:PYTHONPATH = "C:\Users\SUBSECT\Documents\Harness\src"
+py -3 -m agency_harness brain validate --root "C:\Users\SUBSECT\Documents\Harness\codex_app_server"
+py -3 -m agency_harness brain emit --root "C:\Users\SUBSECT\Documents\Harness\codex_app_server" --event neuro.codex.requested --payload-file "C:\path\to\payload.json"
+py -3 -m agency_harness brain heartbeat --root "C:\Users\SUBSECT\Documents\Harness\codex_app_server" --iterations 1 --payload-file "C:\path\to\payload.json"
+```
+
+Recommended bridge events:
+
+- `neuro.codex.requested`: an authorized Discord command/autonomous heartbeat created a queue item.
+- `neuro.codex.processed`: Codex processed a queue item and wrote outbox.
+- `neuro.codex.rejected`: request failed authority checks.
+- `neuro.codex.failed`: processing failed after Codex/Harness attempted it.
+
+Recommended hook payload:
+
+```json
+{
+  "schema": "neuro_codex_bridge.hook_event.v1",
+  "request_id": "uuid-or-snowflake",
+  "thread_id": "019e53da-7adc-7251-a203-e9da141553f7",
+  "inbox_file": "C:\\Users\\SUBSECT\\Documents\\GitHub\\Brain\\codex_bridge\\inbox\\request.json",
+  "authority_mode": "manual_owner",
+  "intent": "ask_codex",
+  "summary": "short routing summary"
+}
+```
+
+Harness hooks are good for observability, fan-out, and optional subagent routing. They should not replace the queue as the source of truth.
 
 ## Harness Commands
 
