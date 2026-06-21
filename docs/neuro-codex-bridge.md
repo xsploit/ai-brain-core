@@ -6,6 +6,7 @@ Neuro can act as a Discord-side control plane for bounded requests into this Cod
 
 ## Current Thread Contract
 
+- Current Codex thread id: `019e53da-7adc-7251-a203-e9da141553f7`
 - Use the Codex app heartbeat with `destination=thread` so wakeups resume this current Codex thread.
 - Do not create a new Codex thread for bridge work unless Subby explicitly asks.
 - The heartbeat should read this document first, then inspect the queue.
@@ -110,4 +111,3 @@ Verified agents on this machine as of 2026-06-21:
    - `DISCORD_BRAIN_CODEX_BRIDGE_MIN_INTERVAL_SECONDS=1800`
 4. Add a Codex thread heartbeat that reads this doc and processes one inbox file.
 5. After queue is proven, add Harness routing for requests with `"intent": "harness"`.
-
