@@ -558,7 +558,7 @@ async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
                     }
                 )
             }
-        return {"text": json.dumps({"done": True, "notes": "done after write", "toolCalls": []})}
+        return {"text": json.dumps({"done": True, "notes": "done after write", "toolCalls": [], "relationship": None})}
 
     store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
     runtime = GrilloRuntime(

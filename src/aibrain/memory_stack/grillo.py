@@ -1091,7 +1091,7 @@ class GrilloRuntime:
             {"role": "user", "content": user_prompt},
         ]
         source_turn_ids = [turn.turn_id for turn in turns if turn.turn_id]
-        max_rounds = 4
+        max_rounds = 6
         max_tool_rounds = 15
         writes = 0
         tool_calls = 0
@@ -1108,6 +1108,7 @@ class GrilloRuntime:
         last_model = "runtime-model"
         last_notes = ""
         final_relationship_reflection: dict[str, Any] | None = None
+        final_relationship_seen = False
 
         for round_index in range(1, max_rounds + 1):
             raw_result = await self.worker_completion(
@@ -1142,12 +1143,28 @@ class GrilloRuntime:
 
             parsed = _parse_worker_json(raw_text)
             last_notes = _compact(str(parsed.get("notes") or ""), 500)
+            if _worker_relationship_present(parsed):
+                final_relationship_seen = True
             relationship_reflection = _worker_relationship_reflection(parsed)
             if relationship_reflection:
                 final_relationship_reflection = relationship_reflection
             calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
             if not calls:
                 if writes > 0:
+                    if not final_relationship_seen and round_index < max_rounds:
+                        messages.append({"role": "assistant", "content": raw_text})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Finalization missing. A write tool has succeeded, but the final WebWaifu "
+                                    "relationship field is absent. Return only JSON now: "
+                                    '{"done":true,"toolCalls":[],"relationship":{...},"notes":"short status"} '
+                                    "when relationship/mood changed, or relationship:null when it did not."
+                                ),
+                            }
+                        )
+                        continue
                     break
                 messages.append({"role": "assistant", "content": raw_text})
                 if round_index < max_rounds:
@@ -2418,6 +2435,28 @@ def _parse_worker_json(raw_text: str) -> dict[str, Any]:
     return {}
 
 
+WORKER_RELATIONSHIP_KEYS = (
+    "relationship_stage",
+    "relationshipStage",
+    "stage",
+    "mood",
+    "actionTag",
+    "trustDelta",
+    "trust_delta",
+    "summary",
+    "rikoDiaryEntry",
+)
+
+
+def _worker_relationship_present(parsed: dict[str, Any]) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    if "relationship" in parsed or "relationship_profile" in parsed or "profile_patches" in parsed:
+        return True
+    memory = parsed.get("memory")
+    return isinstance(memory, dict) and _first_present(memory, WORKER_RELATIONSHIP_KEYS) is not None
+
+
 def _worker_relationship_reflection(parsed: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
@@ -2429,18 +2468,7 @@ def _worker_relationship_reflection(parsed: dict[str, Any]) -> dict[str, Any] | 
             break
     memory = parsed.get("memory")
     if "relationship" not in reflection and "relationship_profile" not in reflection and isinstance(memory, dict):
-        relationship_keys = (
-            "relationship_stage",
-            "relationshipStage",
-            "stage",
-            "mood",
-            "actionTag",
-            "trustDelta",
-            "trust_delta",
-            "summary",
-            "rikoDiaryEntry",
-        )
-        if _first_present(memory, relationship_keys) is not None:
+        if _first_present(memory, WORKER_RELATIONSHIP_KEYS) is not None:
             reflection["relationship"] = memory
     patches = _as_list(parsed.get("profile_patches"))
     if patches:
