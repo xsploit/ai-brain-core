@@ -155,6 +155,33 @@ Codex-side processing:
 - Do not run Harness `edit` or `full-auto` from an autonomous Neuro request.
 - Write a result to outbox before archiving the inbox file.
 
+## Proper Local Bridge Runner
+
+The Codex heartbeat queue watcher was removed because it made Codex poll itself on a timer. The preferred local bridge is now an explicit Brain-owned process:
+
+```powershell
+Set-Location -LiteralPath "C:\Users\SUBSECT\Documents\GitHub\Brain"
+.\.venv\Scripts\python.exe -m aibrain.codex_app_bridge --once --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
+.\.venv\Scripts\python.exe -m aibrain.codex_app_bridge --watch --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
+```
+
+Installed script entrypoint:
+
+```powershell
+aibrain-codex-bridge --watch --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
+```
+
+Behavior:
+
+- Reads the same `codex_bridge/inbox` files Neuro writes.
+- Validates schema, owner id, authority metadata, paused state, and supported delivery mode before contacting Codex.
+- Starts `codex app-server --stdio` through the installed Node entrypoint.
+- Sends `initialize`, `initialized`, `thread/resume`, then `turn/start` for thread `019e53da-7adc-7251-a203-e9da141553f7`.
+- Writes a result JSON to `codex_bridge/outbox` before archiving the request.
+- Processes one request per `--once` call; `--watch` is the long-running local bridge service.
+
+This still does not give normal Discord users or Neuro raw shell access. Neuro only writes bounded queue JSON through owner-gated tools and the bridge runner applies the authority model again before waking Codex.
+
 ## Codex App Server Research
 
 Official Codex app-server protocol facts to anchor future work:

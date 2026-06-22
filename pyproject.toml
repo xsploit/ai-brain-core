@@ -51,6 +51,7 @@ dev = [
 [project.scripts]
 aibrain = "aibrain.cli:main"
 aibrain-discord = "aibrain.discord_bot:main"
+aibrain-codex-bridge = "aibrain.codex_app_bridge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
