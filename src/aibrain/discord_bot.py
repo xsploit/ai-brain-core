@@ -3814,7 +3814,7 @@ def _local_piper_executable() -> Path | None:
 
 
 def build_brain() -> Brain:
-    database_path = Path(os.getenv("DISCORD_BRAIN_DATABASE_PATH", os.getenv("AIBRAIN_DATABASE_PATH", "discord_brain.sqlite3")))
+    database_path = _discord_database_path()
     config = BrainConfig(
         database_path=database_path,
         provider="vercel",
@@ -3840,6 +3840,15 @@ def build_brain() -> Brain:
     register_tavily_tools(tools)
     register_discord_tools(tools)
     return Brain(config=config, tools=tools)
+
+
+def _discord_database_path() -> Path:
+    return Path(
+        os.getenv("DISCORD_BRAIN_DATABASE_PATH")
+        or os.getenv("AIBRAIN_DATABASE_PATH")
+        or os.getenv("AIBRAIN_DATABASE")
+        or "discord_brain.sqlite3"
+    )
 
 
 def build_persona() -> Persona:

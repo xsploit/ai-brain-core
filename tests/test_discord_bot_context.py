@@ -843,6 +843,17 @@ def test_tts_replies_default_off():
     assert DEFAULT_TTS_REPLIES is False
 
 
+def test_discord_database_path_accepts_aibrain_database_alias(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISCORD_BRAIN_DATABASE_PATH", raising=False)
+    monkeypatch.delenv("AIBRAIN_DATABASE_PATH", raising=False)
+    monkeypatch.setenv("AIBRAIN_DATABASE", str(tmp_path / "brain.sqlite3"))
+
+    brain = discord_bot_module.build_brain()
+
+    assert brain.config.database_path == tmp_path / "brain.sqlite3"
+    asyncio.run(brain.close())
+
+
 def test_tts_spoken_text_removes_markdown_formatting():
     text = "# **Big** update\n- *first* item\n- `code` and [docs](https://example.com)\nplain *asterisks*"
 

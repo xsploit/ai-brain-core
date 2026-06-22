@@ -154,3 +154,41 @@ def test_discord_grillo_backfill_moves_channel_rows_to_server_user_scope(tmp_pat
     assert second.diary_entries == 0
     assert second.slots == 0
     assert second.profiles == 0
+
+
+def test_discord_grillo_backfill_backup_copies_memory_sidecars(tmp_path):
+    db_path = tmp_path / "brain.sqlite3"
+    store = SQLiteGrilloStore(db_path)
+    legacy_scope = "discord:guild:guild-1:channel:chan-1"
+    store._append_turn_sync(
+        GrilloTurn(
+            turn_id="turn-old-user",
+            scope_key=legacy_scope,
+            participant_key="user-1",
+            role="user",
+            content="Remember this before backup.",
+            author_name="Subby",
+            channel_id="chan-1",
+            source="discord",
+            metadata={},
+            created_at="2026-06-21T01:00:00+00:00",
+        )
+    )
+    store.close()
+    (tmp_path / "brain.ladybug").write_text("ladybug", encoding="utf-8")
+    (tmp_path / "brain.ladybug.wal").write_text("ladybug wal", encoding="utf-8")
+    turbovec = tmp_path / "brain.turbovec"
+    turbovec.mkdir()
+    (turbovec / "index.bin").write_text("index", encoding="utf-8")
+    (tmp_path / "brain.turbovec.sqlite3").write_text("metadata", encoding="utf-8")
+    (tmp_path / "brain.turbovec.sqlite3-wal").write_text("metadata wal", encoding="utf-8")
+
+    report = backfill_discord_grillo_memory(db_path, participant_keys=["user-1"], dry_run=False, backup=True)
+    backup_path = tmp_path / report.backup_path
+
+    assert backup_path.exists()
+    assert backup_path.with_name(f"{backup_path.name}.brain.ladybug").read_text(encoding="utf-8") == "ladybug"
+    assert backup_path.with_name(f"{backup_path.name}.brain.ladybug.wal").read_text(encoding="utf-8") == "ladybug wal"
+    assert (backup_path.with_name(f"{backup_path.name}.brain.turbovec") / "index.bin").read_text(encoding="utf-8") == "index"
+    assert backup_path.with_name(f"{backup_path.name}.brain.turbovec.sqlite3").read_text(encoding="utf-8") == "metadata"
+    assert backup_path.with_name(f"{backup_path.name}.brain.turbovec.sqlite3-wal").read_text(encoding="utf-8") == "metadata wal"

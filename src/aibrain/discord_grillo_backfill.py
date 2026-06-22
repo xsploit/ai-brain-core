@@ -555,7 +555,34 @@ def _backup_sqlite_db(path: Path) -> str:
         extra = Path(f"{path}{suffix}")
         if extra.exists():
             shutil.copy2(extra, Path(f"{backup_path}{suffix}"))
+    for sidecar in _derived_memory_sidecars(path):
+        _copy_backup_sidecar(sidecar, backup_path.with_name(f"{backup_path.name}.{sidecar.name}"))
     return str(backup_path)
+
+
+def _derived_memory_sidecars(path: Path) -> list[Path]:
+    ladybug = path.with_suffix(".ladybug") if path.suffix else path / "memory.ladybug"
+    turbovec = path.with_suffix(".turbovec") if path.suffix else path / "memory.turbovec"
+    turbovec_metadata = path.with_suffix(".turbovec.sqlite3") if path.suffix else path / "memory.turbovec.sqlite3"
+    return [
+        ladybug,
+        Path(f"{ladybug}.wal"),
+        turbovec,
+        turbovec_metadata,
+        Path(f"{turbovec_metadata}-wal"),
+        Path(f"{turbovec_metadata}-shm"),
+    ]
+
+
+def _copy_backup_sidecar(source: Path, destination: Path) -> None:
+    if not source.exists():
+        return
+    if source.is_dir():
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
+        return
+    shutil.copy2(source, destination)
 
 
 def main(argv: list[str] | None = None) -> int:
