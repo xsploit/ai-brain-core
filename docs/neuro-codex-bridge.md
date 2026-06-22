@@ -323,13 +323,14 @@ Verified agents on this machine as of 2026-06-21:
 - `!codex features`: shows the safe bridge capability manifest, not raw local secrets or unrestricted tools.
 - `!codex route <codex|harness> <prompt>`: owner only; explicit route override.
 
-The `!codex` group should not be exposed as an LLM-callable Brain tool. It is a Discord command/admin control surface, not a normal persona capability.
+The `!codex` command group stays an owner-only Discord/admin control surface. The separate `discord_queue_codex_request` tool is callable only from owner-authorized Discord turns or autonomous Neuro heartbeat turns, so normal Discord users cannot force Codex/Harness routing through chat.
 
 ## Safety Rules
 
 - Owner only for manual bridge commands.
+- Autonomous Neuro heartbeat runs with the configured Discord/Codex tool set when `DISCORD_BRAIN_HEARTBEAT_TOOLS_ENABLED=true`.
 - Autonomous Neuro heartbeat can enqueue only if bridge is enabled, not paused, and cooldown allows it.
-- Autonomous DMs are limited to owners by default; non-owner DMs require `DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS`.
+- Autonomous DMs can be sent through `discord_send_dm`; JSON fallback DMs are limited to owners by default and non-owner fallback DMs require `DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS`.
 - Every request must include requester, channel, guild, and message metadata when available.
 - Queue processing is one request per heartbeat.
 - Codex must write outbox results before archiving inbox files.

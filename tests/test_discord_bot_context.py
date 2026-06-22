@@ -148,10 +148,30 @@ class _FakeDecisionBrain:
     def __init__(self, text):
         self.text = text
         self.prompt = None
+        self.kwargs = None
 
     async def stream(self, prompt, **kwargs):
         self.prompt = prompt
+        self.kwargs = kwargs
         yield SimpleNamespace(type="text.delta", data={"text": self.text})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeToolCallBrain:
+    memory_stack = None
+
+    def __init__(self, tool_name="discord_send_dm", text="done"):
+        self.tool_name = tool_name
+        self.text = text
+        self.prompt = None
+        self.kwargs = None
+
+    async def stream(self, prompt, **kwargs):
+        self.prompt = prompt
+        self.kwargs = kwargs
+        yield SimpleNamespace(type="tool.call", data={"name": self.tool_name, "call_id": "call-1"})
+        if self.text:
+            yield SimpleNamespace(type="text.delta", data={"text": self.text})
         yield SimpleNamespace(type="response.done", data={})
 
 
@@ -1189,6 +1209,9 @@ def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
 
     assert result == "send_channel_message"
     assert channel.sent == ["yo @\u200beveryone"]
+    assert "discord_send_channel_message" in bot.brain.kwargs["tool_names"]
+    assert "discord_queue_codex_request" in bot.brain.kwargs["tool_names"]
+    assert bot.brain.kwargs["max_agent_steps"] == 8
 
 
 def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
@@ -1204,6 +1227,33 @@ def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
 
     assert LETTA_HEARTBEAT_EVENT_TEXT in prompt
     assert "send a message, to reflect and edit your memories, or do nothing at all" in prompt
+    assert "use available Discord/Codex/search/memory tools directly" in prompt
+
+
+def test_tool_call_heartbeat_does_not_echo_done_text(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeToolCallBrain("discord_send_dm", "done")
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tools_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    result = asyncio.run(bot._run_heartbeat_tick(channel))
+
+    assert result == "noop"
+    assert channel.sent == []
+    assert "discord_send_dm" in bot.brain.kwargs["tool_names"]
 
 
 def test_autonomous_heartbeat_can_dm_owner(tmp_path):

@@ -59,6 +59,7 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_send_channel_message",
     "discord_send_rich_embed",
     "discord_send_file",
+    "discord_send_dm",
     "discord_edit_own_message",
     "discord_fetch_message",
     "discord_delete_message",
@@ -594,6 +595,27 @@ async def discord_send_channel_message(
         sent = await _call_discord(channel.send, content, allowed_mentions=allowed_mentions)
     await _audit_action(runtime, "discord_send_channel_message", _id(sent), {"channel_id": _id(channel)})
     return {"sent": True, "message": _serialize_message(sent)}
+
+
+async def discord_send_dm(
+    user_id: int,
+    content: str,
+    allow_user_mentions: bool = False,
+) -> dict[str, Any]:
+    """Owner/admin: send a direct message to a Discord user by ID."""
+    runtime = _runtime()
+    _require_admin_or_owner(runtime, "send direct messages")
+    content = _bounded_text(content, _env_int("DISCORD_BRAIN_TOOL_DM_MAX_CHARS", 1900))
+    if not content:
+        raise DiscordToolError("content is required.")
+    user = await _fetch_user(runtime, int(user_id))
+    sender = getattr(user, "send", None)
+    if not callable(sender):
+        raise DiscordToolError(f"User {user_id} could not be fetched for DM.")
+    allowed_mentions = discord.AllowedMentions(users=allow_user_mentions, roles=False, everyone=False)
+    sent = await _call_discord(sender, content, allowed_mentions=allowed_mentions)
+    await _audit_action(runtime, "discord_send_dm", _id(sent), {"user_id": int(user_id)})
+    return {"sent": True, "user": _serialize_user(user), "message": _serialize_message(sent)}
 
 
 async def discord_send_rich_embed(

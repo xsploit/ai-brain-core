@@ -23,6 +23,7 @@ from aibrain.discord_tools import (
     discord_queue_codex_request,
     discord_read_channel_history,
     discord_send_channel_message,
+    discord_send_dm,
     discord_send_file,
     discord_send_rich_embed,
     discord_timeout_member,
@@ -122,6 +123,28 @@ class _Message:
 
     async def reply(self, content, **kwargs):
         return await self.channel.send(content, **kwargs)
+
+
+class _DMUser:
+    def __init__(self, user_id: int = 777):
+        self.id = user_id
+        self.name = f"user-{user_id}"
+        self.display_name = self.name
+        self.sent = []
+
+    async def send(self, content, **kwargs):
+        message = SimpleNamespace(
+            id=42,
+            author=SimpleNamespace(id=999, name="bot", bot=True),
+            channel=SimpleNamespace(id=None),
+            content=content,
+            clean_content=content,
+            created_at=datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc),
+            attachments=[],
+            jump_url=None,
+        )
+        self.sent.append((content, kwargs))
+        return message
 
 
 class _Channel:
@@ -233,6 +256,7 @@ def test_register_discord_tools_exposes_agentic_suite():
     assert set(DISCORD_AGENT_TOOL_NAMES).issubset(registry._tools)
     assert "discord_queue_codex_request" in registry._tools
     assert "discord_list_bot_guilds" in registry._tools
+    assert "discord_send_dm" in registry._tools
     assert "discord_create_text_channel" in registry._tools
     assert "discord_get_capabilities" in registry._tools
 
@@ -427,6 +451,30 @@ def test_send_channel_message_requires_requester_and_bot_send_permission():
         assert result["sent"] is True
         assert ctx.channel.sent[0][0] == "hello @everyone"
         assert ctx.channel.sent[0][1]["allowed_mentions"].everyone is False
+
+
+def test_send_dm_requires_admin_or_owner_and_blocks_everyone_mentions():
+    with _tool_context() as ctx:
+        dm_user = _DMUser(777)
+        ctx.runtime_bot.fetch_user = lambda user_id: dm_user
+
+        with pytest.raises(DiscordToolError, match="requires a Discord admin or bot owner"):
+            asyncio.run(discord_send_dm(777, "hello"))
+
+    with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
+        dm_user = _DMUser(777)
+
+        async def fetch_user(user_id):
+            assert user_id == 777
+            return dm_user
+
+        ctx.runtime_bot.fetch_user = fetch_user
+        result = asyncio.run(discord_send_dm(777, "hello @everyone"))
+
+        assert result["sent"] is True
+        assert result["user"]["id"] == 777
+        assert dm_user.sent[0][0] == "hello @everyone"
+        assert dm_user.sent[0][1]["allowed_mentions"].everyone is False
 
 
 def test_send_rich_embed_builds_structured_embed_and_blocks_everyone_mentions():

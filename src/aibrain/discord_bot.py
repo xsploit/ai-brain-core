@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -923,6 +924,7 @@ class DiscordBrainBot(commands.Bot):
         self.heartbeat_chance = max(0.0, min(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_CHANCE", 0.08)))
         self.heartbeat_tts_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_TTS", False)
         self.heartbeat_autonomy_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_AUTONOMY_ENABLED", True)
+        self.heartbeat_tools_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_TOOLS_ENABLED", True)
         self.heartbeat_allow_owner_dm = _env_bool("DISCORD_BRAIN_HEARTBEAT_ALLOW_OWNER_DM", True)
         self.heartbeat_dm_user_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS")
         self.heartbeat_action_cooldown_seconds = max(
@@ -1351,6 +1353,7 @@ class DiscordBrainBot(commands.Bot):
                         f"interval seconds: `{self.heartbeat_min_interval_seconds:.0f}-{self.heartbeat_interval_seconds:.0f}`",
                         f"chance: `{self.heartbeat_chance:.2f}`",
                         f"autonomy: `{self.heartbeat_autonomy_enabled}`",
+                        f"tools: `{self.heartbeat_tools_enabled}` (`{len(self._heartbeat_tool_names())}`)",
                         f"voice clip: `{self.heartbeat_tts_enabled}`",
                         f"owner DM: `{self.heartbeat_allow_owner_dm}`",
                         f"allowlisted DM users: `{len(self.heartbeat_dm_user_ids)}`",
@@ -2162,28 +2165,120 @@ class DiscordBrainBot(commands.Bot):
     async def _build_heartbeat_decision(self, channel: Any) -> dict[str, Any]:
         prompt = self._heartbeat_autonomy_prompt(channel)
         buffer = ""
-        async for event in self.brain.stream(
-            prompt,
-            thread_id=f"discord:heartbeat:autonomy:{getattr(channel, 'id', 'unknown')}",
-            persona=self.persona,
-            use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_HEARTBEAT_MEMORY_TOP_K", 3)),
-            tool_names=[],
-            stateless=True,
-            memory_query_text="heartbeat autonomy",
-            memory_event_text="",
-            history_text=prompt,
-        ):
-            if event.type == "text.delta":
-                buffer += event.data.get("text", "")
-            elif event.type == "error":
-                raise RuntimeError(event.data.get("message", "heartbeat autonomy failed"))
+        tool_calls: list[str] = []
+        tool_names = self._heartbeat_tool_names()
+        message = self._heartbeat_runtime_message(channel)
+        context_token = None
+        tool_token = None
+        if tool_names:
+            context_token = DISCORD_CONTEXT.set(self._heartbeat_context(message))
+            tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
+        try:
+            async for event in self.brain.stream(
+                prompt,
+                thread_id=f"discord:heartbeat:autonomy:{getattr(channel, 'id', 'channel-less')}",
+                persona=self.persona,
+                use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_HEARTBEAT_MEMORY_TOP_K", 3)),
+                tool_names=tool_names,
+                max_agent_steps=_env_int("DISCORD_BRAIN_HEARTBEAT_MAX_AGENT_STEPS", 8),
+                stateless=True,
+                memory_query_text="heartbeat autonomy",
+                memory_event_text="",
+                history_text=prompt,
+            ):
+                if event.type == "text.delta":
+                    buffer += event.data.get("text", "")
+                elif event.type == "tool.call":
+                    name = str(event.data.get("name") or "").strip()
+                    if name:
+                        tool_calls.append(name)
+                elif event.type == "error":
+                    raise RuntimeError(event.data.get("message", "heartbeat autonomy failed"))
+        finally:
+            if tool_token is not None:
+                DISCORD_TOOL_CONTEXT.reset(tool_token)
+            if context_token is not None:
+                DISCORD_CONTEXT.reset(context_token)
         decision = _parse_heartbeat_decision(buffer)
         if decision is not None:
+            if tool_calls:
+                decision.setdefault("tool_calls", tool_calls)
             return decision
+        if tool_calls:
+            return {
+                "action": "noop",
+                "reason": "heartbeat completed tool calls without a JSON fallback action",
+                "tool_calls": tool_calls,
+            }
         return {
             "action": "send_channel_message",
             "message": buffer.strip(),
             "reason": "model returned text instead of JSON",
+        }
+
+    def _heartbeat_tool_names(self) -> list[str]:
+        if not getattr(self, "heartbeat_tools_enabled", True):
+            return []
+        raw = os.getenv("DISCORD_BRAIN_HEARTBEAT_TOOL_NAMES", "").strip()
+        if not raw:
+            return list(DEFAULT_DISCORD_TOOL_NAMES)
+        lowered = raw.lower()
+        if lowered in {"0", "false", "no", "none", "off", "disabled"}:
+            return []
+        if lowered in {"1", "true", "yes", "default", "all", "*"}:
+            return list(DEFAULT_DISCORD_TOOL_NAMES)
+        return [item.strip() for item in re.split(r"[,;]", raw) if item.strip()]
+
+    def _heartbeat_runtime_message(self, channel: Any | None) -> Any:
+        now = datetime.now(timezone.utc)
+        owner_id = sorted(self.owner_users)[0] if getattr(self, "owner_users", None) else getattr(getattr(self, "user", None), "id", 0)
+        persona_name = getattr(self.persona, "name", "Neuro-sama")
+        guild = getattr(channel, "guild", None) if channel is not None else None
+        author = SimpleNamespace(
+            id=owner_id,
+            name=persona_name,
+            display_name=persona_name,
+            global_name=persona_name,
+            mention=f"<@{owner_id}>",
+            bot=True,
+            guild_permissions=SimpleNamespace(administrator=True),
+        )
+        return SimpleNamespace(
+            id=None,
+            author=author,
+            channel=channel,
+            guild=guild,
+            content=LETTA_HEARTBEAT_EVENT_TEXT,
+            clean_content=LETTA_HEARTBEAT_EVENT_TEXT,
+            created_at=now,
+            attachments=[],
+            mentions=[],
+            reference=None,
+            jump_url=None,
+        )
+
+    def _heartbeat_context(self, message: Any) -> dict[str, Any]:
+        channel = getattr(message, "channel", None)
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                return self._context_for_message(message)
+        now = getattr(message, "created_at", None) or datetime.now(timezone.utc)
+        scope = "discord:heartbeat:channel-less"
+        metadata = _discord_message_metadata(message)
+        return {
+            "scope": scope,
+            "channel_scope": scope,
+            "grillo_scope": f"discord:heartbeat:user:{getattr(message.author, 'id', 'unknown')}:persona:{getattr(self.persona, 'id', 'unknown')}",
+            "thread_id": scope,
+            "guild_id": None,
+            "guild": None,
+            "channel_id": None,
+            "channel": "heartbeat",
+            "author_id": getattr(message.author, "id", None),
+            "author": _display_name(message.author),
+            "discord_metadata": metadata,
+            **_time_context(now),
+            "recent_messages": [],
         }
 
     def _heartbeat_autonomy_prompt(self, channel: Any | None) -> str:
@@ -2206,14 +2301,17 @@ class DiscordBrainBot(commands.Bot):
         action_text = ", ".join(actions)
         owner_ids = ", ".join(str(user_id) for user_id in sorted(self.owner_users)) or "none"
         dm_ids = ", ".join(str(user_id) for user_id in sorted(self.heartbeat_dm_user_ids)) or "none"
+        tool_count = len(self._heartbeat_tool_names())
         return "\n".join(
             [
                 "You are Neuro-sama during an autonomous Discord heartbeat.",
                 LETTA_HEARTBEAT_EVENT_TEXT,
-                "Choose exactly one action from the allowed action menu.",
-                "Return only one JSON object and no markdown.",
+                "You may either use available Discord/Codex/search/memory tools directly, or choose exactly one fallback JSON action from the allowed action menu.",
+                "Tools execute real actions. If a tool already sent a message, DM, or queued Codex, return a noop JSON result afterward.",
+                "Return only one JSON object and no markdown when you do not need more tool calls.",
                 "",
                 f"Allowed actions: {action_text}",
+                f"Available heartbeat tool count: {tool_count}",
                 f"Current channel: {guild_name}#{channel_name} ({channel_id})",
                 f"Owner DM targets: {owner_ids}",
                 f"Allowlisted non-owner DM targets: {dm_ids}",
@@ -2223,10 +2321,11 @@ class DiscordBrainBot(commands.Bot):
                 "",
                 "Rules:",
                 "- Prefer noop if nothing is worth doing.",
-                "- Use send_channel_message to casually shoot the breeze in the configured heartbeat channel.",
-                "- Use dm_owner only for useful upgrade ideas, self-checks, or funny low-frequency check-ins.",
-                "- Use dm_user only for an allowlisted target_user_id.",
-                "- Use queue_codex only for a concrete bounded bot improvement/debug/review task.",
+                "- Prefer Discord tools for concrete actions: channel messages, DMs, embeds, reading context, or queuing Codex.",
+                "- Use send_channel_message fallback only if you did not call a send-message tool.",
+                "- Use dm_owner/dm_user fallback only if you did not call discord_send_dm.",
+                "- Use queue_codex fallback only if you did not call discord_queue_codex_request.",
+                "- Do not use destructive moderation/server mutation tools unless there is a specific owner-authorized reason in context.",
                 "- Keep messages concise, no mass mentions, no commands, no fake claims that work already happened.",
                 "",
                 "[Recent local context:]",
