@@ -284,23 +284,32 @@ async def discord_list_roles(limit: int = 100) -> dict[str, Any]:
     return {"guild_id": _id(guild), "roles": [_serialize_role(role) for role in roles[:limit]], "count": len(roles)}
 
 
-async def discord_list_members(limit: int = 50, include_bots: bool = True) -> dict[str, Any]:
+async def discord_list_members(
+    limit: int = 50,
+    include_bots: bool = True,
+    guild_id: int | None = None,
+) -> dict[str, Any]:
     """Admin/owner: list cached guild members. Requires the Discord members intent for reliable output."""
     runtime = _runtime()
     _require_admin_or_owner(runtime, "list members")
     _require_member_intent(runtime)
-    guild = _require_guild(runtime)
+    guild = await _resolve_guild(runtime, guild_id)
     members = [member for member in _iter_guild_members(guild) if include_bots or not getattr(member, "bot", False)]
     limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_MEMBER_LIMIT", 100))
     return {"guild_id": _id(guild), "members": [_serialize_member(member) for member in members[:limit]], "count": len(members)}
 
 
-async def discord_search_members(query: str, limit: int = 25, include_bots: bool = True) -> dict[str, Any]:
+async def discord_search_members(
+    query: str,
+    limit: int = 25,
+    include_bots: bool = True,
+    guild_id: int | None = None,
+) -> dict[str, Any]:
     """Admin/owner: search guild members by id, username, global name, display name, or nick."""
     runtime = _runtime()
     _require_admin_or_owner(runtime, "search members")
     _require_member_intent(runtime)
-    guild = _require_guild(runtime)
+    guild = await _resolve_guild(runtime, guild_id)
     query = query.strip().lower()
     limit = _clamp(limit, 1, _env_int("DISCORD_BRAIN_TOOL_MEMBER_SEARCH_LIMIT", 50))
     matched = []
@@ -330,10 +339,10 @@ async def discord_search_members(query: str, limit: int = 25, include_bots: bool
     return {"guild_id": _id(guild), "members": [_serialize_member(member) for member in matched[:limit]], "count": len(matched)}
 
 
-async def discord_get_member(user_id: int) -> dict[str, Any]:
-    """Return guild member details for the current guild."""
+async def discord_get_member(user_id: int, guild_id: int | None = None) -> dict[str, Any]:
+    """Return guild member details for the current guild, or another owner-authorized bot guild."""
     runtime = _runtime()
-    guild = _require_guild(runtime)
+    guild = await _resolve_guild(runtime, guild_id)
     member = await _resolve_member(guild, user_id)
     return {"member": _serialize_member(member)}
 

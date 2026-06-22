@@ -16,12 +16,14 @@ from aibrain.discord_tools import (
     discord_get_capabilities,
     discord_get_channel_overwrites,
     discord_get_current_context,
+    discord_get_member,
     discord_get_permissions,
     discord_list_bot_guilds,
     discord_list_members,
     discord_list_voice_states,
     discord_queue_codex_request,
     discord_read_channel_history,
+    discord_search_members,
     discord_send_channel_message,
     discord_send_dm,
     discord_send_file,
@@ -315,6 +317,22 @@ def test_audit_permissions_reports_channel_capabilities_from_dm(monkeypatch):
         assert result["guild"]["id"] == ctx.guild.id
         assert result["channels"][0]["can_send"] is True
         assert result["channels"][0]["can_speak"] is True
+
+
+def test_member_lookup_can_target_owner_authorized_guild_from_dm(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
+        ctx.message.guild = None
+        ctx.message.channel = SimpleNamespace(id=9_999, name="dm")
+
+        listed = asyncio.run(discord_list_members(guild_id=ctx.guild.id))
+        searched = asyncio.run(discord_search_members("target", guild_id=ctx.guild.id))
+        fetched = asyncio.run(discord_get_member(ctx.target.id, guild_id=ctx.guild.id))
+
+        assert listed["guild_id"] == ctx.guild.id
+        assert ctx.target.id in {member["id"] for member in listed["members"]}
+        assert searched["members"][0]["id"] == ctx.target.id
+        assert fetched["member"]["id"] == ctx.target.id
 
 
 def test_context_and_can_do_report_cross_guild_permissions_from_dm(monkeypatch):
