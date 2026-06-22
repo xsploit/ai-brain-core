@@ -2528,7 +2528,44 @@ class DiscordBrainBot(commands.Bot):
                     return
                 final_text = buffer.strip()
                 if not final_text:
-                    raise RuntimeError("model returned an empty response")
+                    logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
+                    logger.warning(
+                        "Brain model returned empty text for scope %s; retrying once without tools/cache",
+                        channel_scope,
+                    )
+                    retry_options = dict(response_options)
+                    retry_options.pop("prompt_cache_key", None)
+                    retry_options.pop("prompt_cache_retention", None)
+                    retry_prompt = (
+                        f"{prompt}\n\n"
+                        "[System recovery note: Previous model call returned no visible Discord text. "
+                        "Reply now in plain Discord text only. Do not call tools.]"
+                    )
+                    retry_buffer = ""
+                    async for event in self.brain.stream(
+                        retry_prompt,
+                        thread_id=thread_id,
+                        persona=persona,
+                        images=images,
+                        use_memory=(
+                            MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8))
+                            if use_memory is None
+                            else use_memory
+                        ),
+                        tool_names=[],
+                        **retry_options,
+                    ):
+                        if getattr(self, "paused", False):
+                            return
+                        if event.type == "text.delta":
+                            retry_buffer += event.data.get("text", "")
+                        elif event.type == "memory.hit":
+                            self.logger.debug("memory hit %s %.3f", event.data.get("id"), event.data.get("score", 0.0))
+                        elif event.type == "error":
+                            raise RuntimeError(event.data.get("message", "brain retry stream failed"))
+                    final_text = retry_buffer.strip()
+                    if not final_text:
+                        raise RuntimeError("model returned an empty response after retry")
                 await self._send_final_reply(message, final_text)
                 self._record_recent_assistant(message, final_text)
                 await self._maybe_send_tts_reply(message, final_text)

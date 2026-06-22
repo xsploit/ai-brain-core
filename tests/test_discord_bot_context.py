@@ -142,6 +142,23 @@ class _EmptyBrain:
         yield SimpleNamespace(type="response.done", data={})
 
 
+class _EmptyThenOkBrain:
+    memory_stack = None
+
+    def __init__(self):
+        self.prompts = []
+        self.kwargs = []
+
+    async def stream(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
+        if len(self.prompts) == 1:
+            yield SimpleNamespace(type="response.done", data={})
+            return
+        yield SimpleNamespace(type="text.delta", data={"text": "recovered"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
 class _FakeDecisionBrain:
     memory_stack = None
 
@@ -622,7 +639,7 @@ def test_jb_reply_uses_isolated_jb_path(monkeypatch):
     assert message._fake_reply.edits == ["ok"]
 
 
-def test_empty_brain_reply_reports_failure_instead_of_done(monkeypatch):
+def test_empty_brain_reply_reports_failure_after_retry(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
@@ -647,7 +664,7 @@ def test_empty_brain_reply_reports_failure_instead_of_done(monkeypatch):
         )
     )
 
-    assert message._fake_reply.edits == ["brain failed: model returned an empty response"]
+    assert message._fake_reply.edits == ["brain failed: model returned an empty response after retry"]
 
 
 def test_grillo_query_is_bounded_without_truncating_prompt(monkeypatch):
@@ -798,6 +815,34 @@ def test_tts_replies_skip_voice_without_constructor_attrs(monkeypatch):
     asyncio.run(bot._reply_with_brain(message))
 
     assert message._events == [("text", "ok")]
+
+
+def test_empty_model_response_retries_once_without_tools(monkeypatch):
+    async def fail_voice(*args, **kwargs):
+        raise AssertionError("voice should not be sent during empty-response retry test")
+
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fail_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _EmptyThenOkBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = SimpleNamespace(debug=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message, prompt_cache_key="cached-empty", prompt_cache_retention="ephemeral"))
+
+    assert message._events == [("text", "recovered")]
+    assert len(brain.prompts) == 2
+    assert "Previous model call returned no visible Discord text" in brain.prompts[1]
+    assert brain.kwargs[0]["tool_names"] == discord_bot_module.DEFAULT_DISCORD_TOOL_NAMES
+    assert brain.kwargs[1]["tool_names"] == []
+    assert "prompt_cache_key" in brain.kwargs[0]
+    assert "prompt_cache_key" not in brain.kwargs[1]
 
 
 def test_tts_reply_sends_text_before_voice(monkeypatch):
