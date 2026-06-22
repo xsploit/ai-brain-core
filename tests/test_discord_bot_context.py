@@ -952,6 +952,34 @@ def test_bot_message_ignore_toggle_keeps_self_guard():
     assert bot._is_ignored_bot_message(self_message) is True
 
 
+def test_help_command_splits_long_output_under_discord_limit():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.command_prefix_text = "!brain"
+    bot.max_reply_chars = 1900
+    commands = {}
+
+    def add_command(command):
+        commands[command.name] = command
+
+    bot.add_command = add_command
+    bot._install_commands()
+    sent = []
+
+    class FakeContext:
+        async def reply(self, content, *, mention_author=False):
+            sent.append(("reply", content, mention_author))
+
+        async def send(self, content):
+            sent.append(("send", content, None))
+
+    asyncio.run(commands["help"].callback(FakeContext()))
+
+    assert len(sent) > 1
+    assert sent[0][0] == "reply"
+    assert all(len(content) <= 1900 for _, content, _ in sent)
+    assert "**AI Brain commands**" in sent[0][1]
+
+
 def test_bot_messages_are_not_ignored_but_do_not_auto_respond_by_default():
     assert DEFAULT_IGNORE_BOTS is False
     assert DEFAULT_RESPOND_TO_BOTS is False

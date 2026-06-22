@@ -1301,7 +1301,12 @@ class DiscordBrainBot(commands.Bot):
                 f"`{prefix} ladybug relationships export` - DM relationship graph, diary, slots, and emotion state",
                 "Mention me, DM me, or use the configured response mode for normal chat.",
             ]
-            await ctx.reply("\n".join(lines), mention_author=False)
+            chunks = _split_discord_text("\n".join(lines), min(self.max_reply_chars, 1900))
+            for index, chunk in enumerate(chunks):
+                if index == 0:
+                    await ctx.reply(chunk, mention_author=False)
+                else:
+                    await ctx.send(chunk)
 
         @commands.command(name="status")
         async def status(ctx: commands.Context) -> None:
