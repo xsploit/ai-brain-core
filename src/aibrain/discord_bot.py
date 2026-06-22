@@ -45,7 +45,11 @@ from .tts import PiperExecutableTTS, PiperVoice, TTSAudio, discover_piper_voices
 
 DISCORD_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("DISCORD_CONTEXT", default={})
 DEFAULT_DISCORD_TIMEZONE = "America/Los_Angeles"
-DEFAULT_JB_PROMPT_FILE = "prompts/eni-lite-writer-claude-design.txt"
+DEFAULT_JB_PROMPT_FILE = "prompts/eni-lime-apr.txt"
+DEFAULT_JB_ADDITIONS_FILE = "prompts/eni-jb-additions.txt"
+DEFAULT_JB_PROMPT_FILES = f"{DEFAULT_JB_PROMPT_FILE};{DEFAULT_JB_ADDITIONS_FILE}"
+JB_MODAL_CHUNK_CHARS = 4000
+JB_MODAL_CHUNK_COUNT = 5
 DEFAULT_TTS_REPLIES = True
 DEFAULT_IGNORE_BOTS = False
 DEFAULT_RESPOND_TO_BOTS = True
@@ -666,6 +670,63 @@ class ModelSelectMenu(discord.ui.Select):
         await self.model_view.select_model(interaction, int(self.values[0]))
 
 
+class JBPromptAddModal(discord.ui.Modal):
+    def __init__(self, owner_id: int):
+        super().__init__(title="Add JB Prompt Text", timeout=_env_int("DISCORD_BRAIN_JB_MODAL_TIMEOUT_SECONDS", 600))
+        self.owner_id = owner_id
+        self.chunks: list[discord.ui.TextInput] = []
+        for index in range(JB_MODAL_CHUNK_COUNT):
+            chunk = discord.ui.TextInput(
+                label=f"JB prompt chunk {index + 1}/{JB_MODAL_CHUNK_COUNT}",
+                style=discord.TextStyle.paragraph,
+                required=index == 0,
+                max_length=JB_MODAL_CHUNK_CHARS,
+            )
+            self.chunks.append(chunk)
+            self.add_item(chunk)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.user or interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the requester can submit this JB prompt modal.", ephemeral=True)
+            return
+        text = "\n\n".join(str(chunk.value or "").strip() for chunk in self.chunks if str(chunk.value or "").strip())
+        if not text:
+            await interaction.response.send_message("No JB prompt text was submitted.", ephemeral=True)
+            return
+        path, char_count, word_count = _append_jb_prompt_addition(
+            text,
+            author_id=interaction.user.id,
+            author_name=_display_name(interaction.user),
+        )
+        await interaction.response.send_message(
+            f"added `{word_count}` words / `{char_count}` chars to `{path}`. Future `!jb` turns will include it.",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        logger.exception("JB prompt modal failed")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"JB prompt add failed: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"JB prompt add failed: {error}", ephemeral=True)
+
+
+class JBPromptAddView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=_env_int("DISCORD_BRAIN_JB_ADD_VIEW_TIMEOUT_SECONDS", 300))
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the requester can use this JB prompt panel.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Open Paste Modal", style=discord.ButtonStyle.primary)
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(JBPromptAddModal(self.owner_id))
+
+
 class SummaryActionView(discord.ui.View):
     def __init__(self, bot: Any, owner_id: int, scope: str, summary_text: str, source_label: str):
         super().__init__(timeout=_env_int("DISCORD_BRAIN_SUMMARY_VIEW_TIMEOUT_SECONDS", 300))
@@ -1183,6 +1244,7 @@ class DiscordBrainBot(commands.Bot):
                 "`!pause` - pause all normal replies while leaving commands available",
                 "`!resume` - resume normal replies",
                 "`!jb <message>` - answer once with the configured JB pre-prompt",
+                "`!jb add` - open a modal to append JB prompt text",
                 "`!bot toggle` - toggle bot-to-bot auto replies",
                 "`!model` - choose the runtime model from a paginated dropdown",
                 "`!model set <model-id>` - set a model by id",
@@ -1424,8 +1486,10 @@ class DiscordBrainBot(commands.Bot):
                     break
             await ctx.reply("\n".join(lines) if lines else "no memory hits.", mention_author=False)
 
-        @commands.command(name="jb")
+        @commands.group(name="jb", invoke_without_command=True)
         async def jb(ctx: commands.Context, *, content: str = "") -> None:
+            if ctx.invoked_subcommand is not None:
+                return
             content = content.strip()
             if not content:
                 await ctx.reply("usage: `!jb <message>`", mention_author=False)
@@ -1451,6 +1515,24 @@ class DiscordBrainBot(commands.Bot):
                 stateless=True,
                 prompt_cache_key=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "discord-brain:jb:v1"),
                 prompt_cache_retention=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h"),
+            )
+
+        @jb.command(name="add")
+        async def jb_add(ctx: commands.Context) -> None:
+            if not await self._require_admin_or_owner_command(ctx, "JB prompt editing"):
+                return
+            max_chars = JB_MODAL_CHUNK_CHARS * JB_MODAL_CHUNK_COUNT
+            view = JBPromptAddView(ctx.author.id)
+            await ctx.reply(
+                "\n".join(
+                    [
+                        "Click the button to paste JB prompt text.",
+                        f"Modal capacity: `{JB_MODAL_CHUNK_COUNT}` chunks x `{JB_MODAL_CHUNK_CHARS}` chars = `{max_chars}` chars.",
+                        f"Appends to `{_jb_additions_path()}` and applies to future `!jb` turns.",
+                    ]
+                ),
+                mention_author=False,
+                view=view,
             )
 
         @commands.command(name="pause")
@@ -3617,12 +3699,34 @@ def _load_jb_prompt() -> str:
     if explicit:
         return explicit.strip()
 
-    raw_files = os.getenv("DISCORD_BRAIN_JB_PROMPT_FILES", DEFAULT_JB_PROMPT_FILE)
+    raw_files = os.getenv("DISCORD_BRAIN_JB_PROMPT_FILES", DEFAULT_JB_PROMPT_FILES)
+    files = _split_paths(raw_files)
+    additions = _jb_additions_path()
+    if str(additions) not in {str(path) for path in files}:
+        files.append(additions)
     parts = []
-    for path in _split_paths(raw_files):
+    for path in files:
         if path.exists():
             parts.append(path.read_text(encoding="utf-8").strip())
     return "\n\n".join(part for part in parts if part)
+
+
+def _jb_additions_path() -> Path:
+    return Path(os.getenv("DISCORD_BRAIN_JB_ADDITIONS_FILE", DEFAULT_JB_ADDITIONS_FILE))
+
+
+def _append_jb_prompt_addition(text: str, *, author_id: int, author_name: str) -> tuple[Path, int, int]:
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("JB prompt addition is empty")
+    path = _jb_additions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    char_count = len(cleaned)
+    word_count = len(re.findall(r"\S+", cleaned))
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with path.open("a", encoding="utf-8", newline="\n") as file:
+        file.write(f"\n\n--- addition {timestamp} by {author_name} ({author_id}) ---\n{cleaned}\n")
+    return path, char_count, word_count
 
 
 def main() -> None:

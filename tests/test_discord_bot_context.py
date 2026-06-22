@@ -14,6 +14,7 @@ from aibrain.discord_bot import (
     DiscordVoiceClip,
     ModelSelectView,
     RelationshipGraphView,
+    _append_jb_prompt_addition,
     _build_jb_persona,
     _format_summary_transcript,
     _format_tavily_search_result,
@@ -22,6 +23,7 @@ from aibrain.discord_bot import (
     _format_relationship_graph_status,
     _relationship_graph_embed,
     _grillo_scope_for_message,
+    _load_jb_prompt,
     _message_text,
     _model_choice_description,
     _ordered_model_choices,
@@ -403,6 +405,39 @@ def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
     assert jb_persona.model == "deepseek/test"
     assert jb_persona.tools == []
     assert "Neuro-sama" not in jb_persona.name
+
+
+def test_load_jb_prompt_includes_modal_additions_by_default(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_FILES", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_ADDITIONS_FILE", raising=False)
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "eni-lime-apr.txt").write_text("BASE PDF PROMPT", encoding="utf-8")
+    (prompts / "eni-jb-additions.txt").write_text("MODAL ADDITION", encoding="utf-8")
+
+    prompt = _load_jb_prompt()
+
+    assert prompt == "BASE PDF PROMPT\n\nMODAL ADDITION"
+
+
+def test_append_jb_prompt_addition_writes_configured_file(monkeypatch, tmp_path):
+    path = tmp_path / "jb-additions.txt"
+    monkeypatch.setenv("DISCORD_BRAIN_JB_ADDITIONS_FILE", str(path))
+
+    written_path, char_count, word_count = _append_jb_prompt_addition(
+        "alpha beta\n\ngamma",
+        author_id=123,
+        author_name="SUBSECT",
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert written_path == path
+    assert char_count == len("alpha beta\n\ngamma")
+    assert word_count == 3
+    assert "by SUBSECT (123)" in text
+    assert "alpha beta\n\ngamma" in text
 
 
 def test_codex_bridge_result_is_injected_into_next_prompt(monkeypatch, tmp_path):
