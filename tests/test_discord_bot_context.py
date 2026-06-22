@@ -23,6 +23,7 @@ from aibrain.discord_bot import (
     _format_relationship_graph_status,
     _relationship_graph_embed,
     _grillo_scope_for_message,
+    _jb_prompt_cache_key,
     _load_jb_prompt,
     _message_text,
     _model_choice_description,
@@ -130,6 +131,13 @@ class _FakeBrain:
         self.prompt = prompt
         self.kwargs = kwargs
         yield SimpleNamespace(type="text.delta", data={"text": "ok"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _EmptyBrain:
+    memory_stack = None
+
+    async def stream(self, prompt, **kwargs):
         yield SimpleNamespace(type="response.done", data={})
 
 
@@ -440,6 +448,24 @@ def test_append_jb_prompt_addition_writes_configured_file(monkeypatch, tmp_path)
     assert "alpha beta\n\ngamma" in text
 
 
+def test_jb_prompt_cache_key_tracks_prompt_content(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", raising=False)
+
+    first = _jb_prompt_cache_key("prompt one")
+    second = _jb_prompt_cache_key("prompt two")
+
+    assert first.startswith("discord-brain:jb:")
+    assert second.startswith("discord-brain:jb:")
+    assert first != second
+
+
+def test_jb_prompt_cache_key_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "manual-key")
+
+    assert _jb_prompt_cache_key("prompt one") == "manual-key"
+    assert _jb_prompt_cache_key("prompt two") == "manual-key"
+
+
 def test_codex_bridge_result_is_injected_into_next_prompt(monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
@@ -523,6 +549,34 @@ def test_jb_reply_uses_isolated_jb_path(monkeypatch):
     assert brain.kwargs["prompt_cache_key"] == "discord-brain:jb:test"
     assert brain.kwargs["prompt_cache_retention"] == "24h"
     assert message._fake_reply.edits == ["ok"]
+
+
+def test_empty_brain_reply_reports_failure_instead_of_done(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = _EmptyBrain()
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = discord_bot_module.logging.getLogger("test")
+
+    asyncio.run(
+        bot._reply_with_brain(
+            message,
+            user_text_override="write this once",
+            use_memory=False,
+            tool_names=[],
+            include_discord_context=False,
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
+        )
+    )
+
+    assert message._fake_reply.edits == ["brain failed: model returned an empty response"]
 
 
 def test_grillo_query_is_bounded_without_truncating_prompt(monkeypatch):

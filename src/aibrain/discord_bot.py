@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -1513,7 +1514,7 @@ class DiscordBrainBot(commands.Bot):
                 include_grillo_context=False,
                 record_grillo=False,
                 stateless=True,
-                prompt_cache_key=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "discord-brain:jb:v1"),
+                prompt_cache_key=_jb_prompt_cache_key(one_shot_prompt),
                 prompt_cache_retention=os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h"),
             )
 
@@ -2395,11 +2396,14 @@ class DiscordBrainBot(commands.Bot):
                         raise RuntimeError(event.data.get("message", "brain stream failed"))
                 if getattr(self, "paused", False):
                     return
-                await self._send_final_reply(message, buffer.strip() or "done.")
-                self._record_recent_assistant(message, buffer.strip() or "done.")
-                await self._maybe_send_tts_reply(message, buffer.strip())
+                final_text = buffer.strip()
+                if not final_text:
+                    raise RuntimeError("model returned an empty response")
+                await self._send_final_reply(message, final_text)
+                self._record_recent_assistant(message, final_text)
+                await self._maybe_send_tts_reply(message, final_text)
                 if record_grillo:
-                    self._schedule_grillo_ingest(message, grillo_scope, memory_text, buffer.strip())
+                    self._schedule_grillo_ingest(message, grillo_scope, memory_text, final_text)
         except Exception as exc:
             logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
             logger.exception("Brain turn failed for scope %s grillo_scope %s", channel_scope, grillo_scope)
@@ -3709,6 +3713,14 @@ def _load_jb_prompt() -> str:
         if path.exists():
             parts.append(path.read_text(encoding="utf-8").strip())
     return "\n\n".join(part for part in parts if part)
+
+
+def _jb_prompt_cache_key(prompt: str) -> str:
+    explicit = os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY")
+    if explicit:
+        return explicit
+    digest = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"discord-brain:jb:{digest}"
 
 
 def _jb_additions_path() -> Path:
