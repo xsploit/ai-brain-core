@@ -1823,8 +1823,7 @@ def _owner_user_ids() -> set[int]:
     explicit = _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
     if explicit:
         return explicit
-    allowed = _csv_ints("DISCORD_BRAIN_ALLOWED_USER_IDS")
-    return allowed or set(DEFAULT_OWNER_USER_IDS)
+    return set(DEFAULT_OWNER_USER_IDS)
 
 
 async def _audit_action(runtime: DiscordToolRuntime, tool: str, target_id: Any, details: dict[str, Any] | None = None) -> None:

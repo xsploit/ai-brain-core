@@ -273,7 +273,7 @@ def test_discord_brain_exposes_discord_schemas_to_model():
 
 
 def test_capabilities_reports_owner_gate(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
         result = asyncio.run(discord_get_capabilities())
 
@@ -282,8 +282,18 @@ def test_capabilities_reports_owner_gate(monkeypatch):
         assert "discord_create_text_channel" in result["owner_only_tools"]
 
 
-def test_get_permissions_works_from_dm_with_guild_and_channel(monkeypatch):
+def test_allowed_user_is_not_implicitly_owner(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
+    with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
+        result = asyncio.run(discord_get_capabilities())
+
+        assert result["actor"]["id"] == ctx.actor.id
+        assert result["actor"]["is_owner"] is False
+
+
+def test_get_permissions_works_from_dm_with_guild_and_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(
         actor_perms=_Perms(administrator=True, view_channel=True),
         bot_perms=_Perms(view_channel=True, send_messages=True, read_message_history=True),
@@ -300,7 +310,7 @@ def test_get_permissions_works_from_dm_with_guild_and_channel(monkeypatch):
 
 
 def test_audit_permissions_reports_channel_capabilities_from_dm(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(
         bot_perms=_Perms(
             view_channel=True,
@@ -320,7 +330,7 @@ def test_audit_permissions_reports_channel_capabilities_from_dm(monkeypatch):
 
 
 def test_member_lookup_can_target_owner_authorized_guild_from_dm(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
         ctx.message.guild = None
         ctx.message.channel = SimpleNamespace(id=9_999, name="dm")
@@ -336,7 +346,7 @@ def test_member_lookup_can_target_owner_authorized_guild_from_dm(monkeypatch):
 
 
 def test_context_and_can_do_report_cross_guild_permissions_from_dm(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(
         actor_perms=_Perms(administrator=True),
         bot_perms=_Perms(view_channel=True, send_messages=True, attach_files=True),
@@ -353,7 +363,7 @@ def test_context_and_can_do_report_cross_guild_permissions_from_dm(monkeypatch):
 
 
 def test_send_file_from_dm_owner_to_guild_channel(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(
         bot_perms=_Perms(view_channel=True, send_messages=True, attach_files=True),
     ) as ctx:
@@ -373,7 +383,7 @@ def test_get_channel_overwrites_serializes_allow_and_deny(monkeypatch):
         def __iter__(self):
             return iter([("send_messages", True), ("view_channel", False), ("attach_files", None)])
 
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(actor_perms=_Perms(administrator=True), bot_perms=_Perms(view_channel=True)) as ctx:
         ctx.channel.overwrites = {ctx.bot: _Overwrite()}
 
@@ -385,7 +395,7 @@ def test_get_channel_overwrites_serializes_allow_and_deny(monkeypatch):
 
 
 def test_list_voice_states_reports_connected_members(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context(bot_perms=_Perms(view_channel=True)) as ctx:
         ctx.actor.voice = SimpleNamespace(mute=False, deaf=False, self_mute=True, self_deaf=False)
         ctx.channel.members = [ctx.actor]
@@ -398,12 +408,12 @@ def test_list_voice_states_reports_connected_members(monkeypatch):
 
 
 def test_bot_guild_list_is_owner_only(monkeypatch):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "999")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
     with _tool_context():
         with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
             asyncio.run(discord_list_bot_guilds())
 
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context() as ctx:
         result = asyncio.run(discord_list_bot_guilds())
 
@@ -411,7 +421,7 @@ def test_bot_guild_list_is_owner_only(monkeypatch):
 
 
 def test_codex_queue_request_is_owner_only(monkeypatch, tmp_path):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "999")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
     with _tool_context() as ctx:
         ctx.runtime_bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True)
 
@@ -420,7 +430,7 @@ def test_codex_queue_request_is_owner_only(monkeypatch, tmp_path):
 
 
 def test_codex_queue_request_writes_bridge_file(monkeypatch, tmp_path):
-    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
     with _tool_context() as ctx:
         ctx.runtime_bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")
         ctx.runtime_bot._context_for_message = lambda message: {

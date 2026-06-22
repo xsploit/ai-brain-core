@@ -980,8 +980,8 @@ def test_help_command_splits_long_output_under_discord_limit():
     assert "**AI Brain commands**" in sent[0][1]
 
 
-def test_bot_messages_are_not_ignored_but_do_not_auto_respond_by_default():
-    assert DEFAULT_IGNORE_BOTS is False
+def test_bot_messages_are_ignored_and_do_not_auto_respond_by_default():
+    assert DEFAULT_IGNORE_BOTS is True
     assert DEFAULT_RESPOND_TO_BOTS is False
     assert DEFAULT_REQUIRE_MENTION_IN_GUILDS is True
 
@@ -1324,8 +1324,9 @@ def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
 
     assert result == "send_channel_message"
     assert channel.sent == ["yo @\u200beveryone"]
-    assert "discord_send_channel_message" in bot.brain.kwargs["tool_names"]
-    assert "discord_queue_codex_request" in bot.brain.kwargs["tool_names"]
+    assert "discord_read_channel_history" in bot.brain.kwargs["tool_names"]
+    assert "discord_send_channel_message" not in bot.brain.kwargs["tool_names"]
+    assert "discord_queue_codex_request" not in bot.brain.kwargs["tool_names"]
     assert bot.brain.kwargs["max_agent_steps"] == 8
 
 
@@ -1368,7 +1369,9 @@ def test_tool_call_heartbeat_does_not_echo_done_text(tmp_path):
 
     assert result == "noop"
     assert channel.sent == []
-    assert "discord_send_dm" in bot.brain.kwargs["tool_names"]
+    assert "discord_read_channel_history" in bot.brain.kwargs["tool_names"]
+    assert "discord_send_dm" not in bot.brain.kwargs["tool_names"]
+    assert "discord_queue_codex_request" not in bot.brain.kwargs["tool_names"]
 
 
 def test_autonomous_heartbeat_can_dm_owner(tmp_path):
@@ -1569,6 +1572,39 @@ def test_unignored_bot_messages_bypass_human_allow_list():
 
     assert bot._allowed(bot_message) is True
     assert bot._allowed(human_message) is False
+    assert bot._allowed(bot_message, allow_unignored_bot=False) is False
+
+
+def test_command_messages_are_gated_before_processing():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.allowed_users = {123}
+    bot.allowed_guilds = set()
+    bot.ignore_bots = False
+    bot.paused = False
+    bot.command_prefix_text = "!brain"
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    events = []
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=456, bot=False),
+        guild=None,
+        content="!ping <@123>",
+    )
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    bot.process_commands = fake_process_commands
+
+    asyncio.run(bot.on_message(message))
+
+    assert events == []
+
+
+def test_allowed_users_are_not_implicit_bot_owners(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "456")
+    monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
+
+    assert 456 not in discord_bot_module._owner_user_ids()
 
 
 def test_grillo_export_uses_current_record_fields():

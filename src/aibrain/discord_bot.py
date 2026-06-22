@@ -59,7 +59,7 @@ LETTA_HEARTBEAT_EVENT_TEXT = (
     "since your circuit will not be activated until the next automated/timed heartbeat or incoming message event."
 )
 DEFAULT_TTS_REPLIES = False
-DEFAULT_IGNORE_BOTS = False
+DEFAULT_IGNORE_BOTS = True
 DEFAULT_RESPOND_TO_BOTS = False
 DEFAULT_REQUIRE_MENTION_IN_GUILDS = True
 DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
@@ -106,8 +106,6 @@ MODEL_SELECT_PAGE_SIZE = 25
 DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
 DEFAULT_DISCORD_TOOL_NAMES = [
     "discord_context",
-    "remember",
-    "search_memory",
     "current_time",
     "brain_context",
     "tavily_search",
@@ -117,6 +115,23 @@ DEFAULT_DISCORD_TOOL_NAMES = [
     "tavily_research",
     "tavily_research_status",
     *DISCORD_AGENT_TOOL_NAMES,
+]
+DEFAULT_HEARTBEAT_TOOL_NAMES = [
+    "discord_context",
+    "current_time",
+    "brain_context",
+    "tavily_search",
+    "tavily_extract",
+    "tavily_research",
+    "tavily_research_status",
+    "discord_get_capabilities",
+    "discord_get_current_context",
+    "discord_get_permissions",
+    "discord_can_do",
+    "discord_list_channels",
+    "discord_list_threads",
+    "discord_read_channel_history",
+    "discord_search_channel_messages",
 ]
 
 
@@ -229,8 +244,7 @@ def _owner_user_ids() -> set[int]:
     explicit = _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
     if explicit:
         return explicit
-    allowed = _csv_ints("DISCORD_BRAIN_ALLOWED_USER_IDS")
-    return allowed or set(DEFAULT_OWNER_USER_IDS)
+    return set(DEFAULT_OWNER_USER_IDS)
 
 
 def _split_paths(value: str) -> list[Path]:
@@ -984,8 +998,9 @@ class DiscordBrainBot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         if self._is_ignored_bot_message(message):
             return
-        await self._process_commands_including_unignored_bots(message)
         if self._is_command_message(message):
+            if self._allowed(message, allow_unignored_bot=False):
+                await self._process_commands_including_unignored_bots(message)
             return
         if getattr(self, "paused", False):
             return
@@ -1005,9 +1020,9 @@ class DiscordBrainBot(commands.Bot):
             return
         await self.process_commands(message)
 
-    def _allowed(self, message: discord.Message) -> bool:
-        allow_unignored_bot = bool(getattr(message.author, "bot", False) and not self.ignore_bots)
-        if self.allowed_users and message.author.id not in self.allowed_users and not allow_unignored_bot:
+    def _allowed(self, message: discord.Message, *, allow_unignored_bot: bool = True) -> bool:
+        bot_bypass = bool(allow_unignored_bot and getattr(message.author, "bot", False) and not self.ignore_bots)
+        if self.allowed_users and message.author.id not in self.allowed_users and not bot_bypass:
             return False
         if message.guild is not None and self.allowed_guilds and message.guild.id not in self.allowed_guilds:
             return False
@@ -1496,7 +1511,7 @@ class DiscordBrainBot(commands.Bot):
                 query,
                 top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
                 min_score=0.0,
-                scope=["thread", "persona", "global"],
+                scope=["thread"],
                 thread_id=state.thread_id,
                 persona_id=self.persona.id,
             )
@@ -2240,12 +2255,12 @@ class DiscordBrainBot(commands.Bot):
             return []
         raw = os.getenv("DISCORD_BRAIN_HEARTBEAT_TOOL_NAMES", "").strip()
         if not raw:
-            return list(DEFAULT_DISCORD_TOOL_NAMES)
+            return list(DEFAULT_HEARTBEAT_TOOL_NAMES)
         lowered = raw.lower()
         if lowered in {"0", "false", "no", "none", "off", "disabled"}:
             return []
         if lowered in {"1", "true", "yes", "default", "all", "*"}:
-            return list(DEFAULT_DISCORD_TOOL_NAMES)
+            return list(DEFAULT_HEARTBEAT_TOOL_NAMES)
         return [item.strip() for item in re.split(r"[,;]", raw) if item.strip()]
 
     def _heartbeat_runtime_message(self, channel: Any | None) -> Any:
@@ -3535,8 +3550,10 @@ async def _send_text_file(ctx: commands.Context, filename: str, content: str) ->
         if ctx.guild is not None:
             await ctx.reply(f"sent `{filename}` to your DMs.", mention_author=False)
     except discord.HTTPException:
-        data.seek(0)
-        await ctx.reply(file=discord.File(data, filename=filename), mention_author=False)
+        await ctx.reply(
+            f"could not DM `{filename}`. enable DMs for this server and try again.",
+            mention_author=False,
+        )
 
 
 async def build_discord_voice_clip(brain: Brain, text: str, *, voice: str | None = None) -> DiscordVoiceClip:
