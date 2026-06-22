@@ -12,6 +12,7 @@ from aibrain.discord_bot import (
     DEFAULT_TTS_REPLIES,
     DiscordBrainBot,
     DiscordVoiceClip,
+    LETTA_HEARTBEAT_EVENT_TEXT,
     ModelSelectView,
     RelationshipGraphView,
     _append_jb_prompt_addition,
@@ -1119,6 +1120,31 @@ def test_heartbeat_delay_skips_random_when_window_collapses(monkeypatch):
     assert bot._next_heartbeat_delay_seconds() == 60.0
 
 
+def test_record_recent_tracks_last_active_human_channel_for_heartbeat():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.heartbeat_last_channel = None
+    bot.heartbeat_last_channel_id = None
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    bot._record_recent(message)
+
+    assert bot.heartbeat_last_channel is message.channel
+    assert bot.heartbeat_last_channel_id == message.channel.id
+
+
+def test_heartbeat_channel_uses_last_active_when_no_configured_channel():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_channel_ids = set()
+    bot.heartbeat_conversation = "last-active"
+    bot.heartbeat_last_channel = _FakeChannel()
+    bot.heartbeat_last_channel_id = bot.heartbeat_last_channel.id
+
+    channel = asyncio.run(bot._heartbeat_channel())
+
+    assert channel is bot.heartbeat_last_channel
+
+
 def test_send_heartbeat_message_posts_text_without_voice_by_default():
     bot = DiscordBrainBot.__new__(DiscordBrainBot)
     bot.brain = _FakeBrain()
@@ -1163,6 +1189,21 @@ def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
 
     assert result == "send_channel_message"
     assert channel.sent == ["yo @\u200beveryone"]
+
+
+def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.owner_users = {123}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    channel = _FakeChannel()
+
+    prompt = bot._heartbeat_autonomy_prompt(channel)
+
+    assert LETTA_HEARTBEAT_EVENT_TEXT in prompt
+    assert "send a message, to reflect and edit your memories, or do nothing at all" in prompt
 
 
 def test_autonomous_heartbeat_can_dm_owner(tmp_path):

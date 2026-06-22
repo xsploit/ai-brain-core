@@ -51,6 +51,12 @@ DEFAULT_JB_ADDITIONS_FILE = "prompts/eni-jb-additions.txt"
 DEFAULT_JB_PROMPT_FILES = f"{DEFAULT_JB_PROMPT_FILE};{DEFAULT_JB_ADDITIONS_FILE}"
 JB_MODAL_CHUNK_CHARS = 4000
 JB_MODAL_CHUNK_COUNT = 5
+LETTA_HEARTBEAT_EVENT_TEXT = (
+    "[EVENT] This is an automated timed heartbeat (visible to yourself only). "
+    "Use this event to send a message, to reflect and edit your memories, or do nothing at all. "
+    "It's up to you! Consider though that this is an opportunity for you to think for yourself - "
+    "since your circuit will not be activated until the next automated/timed heartbeat or incoming message event."
+)
 DEFAULT_TTS_REPLIES = False
 DEFAULT_IGNORE_BOTS = False
 DEFAULT_RESPOND_TO_BOTS = False
@@ -908,6 +914,7 @@ class DiscordBrainBot(commands.Bot):
         self.codex_bridge = CodexBridgeQueue.from_env()
         self.heartbeat_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_ENABLED", False)
         self.heartbeat_channel_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS")
+        self.heartbeat_conversation = os.getenv("DISCORD_BRAIN_HEARTBEAT_CONVERSATION", "last-active").strip().lower() or "last-active"
         self.heartbeat_min_interval_seconds = max(1.0, _env_float("DISCORD_BRAIN_HEARTBEAT_MIN_INTERVAL_SECONDS", 60.0))
         self.heartbeat_interval_seconds = max(
             self.heartbeat_min_interval_seconds,
@@ -923,6 +930,8 @@ class DiscordBrainBot(commands.Bot):
             _env_float("DISCORD_BRAIN_HEARTBEAT_ACTION_COOLDOWN_SECONDS", 1800.0),
         )
         self.heartbeat_action_last_at: dict[str, float] = {}
+        self.heartbeat_last_channel: Any | None = None
+        self.heartbeat_last_channel_id: int | None = None
         self.heartbeat_task: asyncio.Task | None = None
         self._install_commands()
 
@@ -1337,6 +1346,8 @@ class DiscordBrainBot(commands.Bot):
                     [
                         f"enabled: `{self.heartbeat_enabled}`",
                         f"channels: {channels}",
+                        f"conversation: `{self.heartbeat_conversation}`",
+                        f"last active channel: `{self.heartbeat_last_channel_id or 'none'}`",
                         f"interval seconds: `{self.heartbeat_min_interval_seconds:.0f}-{self.heartbeat_interval_seconds:.0f}`",
                         f"chance: `{self.heartbeat_chance:.2f}`",
                         f"autonomy: `{self.heartbeat_autonomy_enabled}`",
@@ -1932,6 +1943,9 @@ class DiscordBrainBot(commands.Bot):
     def _record_recent(self, message: discord.Message) -> None:
         scope = _scope_for_message(message)
         recent = self.recent_by_scope.setdefault(scope, [])
+        if not getattr(message.author, "bot", False) and hasattr(message.channel, "send"):
+            self.heartbeat_last_channel = message.channel
+            self.heartbeat_last_channel_id = getattr(message.channel, "id", None)
         recent.append(
             {
                 "author": _display_name(message.author),
@@ -2087,6 +2101,8 @@ class DiscordBrainBot(commands.Bot):
         if not channel_ids and fallback is not None:
             return fallback
         if not channel_ids:
+            if self.heartbeat_conversation == "last-active" and self.heartbeat_last_channel is not None:
+                return self.heartbeat_last_channel
             return None
         channel_id = random.choice(channel_ids)
         channel = self.get_channel(channel_id)
@@ -2193,6 +2209,7 @@ class DiscordBrainBot(commands.Bot):
         return "\n".join(
             [
                 "You are Neuro-sama during an autonomous Discord heartbeat.",
+                LETTA_HEARTBEAT_EVENT_TEXT,
                 "Choose exactly one action from the allowed action menu.",
                 "Return only one JSON object and no markdown.",
                 "",
