@@ -448,8 +448,16 @@ def test_append_jb_prompt_addition_writes_configured_file(monkeypatch, tmp_path)
     assert "alpha beta\n\ngamma" in text
 
 
-def test_jb_prompt_cache_key_tracks_prompt_content(monkeypatch):
+def test_jb_prompt_cache_key_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_ENABLED", raising=False)
+
+    assert _jb_prompt_cache_key("prompt one") is None
+
+
+def test_jb_prompt_cache_key_tracks_prompt_content_when_enabled(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", raising=False)
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_ENABLED", "true")
 
     first = _jb_prompt_cache_key("prompt one")
     second = _jb_prompt_cache_key("prompt two")

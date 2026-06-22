@@ -2364,8 +2364,8 @@ class DiscordBrainBot(commands.Bot):
             response_options: dict[str, Any] = {}
             if prompt_cache_key:
                 response_options["prompt_cache_key"] = prompt_cache_key
-            if prompt_cache_retention:
-                response_options["prompt_cache_retention"] = prompt_cache_retention
+                if prompt_cache_retention:
+                    response_options["prompt_cache_retention"] = prompt_cache_retention
             if stateless:
                 response_options["stateless"] = True
             memory_query_text = memory_text.strip() or prompt_text.strip() or "discord message"
@@ -3715,10 +3715,12 @@ def _load_jb_prompt() -> str:
     return "\n\n".join(part for part in parts if part)
 
 
-def _jb_prompt_cache_key(prompt: str) -> str:
+def _jb_prompt_cache_key(prompt: str) -> str | None:
     explicit = os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY")
     if explicit:
         return explicit
+    if not _env_bool("DISCORD_BRAIN_JB_PROMPT_CACHE_ENABLED", False):
+        return None
     digest = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:16]
     return f"discord-brain:jb:{digest}"
 
