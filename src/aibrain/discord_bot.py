@@ -30,6 +30,7 @@ from discord.ext import commands
 from . import Brain, BrainConfig, ImageInput, MemoryPolicy, MemoryStackConfig, Persona, ThreadPolicy
 from .codex_app_bridge import notify_codex_app_bridge
 from .codex_bridge import CodexBridgeQueue
+from .discord_shitlist import DiscordShitlistEntry, DiscordShitlistStore, format_shitlist_reply
 from .env import load_env_file
 from .discord_tools import (
     DISCORD_AGENT_TOOL_NAMES,
@@ -225,8 +226,35 @@ def _ping_target_mention(message: Any, target: str) -> str | None:
     return None
 
 
+def _target_user_id(message: Any, target: str) -> int | None:
+    mentions = getattr(message, "mentions", None) or []
+    if mentions:
+        user_id = getattr(mentions[0], "id", None)
+        if user_id is not None:
+            return int(user_id)
+    target = target.strip()
+    match = re.search(r"<@!?(\d+)>", target)
+    if match:
+        return int(match.group(1))
+    if target.isdecimal():
+        return int(target)
+    return None
+
+
 def _ping_reply(target_mention: str) -> str:
     return f"yo, what up, fam {target_mention}"
+
+
+def _format_shitlist_status(entries: list[DiscordShitlistEntry]) -> str:
+    if not entries:
+        return "shitlist is empty."
+    lines = [f"shitlist entries: `{len(entries)}`"]
+    for entry in entries[:20]:
+        reason = discord.utils.escape_markdown(entry.reason or "manual")
+        lines.append(f"- `<@{entry.user_id}>` spice `{entry.spice_level}`: {reason[:160]}")
+    if len(entries) > 20:
+        lines.append(f"- ...and `{len(entries) - 20}` more")
+    return "\n".join(lines)
 
 
 def _csv_ints(name: str) -> set[int]:
@@ -918,6 +946,10 @@ class DiscordBrainBot(commands.Bot):
         self.allowed_guilds = _csv_ints("DISCORD_BRAIN_ALLOWED_GUILD_IDS")
         self.allowed_users = _csv_ints("DISCORD_BRAIN_ALLOWED_USER_IDS")
         self.owner_users = _owner_user_ids()
+        self.shitlist_store = DiscordShitlistStore(
+            _discord_shitlist_path(self.brain.config.database_path),
+            owner_user_ids=self.owner_users,
+        )
         self.command_prefix_text = command_prefix_text
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_RESPOND_TO_MENTIONS", True)
         self.respond_to_dms = _env_bool("DISCORD_BRAIN_RESPOND_TO_DMS", True)
@@ -1010,6 +1042,10 @@ class DiscordBrainBot(commands.Bot):
             self._record_recent(message)
             return
         self._record_recent(message)
+        shitlist_entry = self.shitlist_store.get(getattr(message.author, "id", None))
+        if shitlist_entry is not None:
+            await self._reply_with_shitlist(message, shitlist_entry)
+            return
         await self._reply_with_brain(message)
 
     async def _process_commands_including_unignored_bots(self, message: discord.Message) -> None:
@@ -1070,6 +1106,8 @@ class DiscordBrainBot(commands.Bot):
             or stripped.startswith("!codex ")
             or stripped == "!bot"
             or stripped.startswith("!bot ")
+            or stripped == "!shitlist"
+            or stripped.startswith("!shitlist ")
             or stripped == "!pause"
             or stripped == "!resume"
             or stripped == "!unpause"
@@ -1616,6 +1654,61 @@ class DiscordBrainBot(commands.Bot):
                 state = "enabled"
             await ctx.reply(f"bot-to-bot auto replies are now `{state}`.", mention_author=False)
 
+        @commands.group(name="shitlist", invoke_without_command=True)
+        async def shitlist_control(ctx: commands.Context) -> None:
+            if not await self._require_owner_command(ctx, "shitlist control"):
+                return
+            await ctx.reply(
+                _format_shitlist_status(self.shitlist_store.list()),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @shitlist_control.command(name="status", aliases=["list"])
+        async def shitlist_status(ctx: commands.Context) -> None:
+            if not await self._require_owner_command(ctx, "shitlist control"):
+                return
+            await ctx.reply(
+                _format_shitlist_status(self.shitlist_store.list()),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @shitlist_control.command(name="add")
+        async def shitlist_add(ctx: commands.Context, target: str = "", spice_level: int = 3, *, reason: str = "manual") -> None:
+            if not await self._require_owner_command(ctx, "shitlist control"):
+                return
+            user_id = _target_user_id(ctx.message, target)
+            if user_id is None:
+                await ctx.reply("usage: `!shitlist add @user [1-10] reason`", mention_author=False)
+                return
+            try:
+                entry = self.shitlist_store.add(user_id, reason=reason, spice_level=spice_level)
+            except ValueError as exc:
+                await ctx.reply(str(exc), mention_author=False)
+                return
+            await ctx.reply(
+                f"added `<@{entry.user_id}>` at spice `{entry.spice_level}`. preview: {format_shitlist_reply(entry)}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @shitlist_control.command(name="remove", aliases=["rm"])
+        async def shitlist_remove(ctx: commands.Context, target: str = "") -> None:
+            if not await self._require_owner_command(ctx, "shitlist control"):
+                return
+            user_id = _target_user_id(ctx.message, target)
+            if user_id is None:
+                await ctx.reply("usage: `!shitlist remove @user`", mention_author=False)
+                return
+            removed = self.shitlist_store.remove(user_id)
+            state = "removed" if removed else "not listed"
+            await ctx.reply(
+                f"`<@{user_id}>` is {state}.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
         @commands.command(name="ping")
         async def ping(ctx: commands.Context, *, target: str = "") -> None:
             target_mention = _ping_target_mention(ctx.message, target)
@@ -1968,6 +2061,7 @@ class DiscordBrainBot(commands.Bot):
         self.add_command(pause)
         self.add_command(resume)
         self.add_command(bot_control)
+        self.add_command(shitlist_control)
         self.add_command(ping)
         self.add_command(model_control)
         self.add_command(say)
@@ -2768,6 +2862,11 @@ class DiscordBrainBot(commands.Bot):
             return
         except Exception:
             self.logger.exception("Background GRILLO ingest failed")
+
+    async def _reply_with_shitlist(self, message: discord.Message, entry: DiscordShitlistEntry) -> None:
+        final_text = format_shitlist_reply(entry)
+        await self._send_final_reply(message, final_text)
+        self._record_recent_assistant(message, final_text)
 
     async def _edit_reply(self, reply: discord.Message, text: str, *, final: bool = False) -> None:
         chunks = _split_discord_text(text, self.max_reply_chars)
@@ -3849,6 +3948,13 @@ def _discord_database_path() -> Path:
         or os.getenv("AIBRAIN_DATABASE")
         or "discord_brain.sqlite3"
     )
+
+
+def _discord_shitlist_path(database_path: Path | None = None) -> Path:
+    explicit = os.getenv("DISCORD_BRAIN_SHITLIST_FILE")
+    if explicit:
+        return Path(explicit)
+    return (database_path or _discord_database_path()).with_suffix(".shitlist.json")
 
 
 def build_persona() -> Persona:

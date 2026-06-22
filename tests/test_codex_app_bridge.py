@@ -50,7 +50,7 @@ def test_app_bridge_submits_authorized_owner_request(tmp_path: Path) -> None:
 
     result = worker.process_once()
 
-    assert result.status == "submitted_to_codex_app_server"
+    assert result.status == "submitted_to_codex_app_server_pending_final"
     assert queue.pending_files() == []
     assert queue.result_files()
     assert queue.archive_files()
@@ -68,9 +68,10 @@ def test_app_bridge_submits_authorized_owner_request(tmp_path: Path) -> None:
     assert "final_outbox_file" in prompt
 
     outbox_payload = json.loads(queue.result_files()[0].read_text(encoding="utf-8"))
-    assert outbox_payload["status"] == "submitted_to_codex_app_server"
+    assert outbox_payload["status"] == "submitted_to_codex_app_server_pending_final"
     assert outbox_payload["origin"]["requester_id"] == "120418341775998976"
     assert outbox_payload["origin"]["channel_id"] == "2"
+    assert outbox_payload["details"]["final_outbox_file"].endswith(".final.json")
     assert outbox_payload["details"]["turn"]["turnId"] == "turn-123"
 
 

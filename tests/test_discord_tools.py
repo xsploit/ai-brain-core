@@ -28,10 +28,14 @@ from aibrain.discord_tools import (
     discord_send_dm,
     discord_send_file,
     discord_send_rich_embed,
+    discord_shitlist_add,
+    discord_shitlist_remove,
+    discord_shitlist_status,
     discord_timeout_member,
     register_discord_tools,
 )
 from aibrain.codex_bridge import CodexBridgeQueue
+from aibrain.discord_shitlist import DiscordShitlistStore
 from aibrain.tools import ToolRegistry
 
 
@@ -257,6 +261,7 @@ def test_register_discord_tools_exposes_agentic_suite():
 
     assert set(DISCORD_AGENT_TOOL_NAMES).issubset(registry._tools)
     assert "discord_queue_codex_request" in registry._tools
+    assert "discord_shitlist_add" in registry._tools
     assert "discord_list_bot_guilds" in registry._tools
     assert "discord_send_dm" in registry._tools
     assert "discord_create_text_channel" in registry._tools
@@ -448,6 +453,41 @@ def test_codex_queue_request_writes_bridge_file(monkeypatch, tmp_path):
         assert '"mode": "manual_owner"' in payload
         assert "add a better status panel" in payload
         assert "please upgrade yourself" in payload
+
+
+def test_shitlist_tools_are_owner_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
+    with _tool_context() as ctx:
+        ctx.runtime_bot.shitlist_store = DiscordShitlistStore(tmp_path / "shitlist.json", owner_user_ids={999})
+
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_shitlist_add(3, "spam", 2))
+
+
+def test_shitlist_tools_write_store(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context() as ctx:
+        ctx.runtime_bot.shitlist_store = DiscordShitlistStore(tmp_path / "shitlist.json", owner_user_ids={1})
+
+        added = asyncio.run(discord_shitlist_add(3, "binary spam", 1))
+        status = asyncio.run(discord_shitlist_status())
+        removed = asyncio.run(discord_shitlist_remove(3))
+
+    assert added["entry"]["user_id"] == 3
+    assert added["entry"]["spice_level"] == 1
+    assert added["preview_reply"] == "gfy"
+    assert status["count"] == 1
+    assert status["entries"][0]["reason"] == "binary spam"
+    assert removed["removed"] is True
+
+
+def test_shitlist_rejects_bot_owner(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context() as ctx:
+        ctx.runtime_bot.shitlist_store = DiscordShitlistStore(tmp_path / "shitlist.json", owner_user_ids={1})
+
+        with pytest.raises(DiscordToolError, match="bot owner cannot be added"):
+            asyncio.run(discord_shitlist_add(1, "nope", 10))
 
 
 def test_list_members_requires_admin_or_owner_and_members_intent():

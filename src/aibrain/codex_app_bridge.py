@@ -202,6 +202,7 @@ class CodexBridgeAppServerWorker:
                 summary=validation_error,
             )
 
+        final_outbox_path = bridge_final_result_path(request_file)
         prompt = build_codex_turn_prompt(request, request_file=request_file, cwd=self.cwd)
         with self.client_factory() as client:
             client.initialize()
@@ -225,20 +226,21 @@ class CodexBridgeAppServerWorker:
         result = self._write_result(
             request_file,
             request,
-            "submitted_to_codex_app_server",
-            "Submitted authorized bridge request to Codex app-server.",
+            "submitted_to_codex_app_server_pending_final",
+            "Submitted authorized bridge request to Codex app-server; awaiting final result JSON.",
             {
                 "thread_id": self.thread_id,
+                "final_outbox_file": str(final_outbox_path),
                 "turn": _summarize_turn_result(turn_result),
             },
         )
-        archive = self._archive_request(request_file, prefix="processed")
+        archive = self._archive_request(request_file, prefix="submitted")
         return ProcessedBridgeRequest(
-            status="submitted_to_codex_app_server",
+            status="submitted_to_codex_app_server_pending_final",
             request_file=request_file.name,
             outbox_file=result.name,
             archive_file=archive.name,
-            summary="Submitted authorized bridge request to Codex app-server.",
+            summary="Submitted authorized bridge request to Codex app-server; awaiting final result JSON.",
         )
 
     def _write_result(
@@ -349,7 +351,7 @@ async def _run_in_thread(func: Callable[[], ProcessedBridgeRequest]) -> Processe
 
 def build_codex_turn_prompt(request: dict[str, Any], *, request_file: Path, cwd: Path) -> str:
     prompt = str(request.get("prompt") or "").strip()
-    final_outbox_path = request_file.parent.parent / "outbox" / f"{request_file.stem}.final.json"
+    final_outbox_path = bridge_final_result_path(request_file)
     summary = {
         "request_file": str(request_file),
         "final_outbox_file": str(final_outbox_path),
@@ -384,6 +386,10 @@ def build_codex_turn_prompt(request: dict[str, Any], *, request_file: Path, cwd:
         f"Request metadata:\n{json.dumps(summary, indent=2, sort_keys=True)}\n\n"
         f"Requested work:\n{prompt}\n"
     )
+
+
+def bridge_final_result_path(request_file: Path) -> Path:
+    return request_file.parent.parent / "outbox" / f"{request_file.stem}.final.json"
 
 
 def _load_request(path: Path) -> dict[str, Any]:

@@ -8,18 +8,23 @@ import re
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import discord
 
 from .codex_app_bridge import notify_codex_app_bridge
 from .codex_bridge import CodexBridgeQueue
+from .discord_shitlist import DiscordShitlistStore, format_shitlist_reply
 
 
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
 
 OWNER_ONLY_TOOL_NAMES = [
     "discord_queue_codex_request",
+    "discord_shitlist_add",
+    "discord_shitlist_remove",
+    "discord_shitlist_status",
     "discord_list_bot_guilds",
     "discord_get_application_info",
     "discord_create_text_channel",
@@ -39,6 +44,9 @@ OWNER_ONLY_TOOL_NAMES = [
 DISCORD_AGENT_TOOL_NAMES = [
     "discord_get_capabilities",
     "discord_queue_codex_request",
+    "discord_shitlist_add",
+    "discord_shitlist_remove",
+    "discord_shitlist_status",
     "discord_list_bot_guilds",
     "discord_get_guild",
     "discord_get_bot_user",
@@ -82,7 +90,7 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_list_voice_states",
     "discord_move_member_voice",
     "discord_disconnect_member_voice",
-    *OWNER_ONLY_TOOL_NAMES[3:],
+    *OWNER_ONLY_TOOL_NAMES[6:],
     "discord_list_invites",
     "discord_delete_invite",
     "discord_create_poll",
@@ -185,6 +193,42 @@ async def discord_queue_codex_request(prompt: str, route: str = "codex") -> dict
         "queue_root": str(queue.root),
         "bridge_notify": notify,
         "message": "Queued one Codex bridge request and notified the local bridge server when configured.",
+    }
+
+
+async def discord_shitlist_add(user_id: int | str, reason: str = "manual", spice_level: int = 3) -> dict[str, Any]:
+    """Owner-only: add or update a user in Neuro's persistent shitlist."""
+    runtime = _runtime()
+    _require_owner(runtime, "edit shitlist")
+    store = _shitlist_store(runtime)
+    try:
+        entry = store.add(user_id, reason=reason, spice_level=int(spice_level))
+    except ValueError as exc:
+        raise DiscordToolError(str(exc)) from exc
+    return {
+        "ok": True,
+        "entry": _serialize_shitlist_entry(entry),
+        "preview_reply": format_shitlist_reply(entry),
+    }
+
+
+async def discord_shitlist_remove(user_id: int | str) -> dict[str, Any]:
+    """Owner-only: remove a user from Neuro's persistent shitlist."""
+    runtime = _runtime()
+    _require_owner(runtime, "edit shitlist")
+    removed = _shitlist_store(runtime).remove(user_id)
+    return {"ok": True, "removed": removed, "user_id": str(user_id)}
+
+
+async def discord_shitlist_status() -> dict[str, Any]:
+    """Owner-only: list Neuro's persistent shitlist entries."""
+    runtime = _runtime()
+    _require_owner(runtime, "view shitlist")
+    entries = _shitlist_store(runtime).list()
+    return {
+        "ok": True,
+        "count": len(entries),
+        "entries": [_serialize_shitlist_entry(entry) for entry in entries],
     }
 
 
@@ -2284,6 +2328,23 @@ def _bounded_optional(text: str | None, limit: int) -> str | None:
     if text is None:
         return None
     return _bounded_text(text, limit)
+
+
+def _shitlist_store(runtime: DiscordToolRuntime) -> DiscordShitlistStore:
+    store = getattr(getattr(runtime, "bot", None), "shitlist_store", None)
+    if isinstance(store, DiscordShitlistStore):
+        return store
+    path = Path(os.getenv("DISCORD_BRAIN_SHITLIST_FILE", "discord_brain.shitlist.json"))
+    return DiscordShitlistStore(path, owner_user_ids=_owner_user_ids())
+
+
+def _serialize_shitlist_entry(entry: Any) -> dict[str, Any]:
+    return {
+        "user_id": int(entry.user_id),
+        "reason": str(entry.reason),
+        "spice_level": int(entry.spice_level),
+        "added_at": str(entry.added_at),
+    }
 
 
 def _id(value: Any) -> int | None:

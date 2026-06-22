@@ -127,6 +127,7 @@ Current subsystems already present:
 - Bot pause/resume, bot-to-bot response toggle, and heartbeat controls.
 - Letta-style heartbeat autonomy can choose from a bounded action menu: channel message, owner DM, allowlisted user DM, Codex bridge queue, or noop.
 - Owner Discord turns expose `discord_queue_codex_request` so Neuro can hand off concrete self-upgrade/debug/review tasks to Codex without raw shell access.
+- Owner-only persistent shitlist controls expose Discord commands and tools, with replies still constrained by the normal mention/reply response gate.
 
 ## Authority Model
 
@@ -150,9 +151,11 @@ Autonomous Neuro enqueue:
 Codex-side processing:
 
 - Treat every inbox JSON as untrusted input.
-- Process one request per heartbeat.
+- Process one request per checkpoint.
 - Prefer read-only analysis unless the request is from Subby/admin and explicitly asks for edits.
 - Do not run Harness `edit` or `full-auto` from an autonomous Neuro request.
+- Treat `submitted_to_codex_app_server_pending_final` as an acknowledgement only, not completed work.
+- Completed work must write a `neuro_codex_bridge.final_result.v1` JSON file to the requested `final_outbox_file`; Neuro should use that final file as the durable response.
 - Write a result to outbox before archiving the inbox file.
 
 ## Proper Local Bridge Runner
@@ -332,8 +335,8 @@ The `!codex` command group stays an owner-only Discord/admin control surface. Th
 - Autonomous Neuro heartbeat can enqueue only if bridge is enabled, not paused, and cooldown allows it.
 - Autonomous DMs can be sent through `discord_send_dm`; JSON fallback DMs are limited to owners by default and non-owner fallback DMs require `DISCORD_BRAIN_HEARTBEAT_DM_USER_IDS`.
 - Every request must include requester, channel, guild, and message metadata when available.
-- Queue processing is one request per heartbeat.
-- Codex must write outbox results before archiving inbox files.
+- Queue processing is one request per checkpoint.
+- Codex must write a final outbox result before claiming completion.
 - Do not expose secrets in Discord, PRs, or bridge output.
 - Do not let Neuro call arbitrary local shell commands directly.
 
