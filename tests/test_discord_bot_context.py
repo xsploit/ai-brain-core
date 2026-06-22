@@ -709,8 +709,8 @@ def test_attachment_read_uses_direct_url_before_cached_proxy():
     assert attachment.calls == [False]
 
 
-def test_tts_replies_default_on():
-    assert DEFAULT_TTS_REPLIES is True
+def test_tts_replies_default_off():
+    assert DEFAULT_TTS_REPLIES is False
 
 
 def test_tts_spoken_text_removes_markdown_formatting():
@@ -844,9 +844,9 @@ def test_bot_message_ignore_toggle_keeps_self_guard():
     assert bot._is_ignored_bot_message(self_message) is True
 
 
-def test_bot_messages_are_not_ignored_by_default():
+def test_bot_messages_are_not_ignored_but_do_not_auto_respond_by_default():
     assert DEFAULT_IGNORE_BOTS is False
-    assert DEFAULT_RESPOND_TO_BOTS is True
+    assert DEFAULT_RESPOND_TO_BOTS is False
     assert DEFAULT_REQUIRE_MENTION_IN_GUILDS is True
 
 
