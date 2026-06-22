@@ -366,6 +366,12 @@ class SQLiteGrilloStore:
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS grillo_worker_state (
+                    scope_key TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -864,6 +870,39 @@ class SQLiteGrilloStore:
                 (str(uuid4()), beat_type, scope_key, participant_key, summary, json.dumps(metadata), utc_now()),
             )
 
+    async def get_worker_state(self, scope_key: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_worker_state_sync, scope_key)
+
+    def _get_worker_state_sync(self, scope_key: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT state_json FROM grillo_worker_state WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            parsed = json.loads(row["state_json"] or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def set_worker_state(self, scope_key: str, state: dict[str, Any]) -> None:
+        await asyncio.to_thread(self._set_worker_state_sync, scope_key, state)
+
+    def _set_worker_state_sync(self, scope_key: str, state: dict[str, Any]) -> None:
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT INTO grillo_worker_state (scope_key, state_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_key, json.dumps(state), utc_now()),
+            )
+
     async def status(self) -> dict[str, int | str | None]:
         return await asyncio.to_thread(self._status_sync)
 
@@ -923,7 +962,7 @@ class GrilloRuntime:
         interface_path: str | None = None,
         source: str = "brain",
         metadata: dict[str, Any] | None = None,
-        run_tick: bool = True,
+        run_tick: bool = False,
     ) -> tuple[GrilloTurn, GrilloTurn]:
         now = utc_now()
         user_turn = await self.store.append_turn(
@@ -957,7 +996,7 @@ class GrilloRuntime:
             )
         )
         if run_tick:
-            await self.run_tick(scope_key=scope_key, participant_key=participant_key, beat_type="relationship")
+            await self.run_tick(scope_key=scope_key, participant_key=participant_key, beat_type="extraction")
         return user_turn, assistant_turn
 
     async def run_tick(
@@ -970,7 +1009,8 @@ class GrilloRuntime:
         if self._tick_lock.locked():
             return {"ok": False, "skipped": "tick_already_running"}
         async with self._tick_lock:
-            turns = await self.store.list_turns(scope_key, participant_key, limit=12)
+            beat_type = _normalize_worker_beat_type(beat_type)
+            turns = await self.store.list_turns(scope_key, participant_key, limit=20)
             if not turns:
                 await self.store.append_activity(
                     beat_type=beat_type,
@@ -979,6 +1019,39 @@ class GrilloRuntime:
                     summary="No turns available for GRILLO tick.",
                 )
                 return {"ok": True, "candidates": 0, "diary": 0, "slots": 0}
+            if beat_type == "semantic_indexing":
+                return await self._run_semantic_indexing_tick(
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    turns=turns,
+                )
+            if beat_type == "extraction":
+                if self.worker_completion is not None:
+                    try:
+                        return await self._run_worker_extraction_tick(
+                            scope_key=scope_key,
+                            participant_key=participant_key,
+                            turns=turns,
+                        )
+                    except Exception as exc:
+                        await self.store.append_activity(
+                            beat_type="grillo_worker_failed",
+                            scope_key=scope_key,
+                            participant_key=participant_key,
+                            summary=f"GRILLO worker extraction failed; using fallback extractor: {exc}",
+                            metadata={
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "requested_beat_type": beat_type,
+                            },
+                        )
+                return await self._run_fallback_extractor_tick(
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    beat_type=beat_type,
+                    turns=turns,
+                    reason="native_extraction",
+                )
             if self.worker_completion is not None:
                 try:
                     return await self._run_worker_beat_tick(
@@ -1018,12 +1091,14 @@ class GrilloRuntime:
                         metadata={"error": str(exc)},
                     )
 
-            return await self._run_fallback_extractor_tick(
+            await self.store.append_activity(
+                beat_type=beat_type,
                 scope_key=scope_key,
                 participant_key=participant_key,
-                beat_type=beat_type,
-                turns=turns,
+                summary="GRILLO memory beat requires an AI worker provider.",
+                metadata={"mode": "beat_requires_provider"},
             )
+            return {"ok": True, "mode": "beat_requires_provider", "writes": 0, "tool_calls": 0}
 
     async def _run_fallback_extractor_tick(
         self,
@@ -1040,6 +1115,7 @@ class GrilloRuntime:
         promoted = await self._promote_candidates(scope_key, participant_key, stored_candidates)
         if self.vector_store is not None:
             await self._index_semantic(turns, stored_candidates, diary)
+        await self._mark_turns_processed(scope_key, [turn.turn_id for turn in turns if turn.turn_id])
         await self.store.append_activity(
             beat_type=beat_type,
             scope_key=scope_key,
@@ -1062,6 +1138,314 @@ class GrilloRuntime:
             "slots": len(promoted),
             "candidate_ids": [candidate.candidate_id for candidate in stored_candidates],
             "diary_id": diary.diary_id,
+        }
+
+    async def _mark_turns_processed(self, scope_key: str, turn_ids: list[str]) -> None:
+        if not turn_ids:
+            return
+        state = await self.store.get_worker_state(scope_key)
+        processed = _string_list(state.get("processedTurnIds"))
+        seen = set(processed)
+        for turn_id in turn_ids:
+            if turn_id and turn_id not in seen:
+                processed.append(turn_id)
+                seen.add(turn_id)
+        state["processedTurnIds"] = processed[-2000:]
+        await self.store.set_worker_state(scope_key, state)
+
+    async def _update_worker_state(self, scope_key: str, patch: dict[str, Any]) -> None:
+        state = await self.store.get_worker_state(scope_key)
+        state.update(patch)
+        await self.store.set_worker_state(scope_key, state)
+
+    async def _run_worker_extraction_tick(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        assert self.worker_completion is not None
+        state = await self.store.get_worker_state(scope_key)
+        processed_turn_ids = set(_string_list(state.get("processedTurnIds")))
+        pairs = _build_unprocessed_turn_pairs(turns, processed_turn_ids)[:3]
+        if not pairs:
+            await self._update_worker_state(scope_key, {"processedTurnIds": list(processed_turn_ids)[-2000:]})
+            return {
+                "ok": True,
+                "mode": "worker_loop",
+                "no_op_reason": "no_new_turn_pairs",
+                "writes": 0,
+                "tool_calls": 0,
+                "candidates": 0,
+                "diary": 0,
+                "slots": 0,
+                "profile_patches": 0,
+                "emotion_updates": 0,
+                "archival": 0,
+            }
+        system_prompt = _build_backend_worker_system_prompt()
+        user_prompt = _build_backend_extraction_prompt(scope_key=scope_key, pairs=pairs)
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        source_turn_ids = [turn.turn_id for pair in pairs for turn in pair if turn.turn_id]
+        writes = 0
+        tool_calls = 0
+        candidate_writes = 0
+        diary_writes = 0
+        recovery_attempted = False
+        counts = _empty_worker_counts()
+        last_trace_id = ""
+        last_provider = "runtime-provider"
+        last_model = "runtime-model"
+        last_notes = ""
+
+        for round_index in range(1, 5):
+            raw_result = await self.worker_completion(
+                {
+                    "disableState": True,
+                    "maxTokens": 900,
+                    "maxToolRounds": 15,
+                    "messages": messages,
+                    "responseFormat": {"type": "json_object"},
+                    "stateKey": f"memory:{scope_key}",
+                    "stateScope": "memory",
+                    "temperature": 0.25,
+                    "toolChoiceMode": "auto",
+                }
+            )
+            raw_text, meta = _worker_completion_text_and_meta(raw_result)
+            last_provider = str(meta.get("provider") or last_provider)
+            last_model = str(meta.get("model") or last_model)
+            last_trace_id = str(uuid4())
+            await self.store.append_worker_trace(
+                trace_id=last_trace_id,
+                scope_key=scope_key,
+                participant_key=participant_key,
+                beat_type="extraction",
+                round=round_index,
+                provider=last_provider,
+                model=last_model,
+                system_prompt=system_prompt,
+                prompt=user_prompt,
+                response_text=raw_text,
+            )
+            parsed = _parse_worker_json(raw_text)
+            last_notes = _compact(str(parsed.get("notes") or ""), 500)
+            calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
+            if not calls:
+                if parsed.get("done") is True:
+                    if not recovery_attempted and _should_run_worker_debrief_recovery(
+                        pairs=pairs,
+                        writes=writes,
+                        candidate_writes=candidate_writes,
+                        diary_writes=diary_writes,
+                    ):
+                        recovery_attempted = True
+                        messages.append({"role": "assistant", "content": raw_text})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": _build_backend_worker_debrief_prompt(
+                                    pairs=pairs,
+                                    writes=writes,
+                                    candidate_writes=candidate_writes,
+                                    diary_writes=diary_writes,
+                                ),
+                            }
+                        )
+                        continue
+                    break
+                await self._update_worker_state(
+                    scope_key,
+                    {
+                        "lastExtractionTraceId": last_trace_id,
+                        "lastExtractionWorkerNotes": last_notes,
+                        "processedTurnIds": list(processed_turn_ids)[-2000:],
+                    },
+                )
+                return {
+                    "ok": True,
+                    "mode": "worker_loop",
+                    "no_op_reason": "worker_no_tool_calls" if writes == 0 else None,
+                    "writes": writes,
+                    "tool_calls": tool_calls,
+                    **counts,
+                }
+
+            messages.append({"role": "assistant", "content": raw_text})
+            for call in calls:
+                tool_calls += 1
+                execution = await self.run_worker_tool(
+                    name=call["name"],
+                    args=call["args"],
+                    scope_key=scope_key,
+                    participant_key=participant_key,
+                    turns=turns,
+                )
+                if execution["ok"] and call["name"] in WORKER_WRITE_TOOLS:
+                    writes += 1
+                    candidate_writes += 1 if call["name"] == "core.worker_candidate_write" else 0
+                    diary_writes += 1 if call["name"] == "core.worker_diary_write" else 0
+                    kind = _worker_write_kind(call["name"])
+                    if kind in counts:
+                        counts[kind] += 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {"ok": execution["ok"], "result": execution["result"], "tool": call["name"]},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Continue the GRILLO worker loop. Use more worker tools if needed. If complete, return JSON with done=true and toolCalls=[].",
+                }
+            )
+
+        for turn_id in source_turn_ids:
+            processed_turn_ids.add(turn_id)
+        await self._update_worker_state(
+            scope_key,
+            {
+                "lastExtractionAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "lastExtractionCandidateWrites": candidate_writes,
+                "lastExtractionDiaryWrites": diary_writes,
+                "lastExtractionModel": last_model,
+                "lastExtractionProvider": last_provider,
+                "lastExtractionRecoveryAttempted": recovery_attempted,
+                "lastExtractionTraceId": last_trace_id,
+                "lastExtractionTurnCount": len(pairs),
+                "lastExtractionWorkerNotes": last_notes,
+                "processedTurnIds": list(processed_turn_ids)[-2000:],
+            },
+        )
+        await self.store.append_activity(
+            beat_type="extraction",
+            scope_key=scope_key,
+            participant_key=participant_key,
+            summary=f"GRILLO extraction tick completed with {writes} writes and {tool_calls} tool calls.",
+            metadata={
+                "mode": "worker_loop",
+                "notes": last_notes,
+                "provider": last_provider,
+                "model": last_model,
+                "trace_id": last_trace_id,
+                "writes": writes,
+                "tool_calls": tool_calls,
+                "candidate_writes": candidate_writes,
+                "diary_writes": diary_writes,
+                "recovery_attempted": recovery_attempted,
+                **counts,
+            },
+        )
+        return {
+            "ok": True,
+            "mode": "worker_loop",
+            "no_op_reason": "worker_no_writes" if writes == 0 else None,
+            "writes": writes,
+            "tool_calls": tool_calls,
+            "trace_id": last_trace_id,
+            **counts,
+        }
+
+    async def _run_semantic_indexing_tick(
+        self,
+        *,
+        scope_key: str,
+        participant_key: str,
+        turns: list[GrilloTurn],
+    ) -> dict[str, Any]:
+        if self.vector_store is None:
+            return {
+                "ok": True,
+                "mode": "semantic_indexing",
+                "no_op_reason": "semantic_indexing_requires_embedding",
+                "writes": 0,
+                "tool_calls": 0,
+            }
+        state = await self.store.get_worker_state(scope_key)
+        indexed_turn_ids = set(_string_list(state.get("semanticIndexedTurnIds")))
+        pairs = _build_unprocessed_turn_pairs(turns, indexed_turn_ids)[:4]
+        if not pairs:
+            await self._update_worker_state(scope_key, {"semanticIndexedTurnIds": list(indexed_turn_ids)[-2000:]})
+            return {
+                "ok": True,
+                "mode": "semantic_indexing",
+                "no_op_reason": "no_new_turn_pairs",
+                "writes": 0,
+                "tool_calls": 0,
+            }
+        writes = 0
+        attempted = 0
+        failed = 0
+        indexed_now: list[str] = []
+        for user_turn, assistant_turn in pairs:
+            attempted += 1
+            text = "\n".join(
+                [
+                    f"User: {_compact(user_turn.content, 1200)}",
+                    f"{assistant_turn.author_name or 'Assistant'}: {_compact(assistant_turn.content, 1200)}",
+                ]
+            )[:2400]
+            source_turn_ids = [turn.turn_id for turn in (user_turn, assistant_turn) if turn.turn_id]
+            try:
+                await self.vector_store.add(
+                    RecallItem(
+                        id=f"grillo:semantic:{uuid4()}",
+                        text=text,
+                        scope="thread",
+                        thread_id=scope_key,
+                        source_event_id=source_turn_ids[0] if source_turn_ids else None,
+                        importance=0.55,
+                        metadata={
+                            "source": "grillo_semantic_turn_pair",
+                            "scope_key": scope_key,
+                            "participant_key": participant_key,
+                        },
+                        created_at=assistant_turn.created_at or user_turn.created_at,
+                    )
+                )
+                writes += 1
+                indexed_now.extend(source_turn_ids)
+            except Exception:
+                failed += 1
+        for turn_id in indexed_now:
+            indexed_turn_ids.add(turn_id)
+        trace_id = str(uuid4())
+        await self.store.append_worker_trace(
+            trace_id=trace_id,
+            scope_key=scope_key,
+            participant_key=participant_key,
+            beat_type="semantic_indexing",
+            round=1,
+            provider="runtime-provider",
+            model="runtime-embedding-model",
+            system_prompt="Backend GRILLO semantic indexing embeds completed turn pairs into Ladybug semantic memory.",
+            prompt="\n\n".join(_format_extraction_pair_for_trace(user, assistant) for user, assistant in pairs),
+            response_text=f"indexed={len(indexed_now)} attempted={attempted} failed={failed}",
+        )
+        await self._update_worker_state(
+            scope_key,
+            {
+                "lastSemanticIndexingAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "lastSemanticIndexingFailed": failed,
+                "lastSemanticIndexingWrites": writes,
+                "semanticIndexedTurnIds": list(indexed_turn_ids)[-2000:],
+            },
+        )
+        return {
+            "ok": True,
+            "mode": "semantic_indexing",
+            "no_op_reason": None if writes > 0 else ("semantic_embedding_failed" if failed else "semantic_already_indexed"),
+            "writes": writes,
+            "tool_calls": attempted,
+            "trace_id": trace_id,
         }
 
     async def _run_worker_beat_tick(
@@ -1091,31 +1475,21 @@ class GrilloRuntime:
             {"role": "user", "content": user_prompt},
         ]
         source_turn_ids = [turn.turn_id for turn in turns if turn.turn_id]
-        max_rounds = 6
-        max_tool_rounds = 15
+        max_rounds = 4
         writes = 0
         tool_calls = 0
-        counts = {
-            "candidates": 0,
-            "diary": 0,
-            "slots": 0,
-            "profile_patches": 0,
-            "emotion_updates": 0,
-            "archival": 0,
-        }
+        counts = _empty_worker_counts()
         last_trace_id = ""
         last_provider = "runtime-provider"
         last_model = "runtime-model"
         last_notes = ""
-        final_relationship_reflection: dict[str, Any] | None = None
-        final_relationship_seen = False
 
         for round_index in range(1, max_rounds + 1):
             raw_result = await self.worker_completion(
                 {
                     "disableState": True,
                     "maxTokens": 900,
-                    "maxToolRounds": max_tool_rounds,
+                    "maxToolRounds": 15,
                     "messages": messages,
                     "responseFormat": {"type": "json_object"},
                     "stateKey": f"memory:{scope_key}",
@@ -1143,75 +1517,17 @@ class GrilloRuntime:
 
             parsed = _parse_worker_json(raw_text)
             last_notes = _compact(str(parsed.get("notes") or ""), 500)
-            if _worker_relationship_present(parsed):
-                final_relationship_seen = True
-            relationship_reflection = _worker_relationship_reflection(parsed)
-            if relationship_reflection:
-                final_relationship_reflection = relationship_reflection
             calls = _normalize_worker_tool_calls(parsed, source_turn_ids)
             if not calls:
-                if writes > 0:
-                    if not final_relationship_seen and round_index < max_rounds:
-                        messages.append({"role": "assistant", "content": raw_text})
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Finalization missing. A write tool has succeeded, but the final WebWaifu "
-                                    "relationship field is absent. Return only JSON now: "
-                                    '{"done":true,"toolCalls":[],"relationship":{...},"notes":"short status"} '
-                                    "when relationship/mood changed, or relationship:null when it did not."
-                                ),
-                            }
-                        )
-                        continue
+                if parsed.get("done") is True:
                     break
-                messages.append({"role": "assistant", "content": raw_text})
-                if round_index < max_rounds:
-                    await self.store.append_activity(
-                        beat_type=beat_type,
-                        scope_key=scope_key,
-                        participant_key=participant_key,
-                        summary="GRILLO worker returned no write tool calls; forcing an AI write repair round.",
-                        metadata={
-                            "mode": "worker_loop",
-                            "notes": last_notes,
-                            "trace_id": last_trace_id,
-                            "writes": writes,
-                            "done": bool(parsed.get("done")),
-                        },
-                    )
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Not complete. No write tool has succeeded in this beat. "
-                                "Call core.worker_diary_write now with a grounded private first-person reflection "
-                                "using the recent turn ids. If a durable relationship slot, profile patch, or emotion "
-                                "update is grounded, call those write tools too. Do not return done=true until at least "
-                                "one write tool succeeds."
-                            ),
-                        }
-                    )
-                    continue
-                await self.store.append_activity(
-                    beat_type=beat_type,
-                    scope_key=scope_key,
-                    participant_key=participant_key,
-                    summary="GRILLO worker failed to write after repair rounds.",
-                    metadata={
-                        "mode": "worker_loop",
-                        "notes": last_notes,
-                        "trace_id": last_trace_id,
-                        "writes": writes,
-                    },
-                )
                 return {
-                    "ok": False,
+                    "ok": True,
                     "mode": "worker_loop",
-                    "no_op_reason": "worker_no_writes",
+                    "no_op_reason": "worker_no_tool_calls" if writes == 0 else None,
                     "writes": writes,
                     "tool_calls": tool_calls,
+                    "trace_id": last_trace_id,
                     **counts,
                 }
 
@@ -1248,48 +1564,10 @@ class GrilloRuntime:
                     "role": "user",
                     "content": (
                         "Continue this GRILLO beat. Use more worker tools if needed. "
-                        "Only return JSON with done=true and toolCalls=[] after at least one write tool has succeeded."
+                        "If complete, return JSON with done=true and toolCalls=[]."
                     ),
                 }
             )
-
-        if writes == 0:
-            await self.store.append_activity(
-                beat_type=beat_type,
-                scope_key=scope_key,
-                participant_key=participant_key,
-                summary="GRILLO worker exhausted rounds without any write tools succeeding.",
-                metadata={
-                    "mode": "worker_loop",
-                    "notes": last_notes,
-                    "provider": last_provider,
-                    "model": last_model,
-                    "trace_id": last_trace_id,
-                    "writes": writes,
-                    "tool_calls": tool_calls,
-                    **counts,
-                },
-            )
-            return {
-                "ok": False,
-                "mode": "worker_loop",
-                "no_op_reason": "worker_no_writes",
-                "writes": writes,
-                "tool_calls": tool_calls,
-                "trace_id": last_trace_id,
-                **counts,
-            }
-
-        if final_relationship_reflection:
-            profile = await self._apply_relationship_updates(
-                scope_key=scope_key,
-                participant_key=participant_key,
-                reflection=final_relationship_reflection,
-                turns=turns,
-                diary=None,
-            )
-            if profile is not None:
-                counts["profile_patches"] += 1
 
         await self.store.append_activity(
             beat_type=beat_type,
@@ -1310,6 +1588,7 @@ class GrilloRuntime:
         return {
             "ok": True,
             "mode": "worker_loop",
+            "no_op_reason": "worker_no_writes" if writes == 0 else None,
             "writes": writes,
             "tool_calls": tool_calls,
             "trace_id": last_trace_id,
@@ -2270,6 +2549,74 @@ def _compact(text: str, limit: int = 320) -> str:
     return value if len(value) <= limit else value[: limit - 1].rstrip() + "..."
 
 
+def _empty_worker_counts() -> dict[str, int]:
+    return {
+        "candidates": 0,
+        "diary": 0,
+        "slots": 0,
+        "profile_patches": 0,
+        "emotion_updates": 0,
+        "archival": 0,
+    }
+
+
+def _normalize_worker_beat_type(value: Any) -> str:
+    normalized = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    if normalized in {
+        "extraction",
+        "reflection",
+        "relationship",
+        "consolidation",
+        "compaction",
+        "curiosity",
+        "tag_elaboration",
+        "semantic_indexing",
+    }:
+        return normalized
+    return "extraction"
+
+
+def _default_participant_key(scope_key: str) -> str:
+    parts = scope_key.split(":")
+    source = parts[0] if parts else "local"
+    channel = parts[1] if len(parts) > 1 else "local"
+    return f"{source}:{channel}:local"
+
+
+def _build_unprocessed_turn_pairs(
+    turns: list[GrilloTurn],
+    processed_turn_ids: set[str],
+) -> list[tuple[GrilloTurn, GrilloTurn]]:
+    pairs: list[tuple[GrilloTurn, GrilloTurn]] = []
+    for index, user_turn in enumerate(turns):
+        if user_turn.role != "user" or not user_turn.turn_id or user_turn.turn_id in processed_turn_ids:
+            continue
+        assistant_turn = next(
+            (
+                candidate
+                for candidate in turns[index + 1 :]
+                if candidate.role == "assistant"
+                and candidate.turn_id
+                and candidate.turn_id not in processed_turn_ids
+            ),
+            None,
+        )
+        if assistant_turn is not None:
+            pairs.append((user_turn, assistant_turn))
+    return pairs
+
+
+def _format_extraction_pair_for_trace(user_turn: GrilloTurn, assistant_turn: GrilloTurn) -> str:
+    author = user_turn.author_name or "User"
+    assistant = assistant_turn.author_name or "Assistant"
+    return "\n".join(
+        [
+            f"{author}: {_compact(user_turn.content, 600)}",
+            f"{assistant}: {_compact(assistant_turn.content, 600)}",
+        ]
+    )
+
+
 def _format_turn(turn: GrilloTurn) -> str:
     author = turn.author_name or turn.role
     channel = f", channel={turn.channel_id}" if turn.channel_id else ""
@@ -2299,14 +2646,11 @@ def _build_backend_worker_system_prompt() -> str:
         [
             "You are the private backend GRILLO memory worker for Web Waifu 4.",
             "You are not writing a user-facing chat reply.",
-            "Run a tool loop over Grillo memory. Return only JSON each round.",
             "Return only JSON matching the schema.",
             "Use worker tools by returning toolCalls. Do not claim a write happened unless you call a write tool.",
             "Extract durable memory only when the transcript contains a preference, fact, goal, boundary, bond signal, or ongoing thread.",
             "Write diary entries only when the exchange meaningfully changes mood, relationship, goals, or stream context.",
             "Diary personal_thought is private first-person avatar reflection, not a mechanical receipt.",
-            "A good diary personal_thought says how the speaker or chat made the avatar feel, what changed, and what to remember next time.",
-            'Do not write mechanical diary text like "Processed N turns" or "I noticed X and answered as Y".',
             "Reflection beats synthesize higher-order insight from clusters of turns and memories; they do not restate isolated facts.",
             "A useful reflection explains what pattern is emerging, what changed emotionally or relationally, and how future replies should adapt.",
             "Use memory_write only for grounded consolidated slots such as open_threads, ongoing_threads, preferences, boundaries, verified_facts, or relationship_state.",
@@ -2323,11 +2667,36 @@ def _build_backend_worker_system_prompt() -> str:
             '- core.worker_emotion_update args: {"intensities": {"emotion_name": number}, "operation"?: "merge|replace", "last_signal_source"?: string}',
             '- core.worker_memory_insert_archival args: {"text": string}',
             "",
-            "First read or search memory if needed. Then call write tools.",
-            "Do not return done=true until at least one write tool has succeeded in this beat.",
-            "If there is no durable slot/profile update, write a core.worker_diary_write reflection about why the beat did or did not change the relationship state.",
-            'When done, return {"done":true,"toolCalls":[],"relationship":{...},"notes":"short status"}.',
-            "relationship must use the WebWaifu legacy merge shape when useful: actionTag,mood,trustDelta,attractionDelta,respectDelta,irritationDelta,jealousyDelta,guardDelta,facts,summary,rikoDiaryEntry.",
+            "First read or search memory if needed. Then call write tools. When finished, return done=true and toolCalls=[].",
+        ]
+    )
+
+
+def _build_backend_extraction_prompt(
+    *,
+    scope_key: str,
+    pairs: list[tuple[GrilloTurn, GrilloTurn]],
+) -> str:
+    transcript = "\n\n".join(
+        "\n".join(
+            [
+                f"Pair {index + 1}",
+                f"source_turn_ids: {json.dumps([turn.turn_id for turn in (user_turn, assistant_turn) if turn.turn_id])}",
+                f"participant_key: {user_turn.participant_key or _default_participant_key(scope_key)}",
+                _format_extraction_pair_for_trace(user_turn, assistant_turn),
+            ]
+        )
+        for index, (user_turn, assistant_turn) in enumerate(pairs)
+    )
+    return "\n".join(
+        [
+            f"scopeKey: {scope_key}",
+            f"currentTimeMs: {int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            "",
+            "Completed turn pairs to process:",
+            transcript,
+            "",
+            "Write only memories grounded in these turns. If nothing durable is present, return done=true with no tool calls.",
         ]
     )
 
@@ -2426,8 +2795,6 @@ def _build_backend_beat_prompt(
                 [
                     {
                         "id": turn.turn_id,
-                        "channelId": turn.channel_id,
-                        "interfacePath": turn.interface_path,
                         "participantKey": turn.participant_key,
                         "role": turn.role,
                         "text": _compact(turn.content, 220),
@@ -2436,12 +2803,43 @@ def _build_backend_beat_prompt(
                 ],
                 ensure_ascii=False,
             ),
-            "",
-            "This beat must be written by the AI worker. Do not finish with zero writes.",
-            "At minimum, call core.worker_diary_write with a grounded private first-person reflection.",
-            "Only after a write tool succeeds may you return done=true with no toolCalls.",
         ]
     )
+
+
+def _build_backend_worker_debrief_prompt(
+    *,
+    pairs: list[tuple[GrilloTurn, GrilloTurn]],
+    writes: int,
+    candidate_writes: int,
+    diary_writes: int,
+) -> str:
+    examples = "\n\n".join(_format_extraction_pair_for_trace(user_turn, assistant_turn) for user_turn, assistant_turn in pairs[:3])
+    return "\n".join(
+        [
+            "The previous extraction round ended without the expected grounded memory writes.",
+            f"writes={writes} candidateWrites={candidate_writes} diaryWrites={diary_writes}",
+            "",
+            "Review the completed turn pairs again:",
+            examples,
+            "",
+            "If there is any durable preference, fact, goal, boundary, bond signal, or ongoing thread, call core.worker_candidate_write.",
+            "If the exchange changes mood, relationship, goals, or stream context, call core.worker_diary_write with private first-person reflection.",
+            "If truly nothing durable exists, return done=true with no tool calls and explain briefly in notes.",
+        ]
+    )
+
+
+def _should_run_worker_debrief_recovery(
+    *,
+    pairs: list[tuple[GrilloTurn, GrilloTurn]],
+    writes: int,
+    candidate_writes: int,
+    diary_writes: int,
+) -> bool:
+    if not pairs:
+        return False
+    return writes == 0 or candidate_writes == 0 or diary_writes == 0
 
 
 def _worker_completion_text_and_meta(raw_result: dict[str, Any] | str) -> tuple[str, dict[str, Any]]:
@@ -2825,7 +3223,7 @@ def _candidate_from_reflection(
         return None
     candidate_type = str(raw.get("type") or "").strip()
     if candidate_type not in CANDIDATE_TYPES:
-        return None
+        candidate_type = "thread"
     content = _compact(str(raw.get("content") or raw.get("summary") or "").strip(), 500)
     summary = _compact(str(raw.get("summary") or content).strip(), 220)
     if not content or not summary:

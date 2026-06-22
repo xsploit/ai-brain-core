@@ -229,6 +229,7 @@ async def test_grillo_runtime_ingests_diary_slots_and_context_packet(tmp_path):
         assistant_name="Neuro-sama",
         source="discord",
     )
+    await runtime.run_tick(scope_key="discord:1:2", participant_key="user-1", beat_type="extraction")
 
     status = await runtime.status()
     packet = await runtime.build_context_packet(
@@ -338,6 +339,7 @@ async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path)
         assistant_text="Noted.",
         source="discord",
     )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="relationship")
 
     slots = await runtime.store.list_slots("discord:guild:alpha", "user-alpha")
     profile = await runtime.store.get_relationship_profile("discord:guild:alpha")
@@ -374,7 +376,8 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
         if len(seen_requests) == 1:
             system = request["messages"][0]["content"]
             prompt = request["messages"][1]["content"]
-            assert "relationship must use the WebWaifu legacy merge shape" in system
+            assert "First read or search memory if needed. Then call write tools." in system
+            assert "relationship must use the WebWaifu legacy merge shape" not in system
             assert "Canonical GRILLO context packet" in prompt
             assert "stage=familiar mood=guarded" in prompt
             assert "I already feel guarded but invested around LO." in prompt
@@ -498,6 +501,7 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
         assistant_text="I will port the worker loop.",
         source="discord",
     )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="relationship")
 
     assert len(seen_requests) == 2
     slots = await store.list_slots("discord:guild:alpha", "user-alpha")
@@ -513,20 +517,18 @@ async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(
         for item in slot.items
     )
     assert profile is not None
-    assert profile.relationship_stage == "rapport_building"
-    assert profile.mood == "warm"
-    assert profile.trust == 7
-    assert "warmer trust" in profile.summary
-    assert "GRILLO parity" in profile.facts[-1]
+    assert profile.relationship_stage == "familiar"
+    assert profile.mood == "guarded"
+    assert profile.trust == 5
+    assert "literal GRILLO parity" in profile.summary
     assert any("literal architecture requirements" in item for item in profile.interaction_style)
-    assert profile.diary_entry.startswith("I feel more trusted")
     assert emotion["intensities"]["focused"] == 0.82
     assert archival and "worker loop" in archival[0]["text"]
     assert any("serious relationship signal" in entry.personal_thought for entry in diary)
 
 
 @pytest.mark.asyncio
-async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
+async def test_grillo_worker_extraction_debrief_can_request_ai_diary_write(tmp_path):
     requests = []
 
     async def worker_completion(request):
@@ -534,7 +536,7 @@ async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
         if len(requests) == 1:
             return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
         if len(requests) == 2:
-            assert "No write tool has succeeded" in request["messages"][-1]["content"]
+            assert "previous extraction round ended" in request["messages"][-1]["content"]
             return {
                 "text": json.dumps(
                     {
@@ -574,6 +576,11 @@ async def test_grillo_worker_noop_is_repaired_by_ai_diary_write(tmp_path):
         assistant_text="Got it, I should remember that across channels.",
         source="discord",
         channel_id="222",
+    )
+    await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="extraction",
     )
 
     diary = await store.list_diary(
@@ -636,6 +643,11 @@ async def test_grillo_worker_relationship_state_slot_syncs_profile(tmp_path):
         assistant_text="I will keep the relationship state synced.",
         source="discord",
     )
+    await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="relationship",
+    )
 
     profile = await store.get_relationship_profile("discord:guild:alpha:user:user-alpha:persona:neuro")
     assert profile is not None
@@ -671,7 +683,7 @@ async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
     result = await runtime.run_tick(
         scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
         participant_key="user-alpha",
-        beat_type="manual_panel",
+        beat_type="relationship",
     )
     diary = await store.list_diary(
         "discord:guild:alpha:user:user-alpha:persona:neuro",
@@ -679,7 +691,7 @@ async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
         limit=4,
     )
 
-    assert result["ok"] is False
+    assert result["ok"] is True
     assert result["no_op_reason"] == "worker_no_writes"
     assert diary == []
 
@@ -700,6 +712,7 @@ async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_partic
         assistant_text="Saved.",
         source="discord",
     )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="extraction")
     await runtime.ingest_turn_pair(
         scope_key="discord:guild:beta",
         participant_key="user-beta",
@@ -707,6 +720,7 @@ async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_partic
         assistant_text="Saved.",
         source="discord",
     )
+    await runtime.run_tick(scope_key="discord:guild:beta", participant_key="user-beta", beat_type="extraction")
 
     packet = await runtime.build_context_packet(
         scope_key="discord:guild:alpha",

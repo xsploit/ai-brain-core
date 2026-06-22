@@ -64,6 +64,7 @@ DEFAULT_RESPOND_TO_BOTS = False
 DEFAULT_REQUIRE_MENTION_IN_GUILDS = True
 DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
 DEFAULT_OWNER_USER_IDS = {120418341775998976}
+DEFAULT_GRILLO_CADENCE_BEATS = ("extraction", "relationship", "reflection")
 TEXT_ATTACHMENT_SUFFIXES = {
     ".bat",
     ".c",
@@ -139,7 +140,17 @@ def _env_int(name: str, default: int) -> int:
         return default
     with contextlib.suppress(ValueError):
         return int(value)
-        return default
+    return default
+
+
+def _grillo_cadence_beats() -> tuple[str, ...]:
+    raw = os.getenv("DISCORD_BRAIN_GRILLO_CADENCE_BEATS", "")
+    beats = tuple(
+        beat
+        for beat in (chunk.strip().lower().replace("-", "_") for chunk in raw.split(","))
+        if beat in {"extraction", "relationship", "reflection", "consolidation", "compaction", "semantic_indexing"}
+    )
+    return beats or DEFAULT_GRILLO_CADENCE_BEATS
 
 
 def _compact(text: str, limit: int) -> str:
@@ -913,6 +924,9 @@ class DiscordBrainBot(commands.Bot):
         self.send_tts_replies = _env_bool("DISCORD_BRAIN_TTS_REPLIES", DEFAULT_TTS_REPLIES)
         self.logger = logging.getLogger("aibrain.discord")
         self.codex_bridge = CodexBridgeQueue.from_env()
+        self.grillo_cadence_interval = max(1, _env_int("DISCORD_BRAIN_GRILLO_INTERVAL_MESSAGES", 7))
+        self.grillo_cadence_beats = _grillo_cadence_beats()
+        self.grillo_pending_turn_counts: dict[str, int] = {}
         self.heartbeat_enabled = _env_bool("DISCORD_BRAIN_HEARTBEAT_ENABLED", False)
         self.heartbeat_channel_ids = _csv_ints("DISCORD_BRAIN_HEARTBEAT_CHANNEL_IDS")
         self.heartbeat_conversation = os.getenv("DISCORD_BRAIN_HEARTBEAT_CONVERSATION", "last-active").strip().lower() or "last-active"
@@ -2647,22 +2661,41 @@ class DiscordBrainBot(commands.Bot):
         runtime = self.brain.memory_stack.grillo if self.brain.memory_stack else None
         if runtime is None or not assistant_text.strip():
             return
-        task = asyncio.create_task(
-            runtime.ingest_turn_pair(
-                scope_key=scope,
-                participant_key=str(message.author.id),
-                user_text=user_text,
-                assistant_text=assistant_text,
-                author_name=_display_name(message.author),
-                assistant_name=self.persona.name,
-                channel_id=str(message.channel.id),
-                interface_path=f"discord/{message.guild.id if message.guild else 'dm'}/{message.channel.id}",
-                source="discord",
-                metadata=_discord_message_metadata(message),
-                run_tick=True,
-            )
-        )
+        task = asyncio.create_task(self._ingest_grillo_turn_pair(message, scope, user_text, assistant_text))
         task.add_done_callback(self._log_grillo_task_result)
+
+    async def _ingest_grillo_turn_pair(
+        self,
+        message: discord.Message,
+        scope: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        runtime = self.brain.memory_stack.grillo if self.brain.memory_stack else None
+        if runtime is None:
+            return
+        participant_key = str(message.author.id)
+        await runtime.ingest_turn_pair(
+            scope_key=scope,
+            participant_key=participant_key,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            author_name=_display_name(message.author),
+            assistant_name=self.persona.name,
+            channel_id=str(message.channel.id),
+            interface_path=f"discord/{message.guild.id if message.guild else 'dm'}/{message.channel.id}",
+            source="discord",
+            metadata=_discord_message_metadata(message),
+            run_tick=False,
+        )
+        state_key = f"{scope}:{participant_key}"
+        pending = self.grillo_pending_turn_counts.get(state_key, 0) + 1
+        if pending < self.grillo_cadence_interval:
+            self.grillo_pending_turn_counts[state_key] = pending
+            return
+        self.grillo_pending_turn_counts[state_key] = 0
+        for beat_type in self.grillo_cadence_beats:
+            await runtime.run_tick(scope_key=scope, participant_key=participant_key, beat_type=beat_type)
 
     def _log_grillo_task_result(self, task: asyncio.Task[Any]) -> None:
         try:

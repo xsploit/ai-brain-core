@@ -189,6 +189,7 @@ class _FakeGrilloRuntime:
         self.error = error
         self.calls = []
         self.ingests = []
+        self.ticks = []
 
     async def build_context_packet(self, **kwargs):
         self.calls.append(kwargs)
@@ -198,6 +199,10 @@ class _FakeGrilloRuntime:
 
     async def ingest_turn_pair(self, **kwargs):
         self.ingests.append(kwargs)
+
+    async def run_tick(self, **kwargs):
+        self.ticks.append(kwargs)
+        return {"ok": True}
 
 
 class _FakeTTSBrain:
@@ -393,6 +398,9 @@ def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     bot.max_reply_chars = 1900
     bot.edit_interval_seconds = 0.25
     bot.send_tts_replies = False
+    bot.grillo_cadence_interval = 7
+    bot.grillo_cadence_beats = ("extraction", "relationship", "reflection")
+    bot.grillo_pending_turn_counts = {}
 
     asyncio.run(bot._reply_with_brain(message))
 
@@ -410,6 +418,40 @@ def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     assert metadata["guild_id"] == 222
     assert metadata["channel_id"] == 456
     assert grillo.ingests[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
+    assert grillo.ingests[0]["run_tick"] is False
+    assert grillo.ticks == []
+
+
+def test_discord_grillo_ingest_runs_webwaifu_cadence_after_interval():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime()
+    brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=grillo))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.grillo_cadence_interval = 2
+    bot.grillo_cadence_beats = ("extraction", "relationship", "reflection")
+    bot.grillo_pending_turn_counts = {}
+
+    async def run_ingests():
+        await bot._ingest_grillo_turn_pair(message, "discord:guild:222:user:123:persona:neuro-sama", "first", "reply")
+        await bot._ingest_grillo_turn_pair(message, "discord:guild:222:user:123:persona:neuro-sama", "second", "reply")
+
+    asyncio.run(run_ingests())
+
+    assert [ingest["run_tick"] for ingest in grillo.ingests] == [False, False]
+    assert [tick["beat_type"] for tick in grillo.ticks] == ["extraction", "relationship", "reflection"]
 
 
 def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
