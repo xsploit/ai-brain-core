@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 from types import SimpleNamespace
@@ -1003,6 +1004,32 @@ async def test_ladybug_adapter_smoke_when_installed(tmp_path):
         "LO expects GRILLO relationship memory."
     ]
     assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:lo"]
+
+
+@pytest.mark.asyncio
+async def test_ladybug_adapter_serializes_concurrent_async_calls(tmp_path):
+    if importlib.util.find_spec("ladybug") is None:
+        pytest.skip("ladybug extra not installed")
+
+    graph = LadybugGraphMemoryStore(tmp_path / "graph.ladybug")
+
+    async def write_fact(index: int) -> None:
+        await graph.upsert_fact(
+            TemporalFact(
+                id=f"fact-{index}",
+                subject=f"user-{index}",
+                predicate="uses",
+                object="LadybugDB",
+                valid_from="2026-06-22T00:00:00+00:00",
+            )
+        )
+
+    await asyncio.gather(*(write_fact(index) for index in range(12)))
+
+    hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=20))
+
+    assert {hit.id for hit in hits} >= {f"fact-{index}" for index in range(12)}
+    graph.close()
 
 
 @pytest.mark.asyncio

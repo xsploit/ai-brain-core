@@ -24,6 +24,7 @@ class LadybugGraphMemoryStore:
         self._lb = lb
         self.db = lb.Database(str(self.path))
         self.conn = lb.Connection(self.db)
+        self._lock = asyncio.Lock()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -113,8 +114,7 @@ class LadybugGraphMemoryStore:
             self.conn.execute(statement)
 
     async def upsert_fact(self, fact: TemporalFact) -> TemporalFact:
-        await asyncio.to_thread(
-            self.conn.execute,
+        await self._execute(
             """
             MERGE (f:Fact {id: $id})
             SET f.subject = $subject,
@@ -137,7 +137,7 @@ class LadybugGraphMemoryStore:
         return fact
 
     async def search_facts(self, query: GraphQuery) -> list[TemporalFact]:
-        return await asyncio.to_thread(self._search_facts_sync, query)
+        return await self._call_locked(self._search_facts_sync, query)
 
     def _search_facts_sync(self, query: GraphQuery) -> list[TemporalFact]:
         clauses = []
@@ -173,8 +173,7 @@ class LadybugGraphMemoryStore:
         valid_until: str,
         reason: str,
     ) -> None:
-        await asyncio.to_thread(
-            self.conn.execute,
+        await self._execute(
             """
             MATCH (f:Fact {id: $id})
             SET f.valid_until = $valid_until,
@@ -188,7 +187,7 @@ class LadybugGraphMemoryStore:
         )
 
     async def upsert_relationship_profile(self, profile: Any) -> None:
-        await asyncio.to_thread(self._upsert_relationship_profile_sync, profile)
+        await self._call_locked(self._upsert_relationship_profile_sync, profile)
 
     def _upsert_relationship_profile_sync(self, profile: Any) -> None:
         params = _relationship_profile_params(profile)
@@ -305,7 +304,7 @@ class LadybugGraphMemoryStore:
             )
 
     async def get_relationship_profile_graph(self, scope_key: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._get_relationship_profile_graph_sync, scope_key)
+        return await self._call_locked(self._get_relationship_profile_graph_sync, scope_key)
 
     def _get_relationship_profile_graph_sync(self, scope_key: str) -> dict[str, Any] | None:
         result = self.conn.execute(
@@ -325,7 +324,7 @@ class LadybugGraphMemoryStore:
         return None
 
     async def export_relationship_graph(self, scope_key: str, *, limit: int = 50) -> dict[str, Any]:
-        return await asyncio.to_thread(self._export_relationship_graph_sync, scope_key, limit)
+        return await self._call_locked(self._export_relationship_graph_sync, scope_key, limit)
 
     def _export_relationship_graph_sync(self, scope_key: str, limit: int) -> dict[str, Any]:
         bounded_limit = max(1, min(int(limit), 200))
@@ -373,6 +372,14 @@ class LadybugGraphMemoryStore:
         close = getattr(self.conn, "close", None)
         if close:
             close()
+
+    async def _execute(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+        async with self._lock:
+            return await asyncio.to_thread(self.conn.execute, cypher, params)
+
+    async def _call_locked(self, func: Any, *args: Any) -> Any:
+        async with self._lock:
+            return await asyncio.to_thread(func, *args)
 
 
 def _fact_params(fact: TemporalFact) -> dict[str, Any]:
