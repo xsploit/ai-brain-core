@@ -1445,6 +1445,7 @@ class DiscordBrainBot(commands.Bot):
                 thread_id_override=f"discord:jb:{ctx.message.id}",
                 use_memory=False,
                 tool_names=[],
+                include_discord_context=False,
                 include_grillo_context=False,
                 record_grillo=False,
                 stateless=True,
@@ -2234,6 +2235,7 @@ class DiscordBrainBot(commands.Bot):
         thread_id_override: str | None = None,
         use_memory: bool | MemoryPolicy | dict[str, Any] | None = None,
         tool_names: list[str] | None = None,
+        include_discord_context: bool = True,
         include_grillo_context: bool = True,
         record_grillo: bool = True,
         stateless: bool = False,
@@ -2254,15 +2256,25 @@ class DiscordBrainBot(commands.Bot):
             if attachment_text:
                 prompt_text = f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
             persona = persona_override or self.persona
-            prompt = await self._build_prompt_for_message(
-                message,
-                grillo_scope,
-                prompt_text,
-                one_shot_pre_prompt=one_shot_pre_prompt,
-                include_grillo_context=include_grillo_context,
-                memory_query_text=memory_text.strip() or prompt_text.strip() or "discord message",
-                persona_name=persona.name,
-            )
+            if include_discord_context:
+                prompt = await self._build_prompt_for_message(
+                    message,
+                    grillo_scope,
+                    prompt_text,
+                    one_shot_pre_prompt=one_shot_pre_prompt,
+                    include_grillo_context=include_grillo_context,
+                    memory_query_text=memory_text.strip() or prompt_text.strip() or "discord message",
+                    persona_name=persona.name,
+                )
+            else:
+                prompt = prompt_text
+                if one_shot_pre_prompt:
+                    prompt = (
+                        "One-shot pre-prompt for this response only. Do not carry it into future turns unless requested again.\n\n"
+                        f"{one_shot_pre_prompt.strip()}\n\n"
+                        "End one-shot pre-prompt. Now answer the user's message:\n\n"
+                        f"{prompt}"
+                    )
             images = _image_inputs(message)
             token = DISCORD_CONTEXT.set(self._context_for_message(message))
             tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))

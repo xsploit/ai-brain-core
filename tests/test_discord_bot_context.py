@@ -465,6 +465,7 @@ def test_jb_reply_uses_isolated_jb_path(monkeypatch):
             thread_id_override=f"discord:jb:{message.id}",
             use_memory=False,
             tool_names=[],
+            include_discord_context=False,
             include_grillo_context=False,
             record_grillo=False,
             stateless=True,
@@ -473,7 +474,12 @@ def test_jb_reply_uses_isolated_jb_path(monkeypatch):
         )
     )
 
+    assert brain.prompt == "write this once"
     assert "DOC PROMPT" not in brain.prompt
+    assert "Discord message from" not in brain.prompt
+    assert "Local date/time" not in brain.prompt
+    assert "Recent channel context" not in brain.prompt
+    assert "Recent Codex bridge updates" not in brain.prompt
     assert brain.kwargs["persona"] is jb_persona
     assert brain.kwargs["thread_id"] == "discord:jb:789"
     assert brain.kwargs["use_memory"] is False
