@@ -2336,6 +2336,8 @@ class DiscordBrainBot(commands.Bot):
             )
         )
         recent_section = f"{recent_block}\n\n" if recent_block else ""
+        codex_block = "\n".join(self._codex_bridge_updates_for_message(message))
+        codex_section = f"{codex_block}\n\n" if codex_block else ""
         prompt = (
             f"Discord message from {_display_name(message.author)} in "
             f"{discord_context['guild'] or 'DM'}#{discord_context['channel']}:\n"
@@ -2344,6 +2346,7 @@ class DiscordBrainBot(commands.Bot):
             "Discord metadata for this speaker and channel:\n"
             f"{metadata_block}\n\n"
             f"{recent_section}"
+            f"{codex_section}"
             f"{user_text}"
         )
         if one_shot_pre_prompt:
@@ -2390,6 +2393,35 @@ class DiscordBrainBot(commands.Bot):
             return prompt
         grillo_prompt = packet.as_prompt_text()
         return f"{grillo_prompt}\n\n{prompt}" if grillo_prompt else prompt
+
+    def _codex_bridge_updates_for_message(self, message: discord.Message) -> list[str]:
+        bridge = getattr(self, "codex_bridge", None)
+        if bridge is None or not _env_bool("DISCORD_BRAIN_CODEX_CONTEXT_ENABLED", True):
+            return []
+        try:
+            results = bridge.result_files()
+        except Exception:
+            return []
+        author_id = str(getattr(getattr(message, "author", None), "id", ""))
+        channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+        guild = getattr(message, "guild", None)
+        guild_id = str(getattr(guild, "id", "")) if guild is not None else None
+        max_results = _env_int("DISCORD_BRAIN_CODEX_CONTEXT_MAX_RESULTS", 3)
+        matched: list[dict[str, Any]] = []
+        for path in reversed(results[-25:]):
+            payload = _read_codex_bridge_result(path)
+            if not payload or not _codex_bridge_result_matches(payload, author_id=author_id, channel_id=channel_id, guild_id=guild_id):
+                continue
+            matched.append(payload)
+            if len(matched) >= max(1, max_results):
+                break
+        if not matched:
+            return []
+        lines = ["Recent Codex bridge updates relevant to this Discord context:"]
+        for payload in reversed(matched):
+            lines.append(_format_codex_bridge_update(payload))
+        lines.append("Use these updates naturally if the user asks what Codex did or what changed.")
+        return lines
 
     def _schedule_grillo_ingest(
         self,
@@ -2478,6 +2510,52 @@ def _recent_messages_prompt_lines(
     if not lines:
         return []
     return ["Recent channel context before this message:", *lines]
+
+
+def _read_codex_bridge_result(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _codex_bridge_result_matches(
+    payload: dict[str, Any],
+    *,
+    author_id: str,
+    channel_id: str,
+    guild_id: str | None,
+) -> bool:
+    origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+    requester_id = str(origin.get("requester_id") or payload.get("requester_id") or "")
+    result_channel_id = str(origin.get("channel_id") or payload.get("channel_id") or "")
+    result_guild_id = str(origin.get("guild_id") or payload.get("guild_id") or "")
+    if author_id and requester_id == author_id:
+        return True
+    if channel_id and result_channel_id == channel_id:
+        if guild_id is None or not result_guild_id or result_guild_id == guild_id:
+            return True
+    return False
+
+
+def _format_codex_bridge_update(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "unknown")
+    processed_at = str(payload.get("processed_at") or payload.get("completed_at") or payload.get("updated_at") or "unknown time")
+    summary = str(payload.get("summary") or payload.get("final_response") or payload.get("message") or "").strip()
+    if not summary:
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        summary = str(details.get("summary") or details.get("message") or "").strip()
+    commit_id = str(payload.get("commit_id") or "").strip()
+    next_step = str(payload.get("next_step") or "").strip()
+    parts = [f"- [{processed_at}] Codex `{status}`"]
+    if commit_id:
+        parts.append(f"commit `{commit_id}`")
+    if summary:
+        parts.append(_compact(summary, _env_int("DISCORD_BRAIN_CODEX_CONTEXT_SUMMARY_CHARS", 700)))
+    if next_step:
+        parts.append(f"next: {_compact(next_step, 240)}")
+    return " -- ".join(parts)
 
 
 def _split_discord_text(text: str, limit: int) -> list[str]:

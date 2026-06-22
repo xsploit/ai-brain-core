@@ -257,6 +257,7 @@ class CodexBridgeAppServerWorker:
             "processed_at": utc_now_iso(),
             "processor": "neuro-codex-app-bridge",
             "summary": summary,
+            "origin": _request_origin(request),
             "details": details,
         }
         path = self.bridge.outbox / f"{request_file.stem}.result.json"
@@ -348,8 +349,10 @@ async def _run_in_thread(func: Callable[[], ProcessedBridgeRequest]) -> Processe
 
 def build_codex_turn_prompt(request: dict[str, Any], *, request_file: Path, cwd: Path) -> str:
     prompt = str(request.get("prompt") or "").strip()
+    final_outbox_path = request_file.parent.parent / "outbox" / f"{request_file.stem}.final.json"
     summary = {
         "request_file": str(request_file),
+        "final_outbox_file": str(final_outbox_path),
         "cwd": str(cwd),
         "request_id": request.get("id") or request.get("request_id"),
         "requester_id": request.get("requester_id"),
@@ -373,6 +376,11 @@ def build_codex_turn_prompt(request: dict[str, Any], *, request_file: Path, cwd:
         "- Use Harness only if the request explicitly asks for a harness/subagent route and is authorized; default Harness permission profile is inspect.\n"
         "- Never use Harness edit/full-auto for autonomous Neuro requests.\n"
         "- If you make code or doc changes, run focused verification and commit only a clean scoped change.\n\n"
+        "Return path for Neuro:\n"
+        f"- Before your final answer, write a concise JSON result to this file: {final_outbox_path}\n"
+        "- Use schema `neuro_codex_bridge.final_result.v1`.\n"
+        "- Include `request_id`, `status`, `summary`, `changes`, `verification`, `commit_id`, `next_step`, and the original Discord `origin` metadata.\n"
+        "- Keep `summary` short enough for Neuro to read in her next Discord context.\n\n"
         f"Request metadata:\n{json.dumps(summary, indent=2, sort_keys=True)}\n\n"
         f"Requested work:\n{prompt}\n"
     )
@@ -403,6 +411,20 @@ def _validate_request(request: dict[str, Any]) -> str | None:
     if isinstance(delivery, dict) and delivery.get("mode") == "harness_brain":
         return "Harness delivery is not handled by the app-server bridge worker."
     return None
+
+
+def _request_origin(request: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": request.get("source"),
+        "requester_id": request.get("requester_id"),
+        "requester_name": request.get("requester_name"),
+        "guild_id": request.get("guild_id"),
+        "channel_id": request.get("channel_id"),
+        "message_id": request.get("message_id"),
+        "intent": request.get("intent"),
+        "delivery": request.get("delivery"),
+        "authority": request.get("authority"),
+    }
 
 
 def _summarize_turn_result(result: dict[str, Any]) -> dict[str, Any]:

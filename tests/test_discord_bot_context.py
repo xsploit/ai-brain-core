@@ -405,6 +405,42 @@ def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
     assert "Neuro-sama" not in jb_persona.name
 
 
+def test_codex_bridge_result_is_injected_into_next_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    queue = CodexBridgeQueue(tmp_path / "bridge", enabled=True)
+    queue.outbox.mkdir(parents=True, exist_ok=True)
+    (queue.outbox / "request.final.json").write_text(
+        """{
+  "schema": "neuro_codex_bridge.final_result.v1",
+  "request_id": "req-1",
+  "status": "complete",
+  "processed_at": "2026-06-22T00:00:00+00:00",
+  "summary": "Codex added the bridge context injection.",
+  "commit_id": "abc1234",
+  "next_step": "Restart Neuro.",
+  "origin": {
+    "requester_id": "123",
+    "channel_id": "456"
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.codex_bridge = queue
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "what changed?"))
+
+    assert "Recent Codex bridge updates relevant to this Discord context:" in prompt
+    assert "Codex added the bridge context injection." in prompt
+    assert "commit `abc1234`" in prompt
+    assert "Restart Neuro." in prompt
+
+
 def test_jb_reply_uses_isolated_jb_path(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
