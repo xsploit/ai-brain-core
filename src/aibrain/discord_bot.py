@@ -2313,7 +2313,7 @@ class DiscordBrainBot(commands.Bot):
                 persona=self.persona,
                 use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_HEARTBEAT_MEMORY_TOP_K", 3)),
                 tool_names=tool_names,
-                max_agent_steps=_env_int("DISCORD_BRAIN_HEARTBEAT_MAX_AGENT_STEPS", 8),
+                max_agent_steps=_env_int("DISCORD_BRAIN_HEARTBEAT_MAX_AGENT_STEPS", 40),
                 stateless=True,
                 memory_query_text="heartbeat autonomy",
                 memory_event_text="",
@@ -4000,6 +4000,7 @@ def build_brain() -> Brain:
         default_model=os.getenv("DISCORD_BRAIN_MODEL", os.getenv("AI_BRAIN_MODEL", "deepseek/deepseek-v4-flash")),
         state_mode="local",
         local_history_limit=_env_int("DISCORD_BRAIN_LOCAL_HISTORY_LIMIT", 32),
+        max_agent_steps=_env_int("DISCORD_BRAIN_MAX_AGENT_STEPS", _env_int("AIBRAIN_MAX_AGENT_STEPS", 40)),
         memory_top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8),
         memory_policy=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8), save_response_summary=True),
         memory_stack=MemoryStackConfig(

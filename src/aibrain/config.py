@@ -111,7 +111,7 @@ class BrainConfig(BaseModel):
         default_factory=lambda: os.environ.get("AIBRAIN_EMBEDDING_MODEL", "openai/text-embedding-3-small")
     )
     embedding_dimensions: int = 256
-    max_agent_steps: int = 8
+    max_agent_steps: int = Field(default_factory=lambda: _env_int("AIBRAIN_MAX_AGENT_STEPS", 40))
     tool_timeout_seconds: float = 30.0
     stt_config: STTConfig = Field(default_factory=STTConfig)
     tts_config: TTSConfig = Field(default_factory=TTSConfig)

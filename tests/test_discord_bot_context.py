@@ -1445,7 +1445,7 @@ def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
     assert "discord_read_channel_history" in bot.brain.kwargs["tool_names"]
     assert "discord_send_channel_message" not in bot.brain.kwargs["tool_names"]
     assert "discord_queue_codex_request" not in bot.brain.kwargs["tool_names"]
-    assert bot.brain.kwargs["max_agent_steps"] == 8
+    assert bot.brain.kwargs["max_agent_steps"] == 40
 
 
 def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
