@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -39,6 +40,8 @@ DEFAULT_SLOT_BUDGETS = {
     "thoughts": 180,
     "output_description": 80,
 }
+DEFAULT_GRILLO_TICK_TURN_SCAN_LIMIT = 250
+DEFAULT_GRILLO_CONTEXT_TURN_SCAN_LIMIT = 250
 
 GrilloReflector = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 GrilloWorkerCompletion = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | str]]
@@ -1010,7 +1013,11 @@ class GrilloRuntime:
             return {"ok": False, "skipped": "tick_already_running"}
         async with self._tick_lock:
             beat_type = _normalize_worker_beat_type(beat_type)
-            turns = await self.store.list_turns(scope_key, participant_key, limit=20)
+            turns = await self.store.list_turns(
+                scope_key,
+                participant_key,
+                limit=_env_int("AIBRAIN_GRILLO_TICK_TURN_SCAN_LIMIT", DEFAULT_GRILLO_TICK_TURN_SCAN_LIMIT),
+            )
             if not turns:
                 await self.store.append_activity(
                     beat_type=beat_type,
@@ -1038,13 +1045,21 @@ class GrilloRuntime:
                             beat_type="grillo_worker_failed",
                             scope_key=scope_key,
                             participant_key=participant_key,
-                            summary=f"GRILLO worker extraction failed; using fallback extractor: {exc}",
+                            summary=f"GRILLO worker extraction failed; leaving turns unprocessed: {type(exc).__name__}",
                             metadata={
                                 "error": str(exc),
                                 "error_type": type(exc).__name__,
                                 "requested_beat_type": beat_type,
                             },
                         )
+                        return {
+                            "ok": False,
+                            "mode": "worker_loop",
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "writes": 0,
+                            "tool_calls": 0,
+                        }
                 return await self._run_fallback_extractor_tick(
                     scope_key=scope_key,
                     participant_key=participant_key,
@@ -2205,7 +2220,11 @@ class GrilloRuntime:
         persona_name: str = "assistant",
         top_k: int = 5,
     ) -> GrilloContextPacket:
-        turn_limit = 50 if channel_id else 10
+        turn_limit = (
+            _env_int("AIBRAIN_GRILLO_CONTEXT_TURN_SCAN_LIMIT", DEFAULT_GRILLO_CONTEXT_TURN_SCAN_LIMIT)
+            if channel_id
+            else 10
+        )
         turns, slots, diary, candidates, relationship_profile = await asyncio.gather(
             self.store.list_turns(scope_key, participant_key, limit=turn_limit),
             self.store.list_slots(scope_key, participant_key),
@@ -2839,7 +2858,7 @@ def _should_run_worker_debrief_recovery(
 ) -> bool:
     if not pairs:
         return False
-    return writes == 0 or candidate_writes == 0 or diary_writes == 0
+    return writes == 0 or candidate_writes == 0
 
 
 def _worker_completion_text_and_meta(raw_result: dict[str, Any] | str) -> tuple[str, dict[str, Any]]:
@@ -3365,6 +3384,13 @@ def _parse_scope_persona_id(scope_key: str) -> str:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 def _reduce_packet(packet: GrilloContextPacket) -> None:

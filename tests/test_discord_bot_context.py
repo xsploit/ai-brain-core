@@ -3,6 +3,7 @@ import base64
 from array import array
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 
 import aibrain.discord_bot as discord_bot_module
 from aibrain.discord_bot import (
@@ -201,9 +202,15 @@ class _FakeGrilloPacket:
 
 
 class _FakeGrilloRuntime:
-    def __init__(self, text: str = "<grillo_context />", error: Exception | None = None):
+    def __init__(
+        self,
+        text: str = "<grillo_context />",
+        error: Exception | None = None,
+        tick_results: list[dict[str, Any]] | None = None,
+    ):
         self.text = text
         self.error = error
+        self.tick_results = list(tick_results or [])
         self.calls = []
         self.ingests = []
         self.ticks = []
@@ -219,6 +226,8 @@ class _FakeGrilloRuntime:
 
     async def run_tick(self, **kwargs):
         self.ticks.append(kwargs)
+        if self.tick_results:
+            return self.tick_results.pop(0)
         return {"ok": True}
 
 
@@ -469,6 +478,47 @@ def test_discord_grillo_ingest_runs_webwaifu_cadence_after_interval():
 
     assert [ingest["run_tick"] for ingest in grillo.ingests] == [False, False]
     assert [tick["beat_type"] for tick in grillo.ticks] == ["extraction", "relationship", "reflection"]
+
+
+def test_discord_grillo_cadence_keeps_pending_after_failed_tick():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime(tick_results=[{"ok": False, "skipped": "tick_already_running"}])
+    brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=grillo))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.grillo_cadence_interval = 1
+    bot.grillo_cadence_beats = ("extraction",)
+    bot.grillo_pending_turn_counts = {}
+
+    asyncio.run(
+        bot._ingest_grillo_turn_pair(
+            message,
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "first",
+            "reply",
+        )
+    )
+
+    assert grillo.ticks == [
+        {
+            "scope_key": "discord:guild:222:user:123:persona:neuro-sama",
+            "participant_key": "123",
+            "beat_type": "extraction",
+        }
+    ]
+    assert bot.grillo_pending_turn_counts["discord:guild:222:user:123:persona:neuro-sama:123"] == 1
 
 
 def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):

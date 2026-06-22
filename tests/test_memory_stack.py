@@ -790,6 +790,117 @@ async def test_grillo_worker_persistent_noop_is_allowed_without_fallback(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_grillo_worker_exception_does_not_fallback_or_mark_processed(tmp_path):
+    async def worker_completion(request):
+        raise RuntimeError("worker exploded")
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="This should remain pending if the worker crashes.",
+        assistant_text="I should not pretend a fallback reflection happened.",
+        source="discord",
+        run_tick=False,
+    )
+
+    result = await runtime.run_tick(scope_key=scope, participant_key=participant, beat_type="extraction")
+    state = await store.get_worker_state(scope)
+    diary = await store.list_diary(scope, participant, limit=4)
+    candidates = await store.list_candidates(scope, participant, limit=4)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "RuntimeError"
+    assert state.get("processedTurnIds") in (None, [])
+    assert diary == []
+    assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_scans_past_latest_20_for_old_unprocessed_turns(tmp_path):
+    requests = []
+
+    async def worker_completion(request):
+        requests.append(request)
+        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    processed_ids = []
+    for index in range(25):
+        user_id = f"user-{index}"
+        assistant_id = f"assistant-{index}"
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=user_id,
+                scope_key=scope,
+                participant_key=participant,
+                role="user",
+                content=f"old durable signal {index}",
+                author_name="Subby",
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:00+00:00",
+            )
+        )
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=assistant_id,
+                scope_key=scope,
+                participant_key=participant,
+                role="assistant",
+                content=f"reply {index}",
+                author_name="Neuro-sama",
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:01+00:00",
+            )
+        )
+        if index != 0:
+            processed_ids.extend([user_id, assistant_id])
+    await store.set_worker_state(scope, {"processedTurnIds": processed_ids})
+
+    await runtime.run_tick(scope_key=scope, participant_key=participant, beat_type="extraction")
+
+    assert requests
+    assert any("old durable signal 0" in message["content"] for request in requests for message in request["messages"])
+
+
+@pytest.mark.asyncio
+async def test_grillo_channel_context_scans_beyond_latest_50_turns(tmp_path):
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    for index in range(60):
+        channel_id = "target" if index < 2 else "other"
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=f"turn-{index}",
+                scope_key=scope,
+                participant_key=participant,
+                role="user",
+                content=f"target channel memory {index}" if channel_id == "target" else f"other channel {index}",
+                author_name="Subby",
+                channel_id=channel_id,
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:00+00:00",
+            )
+        )
+
+    packet = await runtime.build_context_packet(
+        scope_key=scope,
+        participant_key=participant,
+        channel_id="target",
+    )
+
+    assert any("target channel memory 0" in item for item in packet.channel_history)
+
+
+@pytest.mark.asyncio
 async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_participant(tmp_path):
     provider = HashEmbeddingProvider(dimensions=32)
     vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)

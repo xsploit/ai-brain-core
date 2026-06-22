@@ -2750,9 +2750,16 @@ class DiscordBrainBot(commands.Bot):
         if pending < self.grillo_cadence_interval:
             self.grillo_pending_turn_counts[state_key] = pending
             return
-        self.grillo_pending_turn_counts[state_key] = 0
+        should_reset_pending = True
         for beat_type in self.grillo_cadence_beats:
-            await runtime.run_tick(scope_key=scope, participant_key=participant_key, beat_type=beat_type)
+            try:
+                result = await runtime.run_tick(scope_key=scope, participant_key=participant_key, beat_type=beat_type)
+            except Exception:
+                self.grillo_pending_turn_counts[state_key] = pending
+                raise
+            if result.get("ok") is False or result.get("skipped") == "tick_already_running":
+                should_reset_pending = False
+        self.grillo_pending_turn_counts[state_key] = 0 if should_reset_pending else pending
 
     def _log_grillo_task_result(self, task: asyncio.Task[Any]) -> None:
         try:
