@@ -148,8 +148,8 @@ def _create_graph_store(path: str | Path, *, backend: str) -> GraphMemoryStore:
         ladybug_path = _derived_path(path, ".ladybug")
         try:
             return LadybugGraphMemoryStore(ladybug_path)
-        except Exception:
-            if _recover_ladybug_wal(ladybug_path):
+        except Exception as exc:
+            if _recover_ladybug_wal(ladybug_path, exc):
                 try:
                     return LadybugGraphMemoryStore(ladybug_path)
                 except Exception:
@@ -182,14 +182,32 @@ def _create_vector_store(
     return SQLiteVectorRecallStore(path, embedding_provider=embedding_provider)
 
 
-def _recover_ladybug_wal(path: str | Path) -> bool:
+def _recover_ladybug_wal(path: str | Path, exc: BaseException) -> bool:
     wal_path = Path(f"{Path(path)}.wal")
     if not wal_path.exists():
+        return False
+    if not _looks_like_ladybug_wal_corruption(exc):
         return False
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = wal_path.with_name(f"{wal_path.name}.corrupt-{stamp}")
     wal_path.replace(backup)
     return True
+
+
+def _looks_like_ladybug_wal_corruption(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "corrupt",
+            "malformed",
+            "wal",
+            "write-ahead",
+            "checkpoint",
+            "checksum",
+            "not a database",
+        )
+    )
 
 
 def _derived_path(path: str | Path, suffix: str) -> Path:

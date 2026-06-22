@@ -173,7 +173,27 @@ class LadybugGraphMemoryStore:
         valid_until: str,
         reason: str,
     ) -> None:
-        await self._execute(
+        await self._call_locked(self._invalidate_fact_sync, fact_id, valid_until, reason)
+
+    def _invalidate_fact_sync(self, fact_id: str, valid_until: str, reason: str) -> None:
+        metadata: dict[str, Any] = {}
+        result = self.conn.execute(
+            """
+            MATCH (f:Fact {id: $id})
+            RETURN f
+            LIMIT 1
+            """,
+            {"id": fact_id},
+        ).rows_as_dict()
+        while result.has_next():
+            row = result.get_next()
+            if isinstance(row, dict):
+                fact_row = row.get("f", row)
+                if isinstance(fact_row, dict):
+                    metadata = _metadata_json(fact_row.get("metadata_json"))
+                break
+        metadata["invalidated_reason"] = reason
+        self.conn.execute(
             """
             MATCH (f:Fact {id: $id})
             SET f.valid_until = $valid_until,
@@ -182,7 +202,7 @@ class LadybugGraphMemoryStore:
             {
                 "id": fact_id,
                 "valid_until": valid_until,
-                "metadata_json": json.dumps({"invalidated_reason": reason}),
+                "metadata_json": json.dumps(metadata),
             },
         )
 
@@ -251,6 +271,7 @@ class LadybugGraphMemoryStore:
             """,
             params,
         )
+        self._clear_relationship_profile_edges(params["profile_id"])
         self.conn.execute(
             """
             MATCH (s:MemoryScope), (p:RelationshipProfile)
@@ -302,6 +323,33 @@ class LadybugGraphMemoryStore:
                 """,
                 fact_params,
             )
+
+    def _clear_relationship_profile_edges(self, profile_id: str) -> None:
+        params = {"profile_id": profile_id}
+        self.conn.execute(
+            """
+            MATCH (p:RelationshipProfile)-[r:RELATIONSHIP_WITH_PARTICIPANT]->(participant:Participant)
+            WHERE p.id = $profile_id
+            DELETE r
+            """,
+            params,
+        )
+        self.conn.execute(
+            """
+            MATCH (p:RelationshipProfile)-[r:HAS_RELATIONSHIP_FACT]->(f:RelationshipFact)
+            WHERE p.id = $profile_id
+            DELETE r
+            """,
+            params,
+        )
+        self.conn.execute(
+            """
+            MATCH (f:RelationshipFact)
+            WHERE f.profile_id = $profile_id
+            DELETE f
+            """,
+            params,
+        )
 
     async def get_relationship_profile_graph(self, scope_key: str) -> dict[str, Any] | None:
         return await self._call_locked(self._get_relationship_profile_graph_sync, scope_key)
@@ -369,9 +417,10 @@ class LadybugGraphMemoryStore:
         return rows
 
     def close(self) -> None:
-        close = getattr(self.conn, "close", None)
-        if close:
-            close()
+        for handle in (self.conn, self.db):
+            close = getattr(handle, "close", None)
+            if close:
+                close()
 
     async def _execute(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
         async with self._lock:
@@ -503,4 +552,24 @@ def _metadata_json(value: Any) -> dict[str, Any]:
         parsed = ast.literal_eval(raw)
         return parsed if isinstance(parsed, dict) else {}
     except (SyntaxError, ValueError):
-        return {"raw_metadata": raw}
+        loose = _loose_metadata_map(raw)
+        return loose if loose else {"raw_metadata": raw}
+
+
+def _loose_metadata_map(raw: str) -> dict[str, Any]:
+    if not (raw.startswith("{") and raw.endswith("}")):
+        return {}
+    body = raw[1:-1].strip()
+    if not body:
+        return {}
+    parsed: dict[str, Any] = {}
+    for item in body.split(","):
+        if ":" not in item:
+            return {}
+        key, value = item.split(":", 1)
+        key = key.strip().strip("\"'")
+        value = value.strip().strip("\"'")
+        if not key:
+            return {}
+        parsed[key] = value
+    return parsed

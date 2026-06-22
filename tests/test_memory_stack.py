@@ -31,6 +31,7 @@ from aibrain.memory_stack.grillo import (
     _build_backend_beat_prompt,
     _build_backend_worker_system_prompt,
 )
+from aibrain.memory_stack.stack import _recover_ladybug_wal
 
 
 WEBWAIFU_GRILLO_WORKER_SYSTEM_PROMPT = "\n".join(
@@ -956,6 +957,19 @@ async def test_brain_can_keep_attachment_text_out_of_memory_and_history(tmp_path
     assert history[0]["content"] == [{"type": "input_text", "text": "please summarize"}]
 
 
+def test_ladybug_wal_recovery_only_moves_corrupt_wal(tmp_path):
+    graph_path = tmp_path / "graph.ladybug"
+    wal_path = tmp_path / "graph.ladybug.wal"
+    wal_path.write_text("locked", encoding="utf-8")
+
+    assert _recover_ladybug_wal(graph_path, RuntimeError("database is locked")) is False
+    assert wal_path.exists()
+
+    assert _recover_ladybug_wal(graph_path, RuntimeError("WAL checksum mismatch")) is True
+    assert not wal_path.exists()
+    assert list(tmp_path.glob("graph.ladybug.wal.corrupt-*"))
+
+
 @pytest.mark.asyncio
 async def test_ladybug_adapter_smoke_when_installed(tmp_path):
     if importlib.util.find_spec("ladybug") is None:
@@ -969,12 +983,22 @@ async def test_ladybug_adapter_smoke_when_installed(tmp_path):
             predicate="uses",
             object="LadybugDB",
             valid_from="2026-06-08T00:00:00+00:00",
+            metadata={"source": "smoke"},
         )
     )
 
     hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=1))
 
     assert [hit.object for hit in hits] == ["LadybugDB"]
+    await graph.invalidate_fact(
+        "fact-ladybug",
+        valid_until="2026-06-21T00:00:00+00:00",
+        reason="superseded",
+    )
+    expired_hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=1, include_expired=True))
+
+    assert expired_hits[0].metadata["source"] == "smoke"
+    assert expired_hits[0].metadata["invalidated_reason"] == "superseded"
 
     await graph.upsert_relationship_profile(
         GrilloRelationshipProfile(
@@ -1004,6 +1028,29 @@ async def test_ladybug_adapter_smoke_when_installed(tmp_path):
         "LO expects GRILLO relationship memory."
     ]
     assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:lo"]
+    await graph.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:persona:neuro",
+            scope_key="discord:guild:persona:neuro",
+            persona_id="neuro",
+            participant_keys=["discord:guild:subby"],
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            respect=8,
+            guard=9,
+            facts=["Subby expects current relationship graph exports."],
+            summary="Subby wants fresh graph state.",
+            updated_at="2026-06-20T00:01:00+00:00",
+        )
+    )
+    relationship_export = await graph.export_relationship_graph("discord:guild:persona:neuro")
+
+    assert [fact["text"] for fact in relationship_export["relationship_facts"]] == [
+        "Subby expects current relationship graph exports."
+    ]
+    assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:subby"]
+    graph.close()
 
 
 @pytest.mark.asyncio
