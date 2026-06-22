@@ -26,6 +26,7 @@ import httpx
 from discord.ext import commands
 
 from . import Brain, BrainConfig, ImageInput, MemoryPolicy, MemoryStackConfig, Persona, ThreadPolicy
+from .codex_app_bridge import notify_codex_app_bridge
 from .codex_bridge import CodexBridgeQueue
 from .env import load_env_file
 from .discord_tools import (
@@ -1133,8 +1134,10 @@ class DiscordBrainBot(commands.Bot):
             harness_agent="claude",
             harness_permission_profile="inspect",
         )
+        notify = await notify_codex_app_bridge(path)
+        notify_text = "bridge notified" if notify.get("notified") else f"bridge notify skipped: {notify.get('reason') or notify.get('error') or 'unknown'}"
         await ctx.reply(
-            f"queued Codex bridge request `{path.name}` via `{delivery_mode}`.",
+            f"queued Codex bridge request `{path.name}` via `{delivery_mode}`; {notify_text}.",
             mention_author=False,
         )
 
@@ -2051,7 +2054,7 @@ class DiscordBrainBot(commands.Bot):
             prompt = str(decision.get("codex_prompt") or decision.get("prompt") or "").strip()
             if not prompt:
                 return "queue_codex:empty"
-            self._queue_heartbeat_codex_request(channel, prompt)
+            await self._queue_heartbeat_codex_request(channel, prompt)
             self._mark_heartbeat_action(cooldown_key)
             return "queue_codex"
         return "unknown"
@@ -2159,10 +2162,10 @@ class DiscordBrainBot(commands.Bot):
             user = await self.fetch_user(user_id)
         await user.send(text)
 
-    def _queue_heartbeat_codex_request(self, channel: Any, prompt: str) -> Path:
+    async def _queue_heartbeat_codex_request(self, channel: Any, prompt: str) -> Path:
         guild = getattr(channel, "guild", None)
         actor = getattr(self, "user", None)
-        return self.codex_bridge.enqueue(
+        path = self.codex_bridge.enqueue(
             requester_id=getattr(actor, "id", "neuro-heartbeat"),
             requester_name=_display_name(actor) if actor is not None else getattr(self.persona, "name", "Neuro-sama"),
             guild_id=getattr(guild, "id", None),
@@ -2176,6 +2179,8 @@ class DiscordBrainBot(commands.Bot):
             harness_agent="claude",
             harness_permission_profile="inspect",
         )
+        await notify_codex_app_bridge(path, event="heartbeat_queued")
+        return path
 
     async def _build_heartbeat_text(self, channel: Any) -> str:
         prompt = (

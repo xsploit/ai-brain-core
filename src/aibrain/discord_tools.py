@@ -12,6 +12,7 @@ from typing import Any
 
 import discord
 
+from .codex_app_bridge import notify_codex_app_bridge
 from .codex_bridge import CodexBridgeQueue
 
 
@@ -175,12 +176,14 @@ async def discord_queue_codex_request(prompt: str, route: str = "codex") -> dict
         harness_agent="claude",
         harness_permission_profile="inspect",
     )
+    notify = await notify_codex_app_bridge(path)
     return {
         "queued": True,
         "file": path.name,
         "delivery_mode": delivery_mode,
         "queue_root": str(queue.root),
-        "message": "Queued one Codex bridge request. Codex will process one queued request on the next bridge checkpoint.",
+        "bridge_notify": notify,
+        "message": "Queued one Codex bridge request and notified the local bridge server when configured.",
     }
 
 

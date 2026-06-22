@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
 from .codex_bridge import (
     BRIDGE_REQUEST_SCHEMA,
     BRIDGE_RESULT_SCHEMA,
@@ -267,6 +269,83 @@ class CodexBridgeAppServerWorker:
         return destination
 
 
+async def notify_codex_app_bridge(request_file: Path | str, *, event: str = "queued") -> dict[str, Any]:
+    url = os.getenv("DISCORD_BRAIN_CODEX_BRIDGE_NOTIFY_URL") or os.getenv("CODEX_APP_BRIDGE_NOTIFY_URL")
+    if not url:
+        return {"enabled": False, "notified": False, "reason": "notify_url_not_configured"}
+    timeout = _env_float("CODEX_APP_BRIDGE_NOTIFY_TIMEOUT_SECONDS", 2.0)
+    headers = {"Content-Type": "application/json"}
+    token = os.getenv("CODEX_APP_BRIDGE_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    payload = {
+        "event": event,
+        "request_file": str(request_file),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "notified": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "enabled": True,
+        "notified": True,
+        "response": data if isinstance(data, dict) else {},
+    }
+
+
+def create_app(worker: CodexBridgeAppServerWorker, *, token: str | None = None) -> Any:
+    from fastapi import FastAPI, Header, HTTPException
+
+    app = FastAPI(title="Neuro Codex Bridge", version="0.1.0")
+
+    def require_auth(authorization: str | None) -> None:
+        if not token:
+            return
+        if authorization != f"Bearer {token}":
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        status = worker.bridge.status()
+        return {
+            "ok": True,
+            "enabled": status.enabled,
+            "paused": status.paused,
+            "inbox_count": status.inbox_count,
+            "outbox_count": status.outbox_count,
+            "archive_count": status.archive_count,
+        }
+
+    @app.post("/bridge/process-once")
+    async def process_once(payload: dict[str, Any] | None = None, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_auth(authorization)
+        result = await _run_in_thread(worker.process_once)
+        return {
+            "ok": result.status not in {"rejected"},
+            "event": (payload or {}).get("event"),
+            "status": result.status,
+            "request_file": result.request_file,
+            "outbox_file": result.outbox_file,
+            "archive_file": result.archive_file,
+            "summary": result.summary,
+        }
+
+    return app
+
+
+async def _run_in_thread(func: Callable[[], ProcessedBridgeRequest]) -> ProcessedBridgeRequest:
+    import asyncio
+
+    return await asyncio.to_thread(func)
+
+
 def build_codex_turn_prompt(request: dict[str, Any], *, request_file: Path, cwd: Path) -> str:
     prompt = str(request.get("prompt") or "").strip()
     summary = {
@@ -339,6 +418,16 @@ def _summarize_turn_result(result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _env_float(name: str, fallback: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return fallback
+    try:
+        return float(raw)
+    except ValueError:
+        return fallback
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Neuro -> Codex app-server bridge.")
     parser.add_argument("--env-file", default=os.getenv("DISCORD_BRAIN_ENV_FILE") or os.getenv("AIBRAIN_ENV_FILE") or ".env")
@@ -347,6 +436,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--thread-id", default=os.getenv("DISCORD_BRAIN_CODEX_THREAD_ID", DEFAULT_CODEX_THREAD_ID))
     parser.add_argument("--once", action="store_true", help="Process at most one queued request and exit.")
     parser.add_argument("--watch", action="store_true", help="Keep running and process requests as they arrive.")
+    parser.add_argument("--serve", action="store_true", help="Run a local HTTP bridge server instead of polling.")
+    parser.add_argument("--host", default=os.getenv("CODEX_APP_BRIDGE_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("CODEX_APP_BRIDGE_PORT", "8765")))
     parser.add_argument("--interval", type=float, default=float(os.getenv("CODEX_APP_BRIDGE_INTERVAL_SECONDS", "2")))
     args = parser.parse_args(argv)
 
@@ -355,6 +447,12 @@ def main(argv: list[str] | None = None) -> int:
     bridge = CodexBridgeQueue(args.queue, enabled=True, thread_id=args.thread_id)
     worker = CodexBridgeAppServerWorker(bridge, cwd=Path(args.cwd), thread_id=args.thread_id)
 
+    if args.serve:
+        import uvicorn
+
+        app = create_app(worker, token=os.getenv("CODEX_APP_BRIDGE_TOKEN"))
+        uvicorn.run(app, host=args.host, port=args.port, log_level=os.getenv("CODEX_APP_BRIDGE_LOG_LEVEL", "info"))
+        return 0
     if args.watch:
         while True:
             result = worker.process_once()

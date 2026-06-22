@@ -163,12 +163,14 @@ The Codex heartbeat queue watcher was removed because it made Codex poll itself 
 Set-Location -LiteralPath "C:\Users\SUBSECT\Documents\GitHub\Brain"
 .\.venv\Scripts\python.exe -m aibrain.codex_app_bridge --once --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
 .\.venv\Scripts\python.exe -m aibrain.codex_app_bridge --watch --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
+.\.venv\Scripts\python.exe -m aibrain.codex_app_bridge --serve --host 127.0.0.1 --port 8765 --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
 ```
 
 Installed script entrypoint:
 
 ```powershell
 aibrain-codex-bridge --watch --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
+aibrain-codex-bridge --serve --host 127.0.0.1 --port 8765 --cwd "C:\Users\SUBSECT\Documents\GitHub\Brain"
 ```
 
 Behavior:
@@ -179,6 +181,8 @@ Behavior:
 - Sends `initialize`, `initialized`, `thread/resume`, then `turn/start` for thread `019e53da-7adc-7251-a203-e9da141553f7`.
 - Writes a result JSON to `codex_bridge/outbox` before archiving the request.
 - Processes one request per `--once` call; `--watch` is the long-running local bridge service.
+- `--serve` exposes a loopback HTTP bridge. Configure Neuro with `DISCORD_BRAIN_CODEX_BRIDGE_NOTIFY_URL=http://127.0.0.1:8765/bridge/process-once` so enqueue events wake the bridge immediately instead of relying on polling.
+- Set `CODEX_APP_BRIDGE_TOKEN` on both the bridge process and the bot if the local endpoint should require `Authorization: Bearer ...`.
 
 This still does not give normal Discord users or Neuro raw shell access. Neuro only writes bounded queue JSON through owner-gated tools and the bridge runner applies the authority model again before waking Codex.
 
