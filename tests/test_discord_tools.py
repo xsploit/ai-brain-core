@@ -12,7 +12,11 @@ from aibrain.discord_tools import (
     DiscordToolError,
     DiscordToolRuntime,
     discord_audit_permissions,
+    discord_block_user_from_channel,
     discord_can_do,
+    discord_bulk_delete_messages,
+    discord_delete_message,
+    discord_delete_recent_messages,
     discord_get_capabilities,
     discord_get_channel_overwrites,
     discord_get_current_context,
@@ -32,6 +36,7 @@ from aibrain.discord_tools import (
     discord_shitlist_remove,
     discord_shitlist_status,
     discord_timeout_member,
+    discord_unblock_user_from_channel,
     register_discord_tools,
 )
 from aibrain.codex_bridge import CodexBridgeQueue
@@ -193,6 +198,23 @@ class _Channel:
                     break
 
         return gen()
+
+    async def delete_messages(self, messages, *, reason=None):
+        self.bulk_deleted = [message.id for message in messages]
+        self.bulk_delete_reason = reason
+        for message in messages:
+            message.deleted = reason or True
+
+    def overwrites_for(self, target):
+        return self.overwrites.get(target)
+
+    async def set_permissions(self, target, *, overwrite=None, reason=None):
+        self.permission_updates = getattr(self, "permission_updates", [])
+        self.permission_updates.append((target, overwrite, reason))
+        if overwrite is None:
+            self.overwrites.pop(target, None)
+        else:
+            self.overwrites[target] = overwrite
 
 
 class _Guild:
@@ -625,6 +647,88 @@ def test_read_channel_history_requires_history_permission_and_serializes_message
 
         assert result["channel"]["id"] == 123
         assert [message["content"] for message in result["messages"]] == ["first"]
+
+
+def test_delete_message_is_bot_owner_only(monkeypatch):
+    perms = _Perms(view_channel=True, read_message_history=True, manage_messages=True)
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
+    with _tool_context(actor_perms=perms, bot_perms=perms) as ctx:
+        ctx.channel.messages = [_Message(111, ctx.channel, ctx.target, "remove me")]
+
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_delete_message(ctx.channel.id, 111, confirm=True))
+
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context(actor_perms=_Perms(), bot_perms=perms) as ctx:
+        ctx.channel.messages = [_Message(111, ctx.channel, ctx.target, "remove me")]
+
+        result = asyncio.run(discord_delete_message(ctx.channel.id, 111, reason="owner cleanup"))
+
+        assert result["deleted"] is True
+        assert ctx.channel.messages[0].deleted == "owner cleanup"
+
+
+def test_bulk_and_recent_delete_are_bot_owner_only(monkeypatch):
+    perms = _Perms(view_channel=True, read_message_history=True, manage_messages=True)
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
+    with _tool_context(actor_perms=perms, bot_perms=perms) as ctx:
+        ctx.channel.messages = [_Message(111, ctx.channel, ctx.target, "remove me")]
+
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_bulk_delete_messages(ctx.channel.id, [111], confirm=True))
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_delete_recent_messages(ctx.channel.id, limit=1, confirm=True))
+
+
+def test_delete_recent_messages_filters_user_and_content(monkeypatch):
+    perms = _Perms(view_channel=True, read_message_history=True, manage_messages=True)
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context(actor_perms=_Perms(), bot_perms=perms) as ctx:
+        ctx.channel.messages = [
+            _Message(111, ctx.channel, ctx.target, "delete this one"),
+            _Message(112, ctx.channel, ctx.actor, "delete this but wrong user"),
+            _Message(113, ctx.channel, ctx.target, "keep this"),
+        ]
+
+        result = asyncio.run(
+            discord_delete_recent_messages(
+                ctx.channel.id,
+                limit=10,
+                user_id=ctx.target.id,
+                contains="delete",
+                reason="filtered cleanup",
+            )
+        )
+
+        assert result["deleted"] == 1
+        assert result["message_ids"] == [111]
+        assert ctx.channel.messages[0].deleted == "filtered cleanup"
+        assert not hasattr(ctx.channel.messages[1], "deleted")
+        assert not hasattr(ctx.channel.messages[2], "deleted")
+
+
+def test_block_and_unblock_user_from_channel_are_owner_only(monkeypatch):
+    bot_perms = _Perms(manage_channels=True)
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
+    with _tool_context(actor_perms=_Perms(administrator=True), bot_perms=bot_perms) as ctx:
+        with pytest.raises(DiscordToolError, match="requires the configured bot owner"):
+            asyncio.run(discord_block_user_from_channel(ctx.target.id, ctx.channel.id, confirm=True))
+
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context(actor_perms=_Perms(), bot_perms=bot_perms) as ctx:
+        blocked = asyncio.run(discord_block_user_from_channel(ctx.target.id, ctx.channel.id, reason="channel control"))
+        overwrite = ctx.channel.overwrites[ctx.target]
+
+        assert blocked["blocked"] is True
+        assert overwrite.view_channel is False
+        assert overwrite.send_messages is False
+        assert ctx.channel.permission_updates[-1][2] == "channel control"
+
+        unblocked = asyncio.run(discord_unblock_user_from_channel(ctx.target.id, ctx.channel.id, reason="restore"))
+
+        assert unblocked["unblocked"] is True
+        assert ctx.target not in ctx.channel.overwrites
+        assert ctx.channel.permission_updates[-1][2] == "restore"
 
 
 def test_timeout_member_requires_confirm_and_moderation_permissions(monkeypatch):

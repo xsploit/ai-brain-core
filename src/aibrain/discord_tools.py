@@ -27,11 +27,16 @@ OWNER_ONLY_TOOL_NAMES = [
     "discord_shitlist_status",
     "discord_list_bot_guilds",
     "discord_get_application_info",
+    "discord_delete_message",
+    "discord_bulk_delete_messages",
+    "discord_delete_recent_messages",
     "discord_create_text_channel",
     "discord_create_voice_channel",
     "discord_edit_channel",
     "discord_delete_channel",
     "discord_set_channel_overwrite",
+    "discord_block_user_from_channel",
+    "discord_unblock_user_from_channel",
     "discord_create_role",
     "discord_edit_role",
     "discord_delete_role",
@@ -43,14 +48,9 @@ OWNER_ONLY_TOOL_NAMES = [
 
 DISCORD_AGENT_TOOL_NAMES = [
     "discord_get_capabilities",
-    "discord_queue_codex_request",
-    "discord_shitlist_add",
-    "discord_shitlist_remove",
-    "discord_shitlist_status",
-    "discord_list_bot_guilds",
+    *OWNER_ONLY_TOOL_NAMES,
     "discord_get_guild",
     "discord_get_bot_user",
-    "discord_get_application_info",
     "discord_list_channels",
     "discord_list_roles",
     "discord_list_members",
@@ -70,8 +70,6 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_send_dm",
     "discord_edit_own_message",
     "discord_fetch_message",
-    "discord_delete_message",
-    "discord_bulk_delete_messages",
     "discord_pin_message",
     "discord_unpin_message",
     "discord_add_reaction",
@@ -90,12 +88,25 @@ DISCORD_AGENT_TOOL_NAMES = [
     "discord_list_voice_states",
     "discord_move_member_voice",
     "discord_disconnect_member_voice",
-    *OWNER_ONLY_TOOL_NAMES[6:],
     "discord_list_invites",
     "discord_delete_invite",
     "discord_create_poll",
     "discord_end_poll",
     "discord_list_emojis_stickers",
+]
+
+CHANNEL_BLOCK_TEXT_DENIES = [
+    "send_messages",
+    "add_reactions",
+    "create_public_threads",
+    "create_private_threads",
+    "send_messages_in_threads",
+]
+CHANNEL_BLOCK_VOICE_DENIES = [
+    "connect",
+    "speak",
+    "stream",
+    "use_voice_activation",
 ]
 
 
@@ -779,8 +790,9 @@ async def discord_delete_message(
     reason: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """Delete a message after confirmation unless invoked by the configured bot owner."""
+    """Owner-only: delete a message."""
     runtime = _runtime()
+    _require_owner(runtime, "delete message")
     _require_confirm(runtime, confirm, "delete_message")
     channel = await _resolve_channel(runtime, channel_id)
     await _require_channel_permissions(runtime, channel, "manage messages", "view_channel", "read_message_history", "manage_messages")
@@ -796,20 +808,60 @@ async def discord_bulk_delete_messages(
     reason: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """Bulk-delete specific messages after confirmation unless invoked by the configured bot owner."""
+    """Owner-only: bulk-delete specific message IDs."""
     runtime = _runtime()
+    _require_owner(runtime, "bulk delete messages")
     _require_confirm(runtime, confirm, "bulk_delete_messages")
     channel = await _resolve_channel(runtime, channel_id)
     await _require_channel_permissions(runtime, channel, "bulk delete messages", "view_channel", "read_message_history", "manage_messages")
     limit = _env_int("DISCORD_BRAIN_TOOL_BULK_DELETE_LIMIT", 50)
     ids = [int(message_id) for message_id in message_ids[:limit]]
     messages = [await channel.fetch_message(message_id) for message_id in ids]
-    if hasattr(channel, "delete_messages") and len(messages) > 1:
-        await _call_discord(channel.delete_messages, messages, reason=_bounded_optional(reason, 512))
-    else:
-        for message in messages:
-            await _call_discord(message.delete, reason=_bounded_optional(reason, 512))
+    await _delete_messages(channel, messages, reason)
     await _audit_action(runtime, "discord_bulk_delete_messages", _id(channel), {"message_ids": ids, "reason": reason})
+    return {"deleted": len(messages), "channel_id": _id(channel), "message_ids": ids}
+
+
+async def discord_delete_recent_messages(
+    channel_id: int | None = None,
+    limit: int = 25,
+    user_id: int | None = None,
+    contains: str | None = None,
+    include_bot_messages: bool = True,
+    include_pinned: bool = False,
+    reason: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Owner-only: delete recent messages from a channel with simple filters."""
+    runtime = _runtime()
+    _require_owner(runtime, "delete recent messages")
+    _require_confirm(runtime, confirm, "delete_recent_messages")
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "delete recent messages", "view_channel", "read_message_history", "manage_messages")
+    max_limit = _env_int("DISCORD_BRAIN_TOOL_BULK_DELETE_LIMIT", 50)
+    limit = _clamp(limit, 1, max_limit)
+    needle = contains.lower() if contains else None
+    messages: list[Any] = []
+    async for message in channel.history(limit=limit):
+        if user_id is not None and _id(getattr(message, "author", None)) != int(user_id):
+            continue
+        if not include_bot_messages and bool(getattr(getattr(message, "author", None), "bot", False)):
+            continue
+        if not include_pinned and bool(getattr(message, "pinned", False)):
+            continue
+        if needle is not None:
+            content = (getattr(message, "clean_content", None) or getattr(message, "content", "") or "").lower()
+            if needle not in content:
+                continue
+        messages.append(message)
+    await _delete_messages(channel, messages, reason)
+    ids = [_id(message) for message in messages]
+    await _audit_action(
+        runtime,
+        "discord_delete_recent_messages",
+        _id(channel),
+        {"message_ids": ids, "user_id": user_id, "contains": contains, "reason": reason},
+    )
     return {"deleted": len(messages), "channel_id": _id(channel), "message_ids": ids}
 
 
@@ -1193,9 +1245,7 @@ async def discord_set_channel_overwrite(
     channel = await _resolve_channel(runtime, channel_id)
     await _require_bot_guild_permission(runtime, "manage_channels")
     target = await _resolve_overwrite_target(guild, target_id, target_type)
-    overwrite_values = {name: True for name in allow or []}
-    overwrite_values.update({name: False for name in deny or []})
-    overwrite = discord.PermissionOverwrite(**overwrite_values)
+    overwrite = _permission_overwrite_from_lists(allow or [], deny or [])
     await _call_discord(channel.set_permissions, target, overwrite=overwrite, reason=_bounded_optional(reason, 512))
     await _audit_action(runtime, "discord_set_channel_overwrite", channel_id, {"target_id": target_id, "target_type": target_type})
     return {
@@ -1205,6 +1255,89 @@ async def discord_set_channel_overwrite(
         "target_type": target_type,
         "allow": allow or [],
         "deny": deny or [],
+    }
+
+
+async def discord_block_user_from_channel(
+    user_id: int,
+    channel_id: int | None = None,
+    hide_channel: bool = True,
+    block_text: bool = True,
+    block_voice: bool = True,
+    reason: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Owner-only: deny a member from viewing, posting in, or joining a channel."""
+    runtime = _runtime()
+    _require_owner(runtime, "block user from channel")
+    _require_confirm(runtime, confirm, "block_user_from_channel")
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "block user from channel", "manage_channels")
+    guild = _guild_for_channel(runtime, channel)
+    if guild is None:
+        raise DiscordToolError("Could not resolve the channel guild.")
+    target = await _resolve_member(guild, user_id)
+    deny_permissions: list[str] = []
+    if hide_channel:
+        deny_permissions.append("view_channel")
+    if block_text:
+        deny_permissions.extend(CHANNEL_BLOCK_TEXT_DENIES)
+    if block_voice:
+        deny_permissions.extend(CHANNEL_BLOCK_VOICE_DENIES)
+    deny_permissions = _supported_overwrite_permissions(deny_permissions)
+    if not deny_permissions:
+        raise DiscordToolError("No supported channel block permissions are available in this discord.py build.")
+    overwrite = _existing_overwrite(channel, target)
+    for permission in deny_permissions:
+        setattr(overwrite, permission, False)
+    await _call_discord(channel.set_permissions, target, overwrite=overwrite, reason=_bounded_optional(reason, 512))
+    await _audit_action(runtime, "discord_block_user_from_channel", _id(channel), {"user_id": user_id, "deny": deny_permissions, "reason": reason})
+    return {
+        "blocked": True,
+        "channel_id": _id(channel),
+        "user_id": int(user_id),
+        "deny": deny_permissions,
+    }
+
+
+async def discord_unblock_user_from_channel(
+    user_id: int,
+    channel_id: int | None = None,
+    restore_view: bool = True,
+    restore_text: bool = True,
+    restore_voice: bool = True,
+    reason: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Owner-only: clear this bot's channel block denies for a member."""
+    runtime = _runtime()
+    _require_owner(runtime, "unblock user from channel")
+    _require_confirm(runtime, confirm, "unblock_user_from_channel")
+    channel = await _resolve_channel(runtime, channel_id)
+    await _require_channel_permissions(runtime, channel, "unblock user from channel", "manage_channels")
+    guild = _guild_for_channel(runtime, channel)
+    if guild is None:
+        raise DiscordToolError("Could not resolve the channel guild.")
+    target = await _resolve_member(guild, user_id)
+    clear_permissions: list[str] = []
+    if restore_view:
+        clear_permissions.append("view_channel")
+    if restore_text:
+        clear_permissions.extend(CHANNEL_BLOCK_TEXT_DENIES)
+    if restore_voice:
+        clear_permissions.extend(CHANNEL_BLOCK_VOICE_DENIES)
+    clear_permissions = _supported_overwrite_permissions(clear_permissions)
+    overwrite = _existing_overwrite(channel, target)
+    for permission in clear_permissions:
+        setattr(overwrite, permission, None)
+    stored_overwrite = None if _overwrite_is_empty(overwrite) else overwrite
+    await _call_discord(channel.set_permissions, target, overwrite=stored_overwrite, reason=_bounded_optional(reason, 512))
+    await _audit_action(runtime, "discord_unblock_user_from_channel", _id(channel), {"user_id": user_id, "cleared": clear_permissions, "reason": reason})
+    return {
+        "unblocked": True,
+        "channel_id": _id(channel),
+        "user_id": int(user_id),
+        "cleared": clear_permissions,
     }
 
 
@@ -1494,6 +1627,73 @@ def _require_guild(runtime: DiscordToolRuntime) -> Any:
     if guild is None:
         raise DiscordToolError("This Discord tool requires a guild message context.")
     return guild
+
+
+async def _delete_messages(channel: Any, messages: list[Any], reason: str | None) -> None:
+    if not messages:
+        return
+    if hasattr(channel, "delete_messages") and len(messages) > 1:
+        await _call_discord(channel.delete_messages, messages, reason=_bounded_optional(reason, 512))
+        return
+    for message in messages:
+        await _call_discord(message.delete, reason=_bounded_optional(reason, 512))
+
+
+def _permission_overwrite_from_lists(allow: list[str], deny: list[str]) -> discord.PermissionOverwrite:
+    values: dict[str, bool] = {}
+    for name in allow:
+        values[_normalize_overwrite_permission_name(name)] = True
+    for name in deny:
+        values[_normalize_overwrite_permission_name(name)] = False
+    return discord.PermissionOverwrite(**values)
+
+
+def _supported_overwrite_permissions(names: list[str]) -> list[str]:
+    supported: list[str] = []
+    seen: set[str] = set()
+    probe = discord.PermissionOverwrite()
+    for name in names:
+        normalized = str(name).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        if hasattr(probe, normalized):
+            supported.append(normalized)
+            seen.add(normalized)
+    return supported
+
+
+def _normalize_overwrite_permission_name(name: str) -> str:
+    normalized = str(name).strip().lower()
+    if not normalized:
+        raise DiscordToolError("Permission names cannot be empty.")
+    if not hasattr(discord.PermissionOverwrite(), normalized):
+        raise DiscordToolError(f"Unknown channel overwrite permission: {normalized}")
+    return normalized
+
+
+def _existing_overwrite(channel: Any, target: Any) -> discord.PermissionOverwrite:
+    overwrites_for = getattr(channel, "overwrites_for", None)
+    if callable(overwrites_for):
+        with contextlib.suppress(Exception):
+            overwrite = overwrites_for(target)
+            if overwrite is not None:
+                return overwrite
+    overwrites = getattr(channel, "overwrites", None) or {}
+    with contextlib.suppress(Exception):
+        overwrite = overwrites.get(target)
+        if overwrite is not None:
+            return overwrite
+    return discord.PermissionOverwrite()
+
+
+def _overwrite_is_empty(overwrite: Any) -> bool:
+    checker = getattr(overwrite, "is_empty", None)
+    if callable(checker):
+        with contextlib.suppress(Exception):
+            return bool(checker())
+    with contextlib.suppress(Exception):
+        return all(value is None for _, value in overwrite)
+    return False
 
 
 async def _resolve_guild(runtime: DiscordToolRuntime, guild_id: int | None) -> Any:
