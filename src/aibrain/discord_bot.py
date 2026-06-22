@@ -347,6 +347,32 @@ def _discord_message_metadata(message: discord.Message) -> dict[str, Any]:
     }
 
 
+def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
+    reference = getattr(message, "reference", None)
+    if reference is None:
+        return None
+    resolved = None
+    for attr in ("resolved", "cached_message"):
+        candidate = getattr(reference, attr, None)
+        if candidate is not None:
+            resolved = candidate
+            break
+    message_id = getattr(reference, "message_id", None)
+    if resolved is None:
+        return {"message_id": message_id} if message_id is not None else None
+    author = getattr(resolved, "author", None)
+    created_at = getattr(resolved, "created_at", None)
+    return {
+        "message_id": getattr(resolved, "id", None) or message_id,
+        "author": _display_name(author) if author is not None else "unknown",
+        "author_id": getattr(author, "id", None),
+        "author_is_bot": bool(getattr(author, "bot", False)),
+        "content": _message_text(resolved)[:1500],
+        "created_at": created_at.isoformat() if created_at else None,
+        "jump_url": getattr(resolved, "jump_url", None),
+    }
+
+
 def _discord_metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
     keys = [
         "author_id",
@@ -2129,6 +2155,7 @@ class DiscordBrainBot(commands.Bot):
             "discord_metadata": metadata,
             **_time_context(message.created_at),
             "recent_messages": self.recent_by_scope.get(scope, [])[-8:],
+            "reply_target": _reply_target_context(message),
         }
 
     async def _remember_text(self, scope: str, author_id: int, content: str, *, source: str):
@@ -2756,12 +2783,14 @@ class DiscordBrainBot(commands.Bot):
     ) -> str:
         discord_context = self._context_for_message(message)
         metadata_block = "\n".join(_discord_metadata_prompt_lines(discord_context["discord_metadata"]))
+        reply_target_block = "\n".join(_reply_target_prompt_lines(discord_context.get("reply_target")))
         recent_block = "\n".join(
             _recent_messages_prompt_lines(
                 discord_context.get("recent_messages", []),
                 current_message_id=getattr(message, "id", None),
             )
         )
+        reply_target_section = f"{reply_target_block}\n\n" if reply_target_block else ""
         recent_section = f"{recent_block}\n\n" if recent_block else ""
         codex_block = "\n".join(self._codex_bridge_updates_for_message(message))
         codex_section = f"{codex_block}\n\n" if codex_block else ""
@@ -2772,6 +2801,7 @@ class DiscordBrainBot(commands.Bot):
             f"Message sent at: {discord_context['message_local_created_at'] or discord_context['message_created_at']}\n"
             "Discord metadata for this speaker and channel:\n"
             f"{metadata_block}\n\n"
+            f"{reply_target_section}"
             f"{recent_section}"
             f"{codex_section}"
             f"{user_text}"
@@ -3000,6 +3030,25 @@ def _recent_messages_prompt_lines(
     if not lines:
         return []
     return ["Recent channel context before this message:", *lines]
+
+
+def _reply_target_prompt_lines(reply_target: dict[str, Any] | None) -> list[str]:
+    if not reply_target:
+        return []
+    message_id = reply_target.get("message_id")
+    content = " ".join(str(reply_target.get("content") or "").split())
+    if not content:
+        if message_id is None:
+            return []
+        return [f"Discord reply context: this message replies to message_id={message_id}, but the target content was not available."]
+    author = str(reply_target.get("author") or reply_target.get("author_id") or "unknown")
+    marker = " (bot)" if reply_target.get("author_is_bot") else ""
+    created_at = reply_target.get("created_at") or "unknown time"
+    return [
+        "Discord reply context: the current user message is a direct reply to this message.",
+        f"- [{created_at}] {author}{marker}: {content[:1000]}",
+        "Interpret short responses like yes/no/yep/nope/that one as referring to the replied-to message unless the user says otherwise.",
+    ]
 
 
 def _read_codex_bridge_result(path: Path) -> dict[str, Any] | None:

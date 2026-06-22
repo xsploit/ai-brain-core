@@ -418,6 +418,49 @@ def test_discord_prompt_includes_recent_channel_context(monkeypatch):
     assert "oh yeah, your bot can already do the toolbox stuff" in prompt
 
 
+def test_discord_prompt_includes_reply_target_context(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    replied = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    replied.id = 555
+    replied.guild = SimpleNamespace(id=222, name="Test Guild")
+    replied.channel = channel
+    replied.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    replied.content = "should I move the model dropdown into a paginated UI?"
+    replied.clean_content = replied.content
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=replied.id, resolved=replied)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "yep"))
+
+    assert "Discord reply context: the current user message is a direct reply to this message." in prompt
+    assert "Karah" in prompt
+    assert "should I move the model dropdown into a paginated UI?" in prompt
+    assert "Interpret short responses like yes/no/yep/nope/that one" in prompt
+
+
+def test_discord_prompt_notes_unresolved_reply_target(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.reference = SimpleNamespace(message_id=555, resolved=None)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "yep"))
+
+    assert "replies to message_id=555" in prompt
+    assert "target content was not available" in prompt
+
+
 def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
