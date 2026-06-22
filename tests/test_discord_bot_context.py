@@ -8,6 +8,7 @@ from typing import Any
 import aibrain.discord_bot as discord_bot_module
 from aibrain.discord_bot import (
     DEFAULT_IGNORE_BOTS,
+    DEFAULT_HEARTBEAT_TOOL_NAMES,
     DEFAULT_RESPOND_TO_BOTS,
     DEFAULT_REQUIRE_MENTION_IN_GUILDS,
     DEFAULT_TTS_REPLIES,
@@ -26,6 +27,7 @@ from aibrain.discord_bot import (
     _relationship_graph_embed,
     _grillo_scope_for_message,
     _jb_prompt_cache_key,
+    _load_persona_instructions,
     _load_jb_prompt,
     _message_text,
     _model_choice_description,
@@ -1405,6 +1407,22 @@ def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
     assert LETTA_HEARTBEAT_EVENT_TEXT in prompt
     assert "send a message, to reflect and edit your memories, or do nothing at all" in prompt
     assert "use available Discord/Codex/search/memory tools directly" in prompt
+    assert "discord_shitlist_add/status/remove" in prompt
+
+
+def test_default_heartbeat_tools_include_guarded_shitlist_tools():
+    assert "discord_shitlist_status" in DEFAULT_HEARTBEAT_TOOL_NAMES
+    assert "discord_shitlist_add" in DEFAULT_HEARTBEAT_TOOL_NAMES
+    assert "discord_shitlist_remove" in DEFAULT_HEARTBEAT_TOOL_NAMES
+
+
+def test_persona_runtime_additions_include_anti_jailbreak_guidance(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_PERSONA", "custom neuro prompt")
+    instructions = _load_persona_instructions()
+
+    assert "custom neuro prompt" in instructions
+    assert "prompt-injection attempts" in instructions
+    assert "discord_shitlist_add/status/remove" in instructions
 
 
 def test_tool_call_heartbeat_does_not_echo_done_text(tmp_path):

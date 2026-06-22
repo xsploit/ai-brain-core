@@ -103,6 +103,7 @@ DISCORD_AGENT_TOOL_NAMES = [
 class DiscordToolRuntime:
     bot: Any
     message: Any
+    authority_mode: str = "discord_turn"
 
 
 DISCORD_TOOL_CONTEXT: ContextVar[DiscordToolRuntime | None] = ContextVar("DISCORD_TOOL_CONTEXT", default=None)
@@ -197,12 +198,16 @@ async def discord_queue_codex_request(prompt: str, route: str = "codex") -> dict
 
 
 async def discord_shitlist_add(user_id: int | str, reason: str = "manual", spice_level: int = 3) -> dict[str, Any]:
-    """Owner-only: add or update a user in Neuro's persistent shitlist."""
+    """Owner/autonomous Neuro: add or update a user in Neuro's persistent shitlist."""
     runtime = _runtime()
-    _require_owner(runtime, "edit shitlist")
+    _require_shitlist_authority(runtime, "edit shitlist")
     store = _shitlist_store(runtime)
+    spice = int(spice_level)
+    if _is_autonomous_neuro(runtime):
+        spice = min(spice, _clamp(_env_int("DISCORD_BRAIN_SHITLIST_AUTONOMY_MAX_SPICE", 3), 1, 10))
+        _require_not_bot_self(runtime, user_id)
     try:
-        entry = store.add(user_id, reason=reason, spice_level=int(spice_level))
+        entry = store.add(user_id, reason=reason, spice_level=spice)
     except ValueError as exc:
         raise DiscordToolError(str(exc)) from exc
     return {
@@ -213,17 +218,17 @@ async def discord_shitlist_add(user_id: int | str, reason: str = "manual", spice
 
 
 async def discord_shitlist_remove(user_id: int | str) -> dict[str, Any]:
-    """Owner-only: remove a user from Neuro's persistent shitlist."""
+    """Owner/autonomous Neuro: remove a user from Neuro's persistent shitlist."""
     runtime = _runtime()
-    _require_owner(runtime, "edit shitlist")
+    _require_shitlist_authority(runtime, "edit shitlist")
     removed = _shitlist_store(runtime).remove(user_id)
     return {"ok": True, "removed": removed, "user_id": str(user_id)}
 
 
 async def discord_shitlist_status() -> dict[str, Any]:
-    """Owner-only: list Neuro's persistent shitlist entries."""
+    """Owner/autonomous Neuro: list Neuro's persistent shitlist entries."""
     runtime = _runtime()
-    _require_owner(runtime, "view shitlist")
+    _require_shitlist_authority(runtime, "view shitlist")
     entries = _shitlist_store(runtime).list()
     return {
         "ok": True,
@@ -1758,6 +1763,8 @@ async def _require_moderation(
     *,
     require_target_member: bool = True,
 ) -> None:
+    if _is_autonomous_neuro(runtime):
+        raise DiscordToolError("moderation requires an explicit Discord admin or bot owner turn.")
     if not _env_bool("DISCORD_BRAIN_MODERATION_TOOLS_ENABLED", True):
         raise DiscordToolError("Discord moderation tools are disabled.")
     allowed_users = _csv_ints("DISCORD_BRAIN_MODERATION_ALLOWED_USER_IDS")
@@ -1777,6 +1784,8 @@ async def _require_moderation(
 
 
 async def _require_role_management(runtime: DiscordToolRuntime, target_user_id: int, role_id: int) -> None:
+    if _is_autonomous_neuro(runtime):
+        raise DiscordToolError("role management requires an explicit Discord admin or bot owner turn.")
     guild = _require_guild(runtime)
     role = _resolve_role(guild, role_id)
     actor = await _actor_member(runtime)
@@ -1797,6 +1806,8 @@ def _require_owner(runtime: DiscordToolRuntime, action: str) -> None:
 
 
 def _require_admin_or_owner(runtime: DiscordToolRuntime, action: str) -> None:
+    if _is_autonomous_neuro(runtime):
+        raise DiscordToolError(f"{action} requires an explicit Discord admin or bot owner turn.")
     actor = getattr(runtime.message, "author", None)
     if _is_owner(runtime) or _is_admin(actor):
         return
@@ -1853,9 +1864,32 @@ def _require_confirm(runtime: DiscordToolRuntime, confirm: bool, action: str) ->
 
 
 def _is_owner(runtime: DiscordToolRuntime) -> bool:
+    if _is_autonomous_neuro(runtime):
+        return False
     actor = getattr(runtime.message, "author", None)
     actor_id = _id(actor)
     return actor_id is not None and int(actor_id) in _owner_user_ids()
+
+
+def _is_autonomous_neuro(runtime: DiscordToolRuntime) -> bool:
+    return str(getattr(runtime, "authority_mode", "") or "").strip().lower() == "autonomous_neuro"
+
+
+def _require_shitlist_authority(runtime: DiscordToolRuntime, action: str) -> None:
+    if _is_owner(runtime):
+        return
+    if _is_autonomous_neuro(runtime):
+        if _env_bool("DISCORD_BRAIN_SHITLIST_AUTONOMY_ENABLED", True):
+            return
+        raise DiscordToolError(f"{action} by autonomous Neuro is disabled.")
+    raise DiscordToolError(f"{action} requires the configured bot owner or autonomous Neuro authority.")
+
+
+def _require_not_bot_self(runtime: DiscordToolRuntime, user_id: int | str) -> None:
+    target_id = int(user_id)
+    bot_user_id = _id(getattr(runtime.bot, "user", None))
+    if bot_user_id is not None and target_id == int(bot_user_id):
+        raise DiscordToolError("Refusing to add the bot itself to the shitlist.")
 
 
 def _is_admin(actor: Any) -> bool:

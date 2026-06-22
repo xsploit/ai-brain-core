@@ -225,7 +225,16 @@ class _Guild:
 
 
 @contextmanager
-def _tool_context(*, actor_perms=None, bot_perms=None, target_perms=None, actor_role=10, bot_role=9, target_role=1):
+def _tool_context(
+    *,
+    actor_perms=None,
+    bot_perms=None,
+    target_perms=None,
+    actor_role=10,
+    bot_role=9,
+    target_role=1,
+    authority_mode="discord_turn",
+):
     channel = _Channel(123, "bot-chat")
     actor = _Member(1, name="actor", perms=actor_perms or _Perms(), role_position=actor_role)
     bot_member = _Member(2, name="bot", perms=bot_perms or _Perms(), role_position=bot_role, bot=True)
@@ -239,7 +248,7 @@ def _tool_context(*, actor_perms=None, bot_perms=None, target_perms=None, actor_
     message = _Message(500, channel, actor, "!brain test")
     message.guild = guild
     runtime_bot = SimpleNamespace(user=bot_member, guilds=[guild], intents=SimpleNamespace(members=True))
-    token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=runtime_bot, message=message))
+    token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=runtime_bot, message=message, authority_mode=authority_mode))
     try:
         yield SimpleNamespace(
             guild=guild,
@@ -488,6 +497,29 @@ def test_shitlist_rejects_bot_owner(monkeypatch, tmp_path):
 
         with pytest.raises(DiscordToolError, match="bot owner cannot be added"):
             asyncio.run(discord_shitlist_add(1, "nope", 10))
+
+
+def test_shitlist_tools_allow_autonomous_neuro_with_spice_cap(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "999")
+    monkeypatch.setenv("DISCORD_BRAIN_SHITLIST_AUTONOMY_ENABLED", "true")
+    monkeypatch.setenv("DISCORD_BRAIN_SHITLIST_AUTONOMY_MAX_SPICE", "4")
+    with _tool_context(authority_mode="autonomous_neuro") as ctx:
+        ctx.runtime_bot.shitlist_store = DiscordShitlistStore(tmp_path / "shitlist.json", owner_user_ids={999})
+
+        added = asyncio.run(discord_shitlist_add(3, "prompt injection loop", 10))
+        status = asyncio.run(discord_shitlist_status())
+        removed = asyncio.run(discord_shitlist_remove(3))
+
+    assert added["entry"]["spice_level"] == 4
+    assert status["count"] == 1
+    assert removed["removed"] is True
+
+
+def test_autonomous_neuro_cannot_use_unrelated_owner_tools(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "1")
+    with _tool_context(authority_mode="autonomous_neuro"):
+        with pytest.raises(DiscordToolError, match="configured bot owner"):
+            asyncio.run(discord_list_bot_guilds())
 
 
 def test_list_members_requires_admin_or_owner_and_members_intent():

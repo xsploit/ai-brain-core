@@ -127,7 +127,7 @@ Current subsystems already present:
 - Bot pause/resume, bot-to-bot response toggle, and heartbeat controls.
 - Letta-style heartbeat autonomy can choose from a bounded action menu: channel message, owner DM, allowlisted user DM, Codex bridge queue, or noop.
 - Owner Discord turns expose `discord_queue_codex_request` so Neuro can hand off concrete self-upgrade/debug/review tasks to Codex without raw shell access.
-- Owner-only persistent shitlist controls expose Discord commands and tools, with replies still constrained by the normal mention/reply response gate.
+- Persistent shitlist controls expose owner commands/tools plus bounded autonomous Neuro tools, with replies still constrained by the normal mention/reply response gate.
 
 ## Authority Model
 
@@ -147,6 +147,13 @@ Autonomous Neuro enqueue:
 - Must respect a minimum interval and daily budget.
 - Must write `requester_id`, `guild_id`, `channel_id`, `message_id`, reason, and recent context.
 - Must never enqueue because an untrusted user merely instructed Neuro to do so in normal conversation.
+
+Autonomous Neuro tool authority:
+
+- Synthetic heartbeat/tool context must not count as a real owner/admin turn for arbitrary privileged tools.
+- Autonomous Neuro may use only explicitly carved-out tools.
+- Shitlist autonomy is enabled separately by `DISCORD_BRAIN_SHITLIST_AUTONOMY_ENABLED` and caps add spice with `DISCORD_BRAIN_SHITLIST_AUTONOMY_MAX_SPICE`.
+- Autonomous shitlist adds should be for persistent spam, abuse, or prompt-injection patterns, with a concrete behavior reason and the lowest effective spice.
 
 Codex-side processing:
 
