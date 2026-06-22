@@ -162,6 +162,24 @@ class _EmptyThenOkBrain:
         yield SimpleNamespace(type="response.done", data={})
 
 
+class _TransientDropThenOkBrain:
+    memory_stack = None
+
+    def __init__(self):
+        self.prompts = []
+        self.kwargs = []
+
+    async def stream(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
+        if len(self.prompts) == 1:
+            raise discord_bot_module.httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body (incomplete chunked read)"
+            )
+        yield SimpleNamespace(type="text.delta", data={"text": "recovered after drop"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
 class _FakeDecisionBrain:
     memory_stack = None
 
@@ -717,6 +735,43 @@ def test_empty_brain_reply_reports_failure_after_retry(monkeypatch):
     )
 
     assert message._fake_reply.edits == ["brain failed: model returned an empty response after retry"]
+
+
+def test_transient_stream_drop_retries_once_without_tools_or_cache(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _TransientDropThenOkBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = discord_bot_module.logging.getLogger("test")
+
+    asyncio.run(
+        bot._reply_with_brain(
+            message,
+            user_text_override="write this once",
+            use_memory=False,
+            tool_names=["discord_context"],
+            include_discord_context=False,
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
+            prompt_cache_key="cached-turn",
+            prompt_cache_retention="ephemeral",
+        )
+    )
+
+    assert message._fake_reply.edits == ["recovered after drop"]
+    assert len(brain.prompts) == 2
+    assert "stream disconnected" in brain.prompts[1]
+    assert brain.kwargs[0]["tool_names"] == ["discord_context"]
+    assert brain.kwargs[1]["tool_names"] == []
+    assert "prompt_cache_key" not in brain.kwargs[1]
+    assert brain.kwargs[1]["memory_event_text"] == ""
 
 
 def test_grillo_query_is_bounded_without_truncating_prompt(monkeypatch):

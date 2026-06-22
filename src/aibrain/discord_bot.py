@@ -2623,28 +2623,50 @@ class DiscordBrainBot(commands.Bot):
             response_options["memory_query_text"] = memory_query_text
             response_options["memory_event_text"] = memory_text
             response_options["history_text"] = memory_query_text
+            memory_for_stream = (
+                MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8))
+                if use_memory is None
+                else use_memory
+            )
             async with message.channel.typing():
-                async for event in self.brain.stream(
-                    prompt,
-                    thread_id=thread_id,
-                    persona=persona,
-                    images=images,
-                    use_memory=(
-                        MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8))
-                        if use_memory is None
-                        else use_memory
-                    ),
-                    tool_names=tool_names if tool_names is not None else DEFAULT_DISCORD_TOOL_NAMES,
-                    **response_options,
-                ):
-                    if getattr(self, "paused", False):
-                        return
-                    if event.type == "text.delta":
-                        buffer += event.data.get("text", "")
-                    elif event.type == "memory.hit":
-                        self.logger.debug("memory hit %s %.3f", event.data.get("id"), event.data.get("score", 0.0))
-                    elif event.type == "error":
-                        raise RuntimeError(event.data.get("message", "brain stream failed"))
+                try:
+                    collected = await self._collect_brain_stream_text(
+                        prompt,
+                        thread_id=thread_id,
+                        persona=persona,
+                        images=images,
+                        use_memory=memory_for_stream,
+                        tool_names=tool_names if tool_names is not None else DEFAULT_DISCORD_TOOL_NAMES,
+                        response_options=response_options,
+                        error_message="brain stream failed",
+                    )
+                except Exception as exc:
+                    if not _is_transient_brain_stream_error(exc):
+                        raise
+                    logger = getattr(self, "logger", logging.getLogger("aibrain.discord"))
+                    logger.warning(
+                        "Brain stream disconnected for scope %s; retrying once without tools/cache: %s",
+                        channel_scope,
+                        exc,
+                    )
+                    retry_options = _brain_retry_options(response_options)
+                    retry_prompt = _brain_recovery_prompt(
+                        prompt,
+                        "Previous model stream disconnected before Discord received a complete reply.",
+                    )
+                    collected = await self._collect_brain_stream_text(
+                        retry_prompt,
+                        thread_id=thread_id,
+                        persona=persona,
+                        images=images,
+                        use_memory=memory_for_stream,
+                        tool_names=[],
+                        response_options=retry_options,
+                        error_message="brain retry stream failed",
+                    )
+                if collected is None:
+                    return
+                buffer = collected
                 if getattr(self, "paused", False):
                     return
                 final_text = buffer.strip()
@@ -2654,36 +2676,23 @@ class DiscordBrainBot(commands.Bot):
                         "Brain model returned empty text for scope %s; retrying once without tools/cache",
                         channel_scope,
                     )
-                    retry_options = dict(response_options)
-                    retry_options.pop("prompt_cache_key", None)
-                    retry_options.pop("prompt_cache_retention", None)
-                    retry_prompt = (
-                        f"{prompt}\n\n"
-                        "[System recovery note: Previous model call returned no visible Discord text. "
-                        "Reply now in plain Discord text only. Do not call tools.]"
+                    retry_options = _brain_retry_options(response_options)
+                    retry_prompt = _brain_recovery_prompt(
+                        prompt,
+                        "Previous model call returned no visible Discord text.",
                     )
-                    retry_buffer = ""
-                    async for event in self.brain.stream(
+                    retry_buffer = await self._collect_brain_stream_text(
                         retry_prompt,
                         thread_id=thread_id,
                         persona=persona,
                         images=images,
-                        use_memory=(
-                            MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8))
-                            if use_memory is None
-                            else use_memory
-                        ),
+                        use_memory=memory_for_stream,
                         tool_names=[],
-                        **retry_options,
-                    ):
-                        if getattr(self, "paused", False):
-                            return
-                        if event.type == "text.delta":
-                            retry_buffer += event.data.get("text", "")
-                        elif event.type == "memory.hit":
-                            self.logger.debug("memory hit %s %.3f", event.data.get("id"), event.data.get("score", 0.0))
-                        elif event.type == "error":
-                            raise RuntimeError(event.data.get("message", "brain retry stream failed"))
+                        response_options=retry_options,
+                        error_message="brain retry stream failed",
+                    )
+                    if retry_buffer is None:
+                        return
                     final_text = retry_buffer.strip()
                     if not final_text:
                         raise RuntimeError("model returned an empty response after retry")
@@ -2701,6 +2710,38 @@ class DiscordBrainBot(commands.Bot):
                 DISCORD_CONTEXT.reset(token)
             if tool_token is not None:
                 DISCORD_TOOL_CONTEXT.reset(tool_token)
+
+    async def _collect_brain_stream_text(
+        self,
+        prompt: str,
+        *,
+        thread_id: str,
+        persona: Persona,
+        images: list[ImageInput | dict[str, Any] | str],
+        use_memory: bool | MemoryPolicy | dict[str, Any],
+        tool_names: list[str],
+        response_options: dict[str, Any],
+        error_message: str,
+    ) -> str | None:
+        buffer = ""
+        async for event in self.brain.stream(
+            prompt,
+            thread_id=thread_id,
+            persona=persona,
+            images=images,
+            use_memory=use_memory,
+            tool_names=tool_names,
+            **response_options,
+        ):
+            if getattr(self, "paused", False):
+                return None
+            if event.type == "text.delta":
+                buffer += event.data.get("text", "")
+            elif event.type == "memory.hit":
+                self.logger.debug("memory hit %s %.3f", event.data.get("id"), event.data.get("score", 0.0))
+            elif event.type == "error":
+                raise RuntimeError(event.data.get("message", error_message))
+        return buffer
 
     async def _build_prompt_for_message(
         self,
@@ -2893,6 +2934,38 @@ class DiscordBrainBot(commands.Bot):
                 await message.reply(chunk, mention_author=False)
             else:
                 await message.channel.send(chunk)
+
+
+def _brain_retry_options(response_options: dict[str, Any]) -> dict[str, Any]:
+    retry_options = dict(response_options)
+    retry_options.pop("prompt_cache_key", None)
+    retry_options.pop("prompt_cache_retention", None)
+    retry_options["memory_event_text"] = ""
+    return retry_options
+
+
+def _brain_recovery_prompt(prompt: str, note: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        f"[System recovery note: {note} "
+        "Reply now in plain Discord text only. Do not call tools.]"
+    )
+
+
+def _is_transient_brain_stream_error(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout)):
+        return True
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "incomplete chunked read",
+            "peer closed connection without sending complete message body",
+            "server disconnected without sending a response",
+            "connection reset by peer",
+            "connection closed",
+        )
+    )
 
 
 def _memory_query_text(text: str) -> str:

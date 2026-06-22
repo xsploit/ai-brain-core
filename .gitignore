@@ -20,4 +20,5 @@ src/aibrain/voices/
 *.ladybug*
 *.turbovec
 *.turbovec.sqlite3
+*.shitlist.json
 .env
