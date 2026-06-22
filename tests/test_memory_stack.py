@@ -24,6 +24,42 @@ from aibrain.memory_stack import (
     TemporalFact,
     TurboVecRecallStore,
 )
+from aibrain.memory_stack.grillo import (
+    GrilloContextPacket,
+    GrilloTurn,
+    _build_backend_beat_prompt,
+    _build_backend_worker_system_prompt,
+)
+
+
+WEBWAIFU_GRILLO_WORKER_SYSTEM_PROMPT = "\n".join(
+    [
+        "You are the private backend GRILLO memory worker for Web Waifu 4.",
+        "You are not writing a user-facing chat reply.",
+        "Return only JSON matching the schema.",
+        "Use worker tools by returning toolCalls. Do not claim a write happened unless you call a write tool.",
+        "Extract durable memory only when the transcript contains a preference, fact, goal, boundary, bond signal, or ongoing thread.",
+        "Write diary entries only when the exchange meaningfully changes mood, relationship, goals, or stream context.",
+        "Diary personal_thought is private first-person avatar reflection, not a mechanical receipt.",
+        "Reflection beats synthesize higher-order insight from clusters of turns and memories; they do not restate isolated facts.",
+        "A useful reflection explains what pattern is emerging, what changed emotionally or relationally, and how future replies should adapt.",
+        "Use memory_write only for grounded consolidated slots such as open_threads, ongoing_threads, preferences, boundaries, verified_facts, or relationship_state.",
+        "",
+        "Available tools:",
+        '- core.worker_memory_read args: {"block_name"?: string}',
+        '- core.worker_memory_search args: {"query": string, "limit"?: number}',
+        '- core.worker_candidate_list args: {"limit"?: number, "type_filter"?: string}',
+        '- core.worker_candidate_write args: {"type": "preference|fact|goal|boundary|bond_signal|thread", "content": string, "summary": string, "confidence": number, "tags"?: string[], "source_turn_ids"?: string[]}',
+        '- core.worker_diary_write args: {"summary": string, "personal_thought": string, "tags"?: string[], "beat_type"?: string, "source_turn_ids"?: string[]}',
+        '- core.worker_memory_write args: {"block_name": string, "items": string[], "operation": "merge|replace", "reason"?: string, "source_candidate_ids"?: string[]}',
+        '- core.worker_profile_patch args: {"field": "tone_preferences|interaction_style|boundaries|active_threads", "operation": "add|remove", "value": string}',
+        '- core.worker_emotion_read args: {}',
+        '- core.worker_emotion_update args: {"intensities": {"emotion_name": number}, "operation"?: "merge|replace", "last_signal_source"?: string}',
+        '- core.worker_memory_insert_archival args: {"text": string}',
+        "",
+        "First read or search memory if needed. Then call write tools. When finished, return done=true and toolCalls=[].",
+    ]
+)
 
 
 class FakeConversations:
@@ -59,6 +95,60 @@ class RecordingEmbeddingProvider:
         if len(text) > self.max_len:
             raise AssertionError(f"embedding input too long: {len(text)}")
         return [1.0, *([0.0] * (self.dimensions - 1))]
+
+
+def test_grillo_worker_prompts_match_webwaifu_contract():
+    assert _build_backend_worker_system_prompt() == WEBWAIFU_GRILLO_WORKER_SYSTEM_PROMPT
+
+    packet = GrilloContextPacket(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        background_information=["scope_key: discord:guild:alpha"],
+        channel_history=["Subby: make it one to one"],
+        relationship_memory=["stage=familiar mood=guarded"],
+        recalled_memories=[{"score": 0.9, "text": "[candidate:thread] GRILLO parity"}],
+        thoughts=["[diary:relationship] I should preserve source semantics."],
+        output_description=[
+            "Use this GRILLO packet as scoped memory/context for the current reply.",
+            "Treat channel_history as transcript, relationship_memory as durable participant context, recalled_memories as recall, and thoughts as private reflection.",
+            "If memory conflicts with the current user turn, trust the current user turn first.",
+        ],
+    )
+    recent = [
+        GrilloTurn(
+            turn_id="turn-user",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            role="user",
+            content="make sure it is 1 to 1",
+            author_name="Subby",
+            source="discord",
+        ),
+        GrilloTurn(
+            turn_id="turn-assistant",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            role="assistant",
+            content="I will check the source.",
+            author_name="Neuro-sama",
+            source="discord",
+        ),
+    ]
+    prompt = _build_backend_beat_prompt(
+        beat_type="relationship",
+        context_packet=packet,
+        recent_turns=recent,
+        scope_key="discord:guild:alpha",
+    )
+
+    assert "This is a relationship beat." in prompt
+    assert "Canonical GRILLO context packet:" in prompt
+    assert '"id": "turn-user"' in prompt
+    assert '"participantKey": "user-alpha"' in prompt
+    assert "channelId" not in prompt
+    assert "interfacePath" not in prompt
+    assert "Do not finish with zero writes" not in prompt
+    assert "Only after a write tool succeeds" not in prompt
 
 
 @pytest.mark.asyncio
@@ -539,9 +629,9 @@ async def test_grillo_worker_extraction_debrief_can_request_ai_diary_write(tmp_p
             assert "previous extraction round ended" in request["messages"][-1]["content"]
             return {
                 "text": json.dumps(
-                    {
-                        "done": False,
-                        "notes": "forced diary write",
+                        {
+                            "done": False,
+                            "notes": "debrief diary write",
                         "toolCalls": [
                             {
                                 "name": "core.worker_diary_write",
@@ -550,7 +640,7 @@ async def test_grillo_worker_extraction_debrief_can_request_ai_diary_write(tmp_p
                                     "personal_thought": (
                                         "Subby got frustrated because the bot confused context across channels. "
                                         "I should remember that he wants the memory worker itself to write reflections, "
-                                        "not a fallback parser pretending it handled the beat."
+                                        "with the WebWaifu extraction debrief flow when a real signal exists."
                                     ),
                                     "tags": ["relationship", "memory"],
                                     "beat_type": "relationship",
@@ -597,7 +687,7 @@ async def test_grillo_worker_extraction_debrief_can_request_ai_diary_write(tmp_p
     assert result[0].channel_id == "222"
     assert len(requests) == 3
     assert diary
-    assert "fallback parser" in diary[0].personal_thought
+    assert "WebWaifu extraction debrief flow" in diary[0].personal_thought
     assert all(turn.channel_id == "222" for turn in turns)
 
 
@@ -661,7 +751,7 @@ async def test_grillo_worker_relationship_state_slot_syncs_profile(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
+async def test_grillo_worker_persistent_noop_is_allowed_without_fallback(tmp_path):
     async def worker_completion(request):
         return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
 
@@ -674,7 +764,7 @@ async def test_grillo_worker_persistent_noop_fails_without_fallback(tmp_path):
     await runtime.ingest_turn_pair(
         scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
         participant_key="user-alpha",
-        user_text="This should force the AI worker to write.",
+        user_text="This should allow the AI worker to decide nothing durable exists.",
         assistant_text="I should write memory through GRILLO tools.",
         source="discord",
         run_tick=False,

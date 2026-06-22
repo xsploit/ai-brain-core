@@ -1004,7 +1004,7 @@ class GrilloRuntime:
         *,
         scope_key: str,
         participant_key: str,
-        beat_type: str = "memory_consolidation",
+        beat_type: str = "extraction",
     ) -> dict[str, Any]:
         if self._tick_lock.locked():
             return {"ok": False, "skipped": "tick_already_running"}

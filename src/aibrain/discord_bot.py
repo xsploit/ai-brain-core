@@ -858,7 +858,7 @@ class RelationshipGraphView(discord.ui.View):
         self.last_tick_result = await runtime.run_tick(
             scope_key=self.scope,
             participant_key=self.participant,
-            beat_type="manual_panel",
+            beat_type="extraction",
         )
         await self.refresh_snapshot()
         if interaction.message is not None:
@@ -1709,7 +1709,7 @@ class DiscordBrainBot(commands.Bot):
             )
 
         @grillo.command(name="tick")
-        async def grillo_tick(ctx: commands.Context, beat_type: str = "manual") -> None:
+        async def grillo_tick(ctx: commands.Context, beat_type: str = "extraction") -> None:
             runtime = self.brain.memory_stack.grillo if self.brain.memory_stack else None
             if runtime is None:
                 await ctx.reply("GRILLO runtime is not enabled.", mention_author=False)
