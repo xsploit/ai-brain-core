@@ -75,6 +75,12 @@ class SQLiteVectorRecallStore:
         if item.created_at is None:
             item.created_at = utc_now()
         embedding = await self.embedding_provider.embed(item.text)
+        await self.add_with_embedding(item, embedding)
+        return item.id
+
+    async def add_with_embedding(self, item: RecallItem, embedding: list[float]) -> str:
+        if item.created_at is None:
+            item.created_at = utc_now()
         await asyncio.to_thread(self._add_sync, item, embedding)
         return item.id
 
@@ -120,6 +126,8 @@ class SQLiteVectorRecallStore:
         top_k: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[RecallHit]:
+        if not query.strip():
+            return []
         query_embedding = await self.embedding_provider.embed(query)
         return await asyncio.to_thread(
             self._search_sync,
@@ -161,23 +169,29 @@ class SQLiteVectorRecallStore:
             semantic = cosine_similarity(query_embedding, embedding)
             importance = safe_float(row["importance"], 0.5)
             score = semantic * (0.5 + importance)
-            hits.append(
-                RecallHit(
-                    id=row["id"],
-                    text=row["text"],
-                    score=score,
-                    scope=row["scope"],
-                    thread_id=row["thread_id"],
-                    persona_id=row["persona_id"],
-                    source_event_id=row["source_event_id"],
-                    source_fact_id=row["source_fact_id"],
-                    importance=importance,
-                    metadata=metadata,
-                    created_at=row["created_at"],
-                )
-            )
+            hits.append(_row_to_hit(row, metadata=metadata, score=score, importance=importance))
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[: max(top_k, 1)]
+
+    async def hits_by_turbovec_ids(self, numeric_ids: list[int]) -> dict[int, RecallHit]:
+        return await asyncio.to_thread(self._hits_by_turbovec_ids_sync, numeric_ids)
+
+    def _hits_by_turbovec_ids_sync(self, numeric_ids: list[int]) -> dict[int, RecallHit]:
+        wanted = {int(item) for item in numeric_ids}
+        if not wanted:
+            return {}
+        with self._lock:
+            rows = self._connect().execute("SELECT * FROM brain_recall_items").fetchall()
+        hits: dict[int, RecallHit] = {}
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            numeric_id = metadata.get("turbovec_id")
+            if numeric_id is None:
+                continue
+            numeric_id = int(numeric_id)
+            if numeric_id in wanted:
+                hits[numeric_id] = _row_to_hit(row, metadata=metadata)
+        return hits
 
     def close(self) -> None:
         with self._lock:
@@ -219,6 +233,8 @@ class TurboVecRecallStore:
         self._lock = asyncio.Lock()
 
     async def add(self, item: RecallItem) -> str:
+        if not item.text.strip():
+            return item.id
         embedding = await self.embedding_provider.embed(item.text)
         numeric_id = _numeric_id(item.id)
         async with self._lock:
@@ -231,7 +247,7 @@ class TurboVecRecallStore:
             )
             await asyncio.to_thread(self.index.write, str(self.index_path))
         item.metadata = {**item.metadata, "turbovec_id": numeric_id}
-        await self.metadata.add(item)
+        await self.metadata.add_with_embedding(item, embedding)
         return item.id
 
     async def search(
@@ -241,34 +257,44 @@ class TurboVecRecallStore:
         top_k: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[RecallHit]:
-        if filters:
-            return await self.metadata.search(query, top_k=top_k, filters=filters)
+        if not query.strip():
+            return []
+        filters = filters or {}
+        limit = max(top_k, 1)
+        search_k = limit if not filters else max(limit * 8, limit)
         embedding = await self.embedding_provider.embed(query)
+        fallback_to_metadata = False
         async with self._lock:
-            scores, ids = await asyncio.to_thread(
-                self.index.search,
-                _as_vector_array([embedding]),
-                k=top_k,
-            )
-        metadata_hits = {
-            hit.id: hit
-            for hit in await self.metadata.search(query, top_k=max(top_k * 4, top_k), filters=None)
-        }
+            try:
+                scores, ids = await asyncio.to_thread(
+                    self.index.search,
+                    _as_vector_array([embedding]),
+                    k=search_k,
+                )
+            except ValueError as exc:
+                if "query dim" not in str(exc).lower():
+                    raise
+                fallback_to_metadata = True
+                scores, ids = [], []
+        if fallback_to_metadata:
+            return await self.metadata.search(query, top_k=limit, filters=filters)
         hits: list[RecallHit] = []
-        by_numeric_id = {
-            str(hit.metadata.get("turbovec_id")): hit
-            for hit in metadata_hits.values()
-        }
         first_scores = scores[0] if len(scores) else []
         first_ids = ids[0] if len(ids) else []
+        numeric_ids = [int(item_id) for item_id in first_ids if int(item_id) >= 0]
+        by_numeric_id = await self.metadata.hits_by_turbovec_ids(numeric_ids)
         for score, item_id in zip(first_scores, first_ids):
-            hit = by_numeric_id.get(str(int(item_id)))
+            hit = by_numeric_id.get(int(item_id))
             if hit is None:
+                continue
+            if filters and not _hit_matches_filters(hit, filters):
                 continue
             hit.score = safe_float(score, 0.0) * (0.5 + safe_float(hit.importance, 0.5))
             hits.append(hit)
+            if len(hits) >= limit:
+                break
         hits.sort(key=lambda hit: hit.score, reverse=True)
-        return hits[:top_k]
+        return hits[:limit]
 
     def close(self) -> None:
         self.metadata.close()
@@ -295,6 +321,43 @@ def _as_id_array(ids: list[int]) -> Any:
 def _numeric_id(value: str) -> int:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=False)
+
+
+def _row_to_hit(
+    row: sqlite3.Row,
+    *,
+    metadata: dict[str, Any],
+    score: float = 0.0,
+    importance: float | None = None,
+) -> RecallHit:
+    importance = safe_float(row["importance"], 0.5) if importance is None else importance
+    return RecallHit(
+        id=row["id"],
+        text=row["text"],
+        score=score,
+        scope=row["scope"],
+        thread_id=row["thread_id"],
+        persona_id=row["persona_id"],
+        source_event_id=row["source_event_id"],
+        source_fact_id=row["source_fact_id"],
+        importance=importance,
+        metadata=metadata,
+        created_at=row["created_at"],
+    )
+
+
+def _hit_matches_filters(hit: RecallHit, filters: dict[str, Any]) -> bool:
+    for key in ("scope", "thread_id", "persona_id", "source_event_id", "source_fact_id"):
+        expected = filters.get(key)
+        if expected is None:
+            continue
+        actual = getattr(hit, key)
+        if isinstance(expected, (list, tuple, set)):
+            if actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return _metadata_matches(hit.metadata, filters)
 
 
 def _metadata_matches(metadata: dict[str, Any], filters: dict[str, Any]) -> bool:

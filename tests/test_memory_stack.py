@@ -16,6 +16,7 @@ from aibrain.memory_stack import (
     HybridMemoryStack,
     HybridRetriever,
     RawEvent,
+    RecallHit,
     RecallItem,
     SQLiteGrilloStore,
     SQLiteRawEventStore,
@@ -1077,6 +1078,55 @@ async def test_ladybug_adapter_serializes_concurrent_async_calls(tmp_path):
 
     assert {hit.id for hit in hits} >= {f"fact-{index}" for index in range(12)}
     graph.close()
+
+
+@pytest.mark.asyncio
+async def test_turbovec_search_maps_exact_numeric_ids_and_filters():
+    class FakeIndex:
+        def __init__(self):
+            self.requested_k = None
+
+        def search(self, vectors, k):
+            self.requested_k = k
+            return [[0.9, 0.8]], [[222, 111]]
+
+    class FakeMetadata:
+        def __init__(self):
+            self.requested_ids = None
+
+        async def hits_by_turbovec_ids(self, numeric_ids):
+            self.requested_ids = numeric_ids
+            return {
+                222: RecallHit(
+                    id="wanted",
+                    text="Subby asked for graph memory.",
+                    score=0.0,
+                    scope="archival",
+                    metadata={"turbovec_id": 222, "participant_key": "discord:user:subby"},
+                ),
+                111: RecallHit(
+                    id="other",
+                    text="Other memory.",
+                    score=0.0,
+                    scope="archival",
+                    metadata={"turbovec_id": 111, "participant_key": "discord:user:other"},
+                ),
+            }
+
+        async def search(self, *args, **kwargs):
+            raise AssertionError("TurboVec search should not use semantic metadata fallback")
+
+    store = TurboVecRecallStore.__new__(TurboVecRecallStore)
+    store.index = FakeIndex()
+    store.metadata = FakeMetadata()
+    store.embedding_provider = RecordingEmbeddingProvider(dimensions=2, max_len=20)
+    store._lock = asyncio.Lock()
+
+    hits = await store.search("graph", top_k=1, filters={"participant_key": "discord:user:subby"})
+
+    assert [hit.id for hit in hits] == ["wanted"]
+    assert store.index.requested_k == 8
+    assert store.metadata.requested_ids == [222, 111]
 
 
 @pytest.mark.asyncio
