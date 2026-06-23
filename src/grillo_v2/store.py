@@ -297,7 +297,8 @@ class SQLiteGrilloV2Store:
                 key=lambda fact: (_text_score(query, fact.claim), fact.confidence, fact.updated_at),
                 reverse=True,
             )
-            facts = [fact for fact in facts if _text_score(query, fact.claim) > 0 or not subject_id]
+            if subject_id is None:
+                facts = [fact for fact in facts if _text_score(query, fact.claim) > 0]
         return facts[: max(1, int(limit))]
 
     def search_facts(self, scope_key: str, query: str, *, limit: int = 8) -> list[TemporalFact]:

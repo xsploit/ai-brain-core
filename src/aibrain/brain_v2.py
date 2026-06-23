@@ -55,6 +55,51 @@ class BrainV2:
     def append_episode(self, episode: GrilloEpisode) -> GrilloEpisode:
         return self.grillo.append_episode(episode)
 
+    async def respond(
+        self,
+        *,
+        scope_key: str,
+        actor_id: str,
+        user_text: str,
+        source: str = "brain_v2",
+        channel_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        user_episode = GrilloEpisode.create(
+            scope_key=scope_key,
+            source=source,
+            actor_id=actor_id,
+            participant_ids=[actor_id, self.config.persona_id],
+            channel_id=channel_id,
+            content=user_text,
+            metadata=metadata or {},
+        )
+        self.append_episode(user_episode)
+        packet = self.build_context_packet(
+            scope_key=scope_key,
+            actor_id=actor_id,
+            query=user_text,
+            channel_id=channel_id,
+        )
+        response_text = await self.json_client.complete_text(
+            instructions=_response_instructions(self.config.persona_name),
+            prompt=_response_prompt(packet=packet, user_text=user_text),
+            store=False,
+        )
+        if response_text.strip():
+            self.append_episode(
+                GrilloEpisode.create(
+                    scope_key=scope_key,
+                    source=f"{source}:assistant",
+                    actor_id=self.config.persona_id,
+                    participant_ids=[actor_id, self.config.persona_id],
+                    channel_id=channel_id,
+                    content=response_text.strip(),
+                    metadata={"reply_to_episode_id": user_episode.episode_id},
+                )
+            )
+        return response_text.strip()
+
     def build_context_packet(
         self,
         *,
@@ -90,3 +135,26 @@ GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(
         "Return only JSON matching the supplied schema.",
     ]
 )
+
+
+def _response_instructions(persona_name: str) -> str:
+    return "\n".join(
+        [
+            f"You are {persona_name}.",
+            "Use the GRILLO v2 context packet as structured memory.",
+            "Do not treat evidence_gaps as facts.",
+            "If memory conflicts with the current message, trust the current message.",
+            "Reply naturally and do not expose internal XML tags unless asked for a diagnostic export.",
+        ]
+    )
+
+
+def _response_prompt(*, packet: GrilloContextPacket, user_text: str) -> str:
+    return "\n\n".join(
+        [
+            "# GRILLO v2 Context",
+            packet.as_prompt_text(),
+            "# Current User Message",
+            user_text,
+        ]
+    )

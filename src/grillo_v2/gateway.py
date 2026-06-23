@@ -55,6 +55,22 @@ class VercelAIGatewayJSONClient:
             output_text = _response_text(response)
         return _parse_json_object(output_text)
 
+    async def complete_text(
+        self,
+        *,
+        instructions: str,
+        prompt: str,
+        store: bool = False,
+    ) -> str:
+        response = await self.client.responses.create(
+            model=self.model,
+            instructions=instructions,
+            input=prompt,
+            store=store,
+        )
+        output_text = getattr(response, "output_text", None)
+        return str(output_text) if output_text is not None else _response_text(response)
+
 
 def _response_text(response: Any) -> str:
     parts: list[str] = []

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from aibrain.brain_v2 import BrainV2, BrainV2Config
+from aibrain.discord_bot_v2 import _discord_metadata, _scope_for_message
 from grillo_v2 import (
     Evidence,
     EvidenceGap,
@@ -190,3 +191,72 @@ def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
     assert brain.base_url == VERCEL_AI_GATEWAY_BASE_URL
     assert packet.scope_key == "discord:guild:1"
     assert isinstance(brain.grillo, GrilloV2Runtime)
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_respond_compiles_grillo_context_and_stores_assistant_episode(tmp_path):
+    calls = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text="yo, noted")
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=json_client,
+    )
+    brain.store.upsert_fact(
+        TemporalFact.create(
+            scope_key="discord:guild:1",
+            subject_id="discord_user:subby",
+            predicate="preferred_name",
+            object_value="Subby",
+            claim="Subby prefers being called Subby.",
+            confidence=0.9,
+        )
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1",
+        actor_id="discord_user:subby",
+        user_text="hello",
+        source="discord",
+        channel_id="bot-chat",
+    )
+    episodes = brain.store.list_recent_episodes("discord:guild:1", limit=10)
+
+    assert response == "yo, noted"
+    assert len(calls) == 1
+    assert calls[0]["model"] == "deepseek/test"
+    assert "<grillo_context" in calls[0]["input"]
+    assert "Subby prefers being called Subby." in calls[0]["input"]
+    assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+def test_discord_bot_v2_helpers_make_server_scope_and_metadata():
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    channel = SimpleNamespace(id=333, name="bot-chat")
+    author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="Npc",
+        global_name=None,
+        bot=False,
+    )
+    message = SimpleNamespace(
+        id=444,
+        guild=guild,
+        channel=channel,
+        author=author,
+        jump_url="https://discord.example/message",
+    )
+
+    assert _scope_for_message(message) == "discord:guild:222:persona:v2"
+    metadata = _discord_metadata(message)
+    assert metadata["guild_name"] == "Test Guild"
+    assert metadata["channel_name"] == "bot-chat"
+    assert metadata["author_username"] == "subsect"
+    assert metadata["author_display_name"] == "Npc"
