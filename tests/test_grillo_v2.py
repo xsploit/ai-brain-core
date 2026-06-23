@@ -11,6 +11,7 @@ from aibrain.discord_bot_v2 import (
     _discord_metadata,
     _format_backfill_results,
     _format_status,
+    _format_worker_loop_status,
     _format_worker_result,
     _scope_for_message,
 )
@@ -21,10 +22,13 @@ from grillo_v2 import (
     GrilloEntity,
     GrilloMemoryDocument,
     GrilloV2Runtime,
+    GrilloV2Worker,
+    GrilloV2WorkerConfig,
     OpinionEdge,
     SQLiteGrilloV2Store,
     TemporalFact,
     VercelAIGatewayJSONClient,
+    WorkerTickResult,
     backfill_discord_identity,
     backfill_grillo_v1,
 )
@@ -255,6 +259,61 @@ async def test_grillo_v2_worker_tick_processes_unreflected_batches(tmp_path):
     assert second.episodes == 1
     assert third.batches == 0
     assert third.notes == ["no_unprocessed_episodes"]
+
+
+@pytest.mark.asyncio
+async def test_grillo_v2_worker_loop_runs_configured_ticks():
+    calls = []
+    sleeps = []
+    tick_notes = []
+
+    class FakeRuntime:
+        async def worker_tick(self, **kwargs):
+            calls.append(kwargs)
+            return WorkerTickResult(scopes=1, batches=1, episodes=len(calls), notes=[f"tick-{len(calls)}"])
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def on_tick(result):
+        tick_notes.extend(result.notes or [])
+
+    worker = GrilloV2Worker(
+        runtime=FakeRuntime(),
+        config=GrilloV2WorkerConfig(
+            interval_seconds=2.5,
+            initial_delay_seconds=0.25,
+            scope_key="discord:guild:1:persona:v2",
+            scope_limit=7,
+            batch_size=3,
+            max_batches=2,
+        ),
+        on_tick=on_tick,
+        sleep=fake_sleep,
+    )
+
+    await worker.run_forever(max_ticks=2)
+
+    assert calls == [
+        {
+            "scope_key": "discord:guild:1:persona:v2",
+            "scope_limit": 7,
+            "batch_size": 3,
+            "max_batches": 2,
+        },
+        {
+            "scope_key": "discord:guild:1:persona:v2",
+            "scope_limit": 7,
+            "batch_size": 3,
+            "max_batches": 2,
+        },
+    ]
+    assert sleeps == [0.25, 2.5]
+    assert tick_notes == ["tick-1", "tick-2"]
+    assert worker.ticks == 2
+    assert worker.running is False
+    assert worker.last_result is not None
+    assert worker.last_result.episodes == 2
 
 
 def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
@@ -561,5 +620,16 @@ def test_brain_v2_backfill_and_status_formatting(tmp_path):
             memory_docs=1,
             invalidated_facts=0,
             notes=["ok"],
+        )
+    )
+    assert "ticks=`3`" in _format_worker_loop_status(
+        SimpleNamespace(
+            worker_enabled=True,
+            worker_task=None,
+            worker=SimpleNamespace(
+                ticks=3,
+                consecutive_errors=0,
+                last_result=WorkerTickResult(batches=1, episodes=2, notes=["ok"]),
+            ),
         )
     )

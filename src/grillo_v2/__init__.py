@@ -13,6 +13,7 @@ from .models import (
 )
 from .runtime import GrilloV2Runtime, ReflectionResult, WorkerTickResult
 from .store import SQLiteGrilloV2Store
+from .worker import GrilloV2Worker, GrilloV2WorkerConfig
 
 __all__ = [
     "Evidence",
@@ -24,6 +25,8 @@ __all__ = [
     "GrilloEpisode",
     "GrilloMemoryDocument",
     "GrilloV2Runtime",
+    "GrilloV2Worker",
+    "GrilloV2WorkerConfig",
     "OpinionEdge",
     "ReflectionResult",
     "SQLiteGrilloV2Store",

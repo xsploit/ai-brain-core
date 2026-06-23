@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import io
 import logging
 import os
@@ -9,6 +10,7 @@ from typing import Any
 
 import discord
 from discord.ext import commands
+from grillo_v2 import GrilloV2Worker, GrilloV2WorkerConfig
 
 from .brain_v2 import BrainV2, BrainV2Config
 from .env import load_env_file
@@ -38,14 +40,58 @@ class DiscordBrainV2Bot(commands.Bot):
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_MENTIONS", True)
         self.require_mention_in_guilds = _env_bool("DISCORD_BRAIN_V2_REQUIRE_MENTION_IN_GUILDS", True)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
+        self.worker_enabled = _env_bool("DISCORD_BRAIN_V2_WORKER_ENABLED", True)
+        self.worker = GrilloV2Worker(
+            runtime=self.brain_v2.grillo,
+            config=GrilloV2WorkerConfig(
+                interval_seconds=_env_float("DISCORD_BRAIN_V2_WORKER_INTERVAL_SECONDS", 60.0),
+                initial_delay_seconds=_env_float("DISCORD_BRAIN_V2_WORKER_INITIAL_DELAY_SECONDS", 15.0),
+                scope_limit=_env_int("DISCORD_BRAIN_V2_WORKER_SCOPE_LIMIT", 10),
+                batch_size=_env_int("DISCORD_BRAIN_V2_WORKER_BATCH_SIZE", 12),
+                max_batches=_env_int("DISCORD_BRAIN_V2_WORKER_MAX_BATCHES", 3),
+                max_consecutive_errors=_env_int("DISCORD_BRAIN_V2_WORKER_MAX_ERRORS", 3),
+            ),
+            on_tick=self._on_worker_tick,
+            on_error=self._on_worker_error,
+        )
+        self.worker_task: asyncio.Task | None = None
         self.add_command(_status_command(self))
         self.add_command(_context_command(self))
         self.add_command(_reflect_command(self))
         self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
 
+    async def setup_hook(self) -> None:
+        if self.worker_enabled and self.worker_task is None:
+            self.worker_task = asyncio.create_task(
+                self.worker.run_forever(),
+                name="discord-brain-v2-grillo-worker",
+            )
+
     async def on_ready(self) -> None:
         logger.info("Discord Brain v2 bot logged in as %s/%s", self.user.id if self.user else "unknown", self.user)
+
+    async def close(self) -> None:
+        if self.worker_task is not None:
+            self.worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.worker_task
+            self.worker_task = None
+        await super().close()
+
+    async def _on_worker_tick(self, result) -> None:
+        logger.info(
+            "GRILLO v2 worker tick scopes=%s batches=%s episodes=%s facts=%s memory_docs=%s notes=%s",
+            result.scopes,
+            result.batches,
+            result.episodes,
+            result.facts,
+            result.memory_docs,
+            result.notes,
+        )
+
+    async def _on_worker_error(self, error: Exception) -> None:
+        logger.error("GRILLO v2 worker error", exc_info=(type(error), error, error.__traceback__))
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is not None and message.author.id == self.user.id:
@@ -102,7 +148,10 @@ def build_brain_v2() -> BrainV2:
 def _status_command(bot: DiscordBrainV2Bot):
     @commands.command(name="status")
     async def status(ctx: commands.Context) -> None:
-        await ctx.reply(_format_status(bot.brain_v2.status()), mention_author=False)
+        await ctx.reply(
+            "\n".join([_format_status(bot.brain_v2.status()), _format_worker_loop_status(bot)]),
+            mention_author=False,
+        )
 
     return status
 
@@ -242,6 +291,19 @@ def _format_worker_result(result: Any) -> str:
     )
 
 
+def _format_worker_loop_status(bot: DiscordBrainV2Bot) -> str:
+    task = bot.worker_task
+    running = bool(task is not None and not task.done())
+    last = bot.worker.last_result
+    last_notes = ", ".join(last.notes or []) if last is not None else "none"
+    return (
+        "GRILLO v2 worker loop: "
+        f"enabled=`{bot.worker_enabled}` running=`{running}` ticks=`{bot.worker.ticks}` "
+        f"errors=`{bot.worker.consecutive_errors}` last_batches=`{getattr(last, 'batches', 0)}` "
+        f"last_episodes=`{getattr(last, 'episodes', 0)}` notes=`{last_notes}`"
+    )
+
+
 def _scope_for_message(message: discord.Message) -> str:
     if message.guild is None:
         return f"discord:dm:{message.author.id}:persona:v2"
@@ -302,6 +364,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
