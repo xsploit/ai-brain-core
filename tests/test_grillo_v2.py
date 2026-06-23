@@ -16,6 +16,9 @@ from aibrain.discord_bot_v2 import (
     _complete_jb_turn,
     _discord_metadata,
     _format_backfill_results,
+    _format_grillo_v2_facts,
+    _format_grillo_v2_memory_documents,
+    _format_grillo_v2_opinions,
     _format_status,
     _format_worker_loop_status,
     _format_worker_result,
@@ -1089,6 +1092,42 @@ def test_discord_bot_v2_uses_v1_model_select_view():
 
     assert "current model: `deepseek/current`" in view.message_text()
     assert view.choices[0].id == "deepseek/current"
+
+
+def test_discord_bot_v2_formats_grillo_diagnostics():
+    fact = TemporalFact.create(
+        scope_key="discord:guild:1:persona:v2",
+        subject_id="discord_user:subby",
+        predicate="preferred_name",
+        object_value="Subby",
+        claim="Subby prefers being called Subby.",
+        confidence=0.91,
+    )
+    document = GrilloMemoryDocument.create(
+        scope_key="discord:guild:1:persona:v2",
+        document_type="diary",
+        title="Recent reflection",
+        body="I noticed Subby cares about context continuity.",
+    )
+    edge = OpinionEdge.create(
+        scope_key="discord:guild:1:persona:v2",
+        source_id="neuro-sama-v2",
+        target_id="discord_user:subby",
+        relation="trust",
+        score=0.75,
+        rationale="Subby corrected a memory bug.",
+    )
+
+    facts = _format_grillo_v2_facts([fact])
+    documents = _format_grillo_v2_memory_documents([document])
+    opinions = _format_grillo_v2_opinions([edge])
+
+    assert "preferred_name" in facts
+    assert "Subby prefers being called Subby." in facts
+    assert "Recent reflection" in documents
+    assert "context continuity" in documents
+    assert "trust" in opinions
+    assert "+0.75" in opinions
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):

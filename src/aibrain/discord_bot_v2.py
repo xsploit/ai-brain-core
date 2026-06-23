@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from contextlib import suppress
+from dataclasses import asdict, is_dataclass
 import io
 import json
 import logging
@@ -113,6 +114,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_pause_command(self))
         self.add_command(_resume_command(self))
         self.add_command(_bot_control_group(self))
+        self.add_command(_grillo_control_group(self))
+        self.add_command(_ladybug_control_group(self))
         self.add_command(_reflect_command(self))
         self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
@@ -354,6 +357,8 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
                     "`!pause` / `!resume` - admin/owner normal reply control",
                     "`!bot toggle` - admin/owner bot-to-bot reply control",
+                    "`!grillo` / `!grillo facts/memory/relationships/export` - owner memory diagnostics",
+                    "`!ladybug search/relationships/export` - owner graph diagnostics",
                     f"`{prefix} status` - show v2 model and GRILLO counts",
                     f"`{prefix} context [query]` - owner-only context packet export",
                     f"`{prefix} reflect [limit]` - owner-only reflection pass",
@@ -674,6 +679,123 @@ def _tts_control_group(bot: DiscordBrainV2Bot):
     return tts_control
 
 
+def _grillo_control_group(bot: DiscordBrainV2Bot):
+    @commands.group(name="grillo", invoke_without_command=True)
+    async def grillo(ctx: commands.Context) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        await ctx.reply(
+            "\n".join([_format_status(bot.brain_v2.status()), _format_worker_loop_status(bot)]),
+            mention_author=False,
+        )
+
+    @grillo.command(name="context", aliases=["ctx", "debug"])
+    async def grillo_context(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        await _send_grillo_context_packet(bot, ctx, query=query)
+
+    @grillo.command(name="facts")
+    async def grillo_facts(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        facts = bot.brain_v2.store.list_active_facts(
+            _scope_for_message(ctx.message),
+            subject_id=_actor_id(ctx.author),
+            query=query,
+            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_FACT_LIMIT", 12),
+        )
+        await ctx.reply(_format_grillo_v2_facts(facts), mention_author=False)
+
+    @grillo.command(name="memory", aliases=["diary", "docs", "slots"])
+    async def grillo_memory(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        documents = bot.brain_v2.store.list_memory_documents(
+            _scope_for_message(ctx.message),
+            subject_id=_actor_id(ctx.author),
+            query=query,
+            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_MEMORY_LIMIT", 12),
+        )
+        await ctx.reply(_format_grillo_v2_memory_documents(documents), mention_author=False)
+
+    @grillo.command(name="relationships", aliases=["relationship", "opinions"])
+    async def grillo_relationships(ctx: commands.Context) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        edges = bot.brain_v2.store.list_opinion_edges(
+            _scope_for_message(ctx.message),
+            source_id=bot.brain_v2.config.persona_id,
+            target_id=_actor_id(ctx.author),
+            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_OPINION_LIMIT", 12),
+        )
+        await ctx.reply(_format_grillo_v2_opinions(edges), mention_author=False)
+
+    @grillo.command(name="export")
+    async def grillo_export(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        await _send_grillo_v2_export(bot, ctx, query=query)
+
+    return grillo
+
+
+def _ladybug_control_group(bot: DiscordBrainV2Bot):
+    @commands.group(name="ladybug", invoke_without_command=True)
+    async def ladybug(ctx: commands.Context) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        await ctx.reply(
+            "Ladybug-compatible V2 graph view. Use `!ladybug search <query>`, `!ladybug relationships`, or `!ladybug export`.",
+            mention_author=False,
+        )
+
+    @ladybug.command(name="search")
+    async def ladybug_search(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        query = query.strip()
+        if not query:
+            await ctx.reply("usage: `!ladybug search <query>`", mention_author=False)
+            return
+        facts = bot.brain_v2.store.search_facts(
+            _scope_for_message(ctx.message),
+            query,
+            limit=_env_int("DISCORD_BRAIN_V2_LADYBUG_SEARCH_LIMIT", 12),
+        )
+        await ctx.reply(_format_grillo_v2_facts(facts), mention_author=False)
+
+    @ladybug.command(name="relationships", aliases=["relationship", "rel", "profile"])
+    async def ladybug_relationships(ctx: commands.Context) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        edges = bot.brain_v2.store.list_opinion_edges(
+            _scope_for_message(ctx.message),
+            source_id=bot.brain_v2.config.persona_id,
+            target_id=_actor_id(ctx.author),
+            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_OPINION_LIMIT", 12),
+        )
+        await ctx.reply(_format_grillo_v2_opinions(edges), mention_author=False)
+
+    @ladybug.command(name="export")
+    async def ladybug_export(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        await _send_grillo_v2_export(bot, ctx, query=query, filename="ladybug-v2-graph-export.json")
+
+    return ladybug
+
+
 async def _send_tts_voice_message(bot: DiscordBrainV2Bot, ctx: commands.Context, text: str) -> None:
     text = text.strip()
     if not text:
@@ -695,6 +817,61 @@ async def _send_tts_voice_message(bot: DiscordBrainV2Bot, ctx: commands.Context,
         clip = await build_discord_voice_clip(brain, text, voice=bot.tts_voice)
         await send_discord_voice_message(ctx.channel.id, bot.discord_token, clip)
     await ctx.reply("sent voice clip.", mention_author=False)
+
+
+async def _send_grillo_context_packet(bot: DiscordBrainV2Bot, ctx: commands.Context, *, query: str = "") -> None:
+    packet = bot.brain_v2.build_context_packet(
+        scope_key=_scope_for_message(ctx.message),
+        actor_id=_actor_id(ctx.author),
+        query=query or _message_text(ctx.message),
+        channel_id=str(ctx.channel.id),
+    )
+    content = packet.as_prompt_text()
+    if len(content) <= 1800:
+        await ctx.reply(f"```xml\n{content}\n```", mention_author=False)
+        return
+    data = io.BytesIO(content.encode("utf-8", errors="replace"))
+    await ctx.reply(
+        "GRILLO v2 context packet",
+        file=discord.File(data, filename="grillo-v2-context.xml"),
+        mention_author=False,
+    )
+
+
+async def _send_grillo_v2_export(
+    bot: DiscordBrainV2Bot,
+    ctx: commands.Context,
+    *,
+    query: str = "",
+    filename: str = "grillo-v2-export.json",
+) -> None:
+    scope = _scope_for_message(ctx.message)
+    actor = _actor_id(ctx.author)
+    packet = bot.brain_v2.build_context_packet(
+        scope_key=scope,
+        actor_id=actor,
+        query=query or _message_text(ctx.message),
+        channel_id=str(ctx.channel.id),
+    )
+    payload = {
+        "scope_key": scope,
+        "actor_id": actor,
+        "counts": bot.brain_v2.store.counts(),
+        "context_packet": _object_payload(packet),
+        "active_facts": [_object_payload(fact) for fact in bot.brain_v2.store.list_active_facts(scope, subject_id=actor, query=query, limit=50)],
+        "memory_documents": [_object_payload(document) for document in bot.brain_v2.store.list_memory_documents(scope, subject_id=actor, query=query, limit=50)],
+        "opinion_edges": [
+            _object_payload(edge)
+            for edge in bot.brain_v2.store.list_opinion_edges(scope, source_id=bot.brain_v2.config.persona_id, target_id=actor, limit=50)
+        ],
+        "recent_episodes": [_object_payload(episode) for episode in bot.brain_v2.store.list_recent_episodes(scope, actor_id=actor, limit=50)],
+    }
+    data = io.BytesIO(json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8"))
+    await ctx.reply(
+        "GRILLO v2 graph export",
+        file=discord.File(data, filename=filename),
+        mention_author=False,
+    )
 
 
 def _pause_command(bot: DiscordBrainV2Bot):
@@ -925,6 +1102,55 @@ def _format_worker_loop_status(bot: DiscordBrainV2Bot) -> str:
     )
 
 
+def _format_grillo_v2_facts(facts: list[Any]) -> str:
+    if not facts:
+        return "no active GRILLO v2 facts."
+    lines = ["GRILLO v2 active facts:"]
+    for fact in facts:
+        lines.append(
+            f"- `{getattr(fact, 'confidence', 0.0):.2f}` "
+            f"{getattr(fact, 'subject_id', 'unknown')} --{getattr(fact, 'predicate', 'related_to')}-> "
+            f"{getattr(fact, 'object_value', '')}: {getattr(fact, 'claim', '')}"
+        )
+    return "\n".join(lines)[:1900]
+
+
+def _format_grillo_v2_memory_documents(documents: list[Any]) -> str:
+    if not documents:
+        return "no GRILLO v2 memory documents."
+    lines = ["GRILLO v2 memory documents:"]
+    for document in documents:
+        body = " ".join(str(getattr(document, "body", "")).split())
+        lines.append(
+            f"- `{getattr(document, 'document_type', 'memory')}` "
+            f"{getattr(document, 'title', getattr(document, 'memory_id', 'memory'))}: {body[:240]}"
+        )
+    return "\n".join(lines)[:1900]
+
+
+def _format_grillo_v2_opinions(edges: list[Any]) -> str:
+    if not edges:
+        return "no GRILLO v2 opinion/relationship edges."
+    lines = ["GRILLO v2 opinion edges:"]
+    for edge in edges:
+        lines.append(
+            f"- `{getattr(edge, 'score', 0.0):+.2f}` "
+            f"{getattr(edge, 'source_id', 'unknown')} --{getattr(edge, 'relation', 'related_to')}-> "
+            f"{getattr(edge, 'target_id', 'unknown')}: {getattr(edge, 'rationale', '')}"
+        )
+    return "\n".join(lines)[:1900]
+
+
+def _object_payload(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return value
+    return str(value)
+
+
 def _build_command_prefix(command_prefix_text: str):
     direct_prefix_commands = (
         "help",
@@ -941,6 +1167,8 @@ def _build_command_prefix(command_prefix_text: str):
         "resume",
         "unpause",
         "bot",
+        "grillo",
+        "ladybug",
     )
 
     def command_prefix(bot: commands.Bot, message: discord.Message):
