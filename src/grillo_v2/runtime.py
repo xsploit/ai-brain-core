@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .context import GrilloContextBuilder
-from .models import Evidence, EvidenceGap, GrilloEpisode, GrilloMemoryDocument, OpinionEdge, TemporalFact, from_json_dict
+from .models import GrilloEpisode, from_json_dict
 from .store import SQLiteGrilloV2Store
+from .tools import GRILLO_V2_MEMORY_TOOL_NAMES, apply_memory_tool_calls, legacy_payload_tool_calls
 
 
 ReflectionCompletion = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -21,6 +22,8 @@ class ReflectionResult:
     opinions: int = 0
     memory_docs: int = 0
     invalidated_facts: int = 0
+    tool_calls: int = 0
+    ignored_tool_calls: int = 0
     notes: str = ""
 
 
@@ -34,6 +37,8 @@ class WorkerTickResult:
     opinions: int = 0
     memory_docs: int = 0
     invalidated_facts: int = 0
+    tool_calls: int = 0
+    ignored_tool_calls: int = 0
     notes: list[str] | None = None
 
     def add(self, result: ReflectionResult) -> None:
@@ -44,6 +49,8 @@ class WorkerTickResult:
         self.opinions += result.opinions
         self.memory_docs += result.memory_docs
         self.invalidated_facts += result.invalidated_facts
+        self.tool_calls += result.tool_calls
+        self.ignored_tool_calls += result.ignored_tool_calls
         if result.notes:
             if self.notes is None:
                 self.notes = []
@@ -112,6 +119,7 @@ class GrilloV2Runtime:
                 "scope_key": scope_key,
                 "actor_id": actor_id,
                 "persona_id": self.persona_id,
+                "available_tools": GRILLO_V2_MEMORY_TOOL_NAMES,
                 "context_packet": packet.as_prompt_text(),
                 "episodes": [_episode_payload(episode) for episode in episodes],
             }
@@ -153,6 +161,7 @@ class GrilloV2Runtime:
                 "cursor_key": cursor_key,
                 "cursor": cursor,
                 "persona_id": self.persona_id,
+                "available_tools": GRILLO_V2_MEMORY_TOOL_NAMES,
                 "context_packet": packet.as_prompt_text(),
                 "episodes": [_episode_payload(episode) for episode in episodes],
             }
@@ -201,92 +210,23 @@ class GrilloV2Runtime:
 
     def apply_reflection(self, *, scope_key: str, payload: dict[str, Any]) -> ReflectionResult:
         result = ReflectionResult(notes=str(payload.get("notes") or ""))
-        for item in _list(payload.get("evidence")):
-            evidence = Evidence.create(
-                scope_key=scope_key,
-                episode_id=str(item.get("episode_id") or ""),
-                quote=str(item.get("quote") or ""),
-                extractor=str(item.get("extractor") or "grillo_v2"),
-                confidence=_float(item.get("confidence"), 0.5),
-                metadata=_dict(item.get("metadata")),
-            )
-            if item.get("evidence_id"):
-                evidence.evidence_id = str(item["evidence_id"])
-            if evidence.episode_id and evidence.quote:
-                self.store.append_evidence(evidence)
-                result.evidence += 1
-        for item in _list(payload.get("facts")):
-            fact = TemporalFact.create(
-                scope_key=scope_key,
-                subject_id=str(item.get("subject_id") or item.get("subject") or ""),
-                predicate=str(item.get("predicate") or ""),
-                object_value=str(item.get("object") or item.get("object_value") or ""),
-                claim=str(item.get("claim") or ""),
-                evidence_ids=[str(value) for value in _list(item.get("evidence_ids"))],
-                confidence=_float(item.get("confidence"), 0.5),
-                valid_from=str(item.get("valid_from") or "") or None,
-                valid_to=str(item.get("valid_to") or "") or None,
-                contradicts=[str(value) for value in _list(item.get("contradicts"))],
-                missing_evidence=[
-                    EvidenceGap(
-                        question=str(gap.get("question") or ""),
-                        why=str(gap.get("why") or ""),
-                        needed=str(gap.get("needed") or ""),
-                    )
-                    for gap in _list(item.get("missing_evidence"))
-                    if isinstance(gap, dict)
-                ],
-                metadata=_dict(item.get("metadata")),
-            )
-            if item.get("fact_id"):
-                fact.fact_id = str(item["fact_id"])
-            if fact.subject_id and fact.predicate and fact.claim:
-                self.store.upsert_fact(fact)
-                result.facts += 1
-        for item in _list(payload.get("opinion_edges")):
-            edge = OpinionEdge.create(
-                scope_key=scope_key,
-                source_id=str(item.get("source_id") or self.persona_id),
-                target_id=str(item.get("target_id") or ""),
-                relation=str(item.get("relation") or ""),
-                score=_float(item.get("score"), 0.0),
-                rationale=str(item.get("rationale") or ""),
-                evidence_ids=[str(value) for value in _list(item.get("evidence_ids"))],
-                metadata=_dict(item.get("metadata")),
-            )
-            if item.get("edge_id"):
-                edge.edge_id = str(item["edge_id"])
-            if edge.source_id and edge.target_id and edge.relation:
-                self.store.upsert_opinion_edge(edge)
-                result.opinions += 1
-        for item in _list(payload.get("memory_documents")):
-            document = GrilloMemoryDocument.create(
-                scope_key=scope_key,
-                document_type=str(item.get("document_type") or item.get("type") or ""),
-                subject_id=str(item.get("subject_id") or item.get("subject") or "") or None,
-                title=str(item.get("title") or ""),
-                body=str(item.get("body") or item.get("content") or ""),
-                evidence_ids=[str(value) for value in _list(item.get("evidence_ids"))],
-                importance=_float(item.get("importance"), 0.5),
-                metadata=_dict(item.get("metadata")),
-            )
-            if item.get("memory_id"):
-                document.memory_id = str(item["memory_id"])
-            if document.document_type and document.title and document.body:
-                self.store.upsert_memory_document(document)
-                result.memory_docs += 1
-        for item in _list(payload.get("invalidate_facts")):
-            fact_id = str(item.get("fact_id") or "") if isinstance(item, dict) else str(item)
-            if fact_id:
-                valid_to = None
-                if isinstance(item, dict) and item.get("valid_to"):
-                    valid_to = str(item["valid_to"])
-                self.store.invalidate_fact(
-                    fact_id,
-                    valid_to=valid_to,
-                    contradicts=[str(value) for value in _list(item.get("contradicts"))] if isinstance(item, dict) else [],
-                )
-                result.invalidated_facts += 1
+        tool_result = apply_memory_tool_calls(
+            store=self.store,
+            scope_key=scope_key,
+            persona_id=self.persona_id,
+            tool_calls=[*legacy_payload_tool_calls(payload), *_list(payload.get("tool_calls"))],
+        )
+        result.tool_calls = tool_result.tool_calls
+        result.evidence = tool_result.evidence
+        result.facts = tool_result.facts
+        result.opinions = tool_result.opinions
+        result.memory_docs = tool_result.memory_docs
+        result.invalidated_facts = tool_result.invalidated_facts
+        result.ignored_tool_calls = tool_result.ignored
+        if tool_result.notes:
+            notes = [result.notes] if result.notes else []
+            notes.extend(tool_result.notes)
+            result.notes = "; ".join(notes)
         return result
 
 
@@ -301,8 +241,17 @@ GRILLO_V2_REFLECTION_SCHEMA: dict[str, Any] = {
             "opinion_edges": {"type": "array"},
             "memory_documents": {"type": "array"},
             "invalidate_facts": {"type": "array"},
+            "tool_calls": {"type": "array"},
         },
-        "required": ["notes", "evidence", "facts", "opinion_edges", "memory_documents", "invalidate_facts"],
+        "required": [
+            "notes",
+            "evidence",
+            "facts",
+            "opinion_edges",
+            "memory_documents",
+            "invalidate_facts",
+            "tool_calls",
+        ],
     },
 }
 

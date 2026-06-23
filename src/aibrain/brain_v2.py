@@ -217,6 +217,8 @@ GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(
         "You are GRILLO v2, a background memory worker for a persistent AI companion.",
         "You are not writing a chat reply.",
         "Extract only evidence-backed memory from the provided episodes.",
+        "Prefer tool_calls for memory writes. Each tool call is {name, arguments}.",
+        "Available tools: record_evidence, upsert_fact, upsert_opinion_edge, upsert_memory_document, invalidate_fact.",
         "Write temporal facts with subject, predicate, object, claim, confidence, valid_from, and evidence_ids.",
         "Write opinion_edges only as computed relationship state from the persona to an entity.",
         "Write memory_documents for durable diary/profile/slot/procedural context that should be pinned into future prompts.",

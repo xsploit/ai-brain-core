@@ -13,6 +13,7 @@ from .models import (
 )
 from .runtime import GrilloV2Runtime, ReflectionResult, WorkerTickResult
 from .store import SQLiteGrilloV2Store
+from .tools import GRILLO_V2_MEMORY_TOOL_NAMES, GrilloMemoryToolResult, apply_memory_tool_calls, legacy_payload_tool_calls
 from .worker import GrilloV2Worker, GrilloV2WorkerConfig
 
 __all__ = [
@@ -24,15 +25,19 @@ __all__ = [
     "GrilloEntity",
     "GrilloEpisode",
     "GrilloMemoryDocument",
+    "GrilloMemoryToolResult",
     "GrilloV2Runtime",
     "GrilloV2Worker",
     "GrilloV2WorkerConfig",
+    "GRILLO_V2_MEMORY_TOOL_NAMES",
     "OpinionEdge",
     "ReflectionResult",
     "SQLiteGrilloV2Store",
     "TemporalFact",
     "VercelAIGatewayJSONClient",
     "WorkerTickResult",
+    "apply_memory_tool_calls",
     "backfill_discord_identity",
     "backfill_grillo_v1",
+    "legacy_payload_tool_calls",
 ]

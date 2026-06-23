@@ -190,6 +190,7 @@ async def test_grillo_v2_reflection_worker_writes_evidence_facts_and_opinions(tm
                 }
             ],
             "invalidate_facts": [],
+            "tool_calls": [],
         }
 
     runtime = GrilloV2Runtime(store=store, completion=completion, persona_id="persona:neuro")
@@ -210,6 +211,108 @@ async def test_grillo_v2_reflection_worker_writes_evidence_facts_and_opinions(tm
     assert packet.relationship_state[0]["id"] == "opinion:trust-subby"
     assert packet.memory_blocks[0]["id"] == "memory:diary-subby-temporal"
     assert "not a flat log" in packet.as_prompt_text()
+
+
+def test_grillo_v2_reflection_accepts_memory_tool_calls(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    episode = store.append_episode(
+        GrilloEpisode.create(
+            scope_key="discord:guild:1",
+            source="discord",
+            actor_id="discord_user:subby",
+            content="Subby wants GRILLO to use memory tools.",
+        )
+    )
+    old_fact = TemporalFact.create(
+        scope_key="discord:guild:1",
+        subject_id="discord_user:subby",
+        predicate="memory_architecture",
+        object_value="flat log",
+        claim="Subby wants a flat log memory.",
+    )
+    old_fact.fact_id = "fact:old-flat-log"
+    store.upsert_fact(old_fact)
+    runtime = GrilloV2Runtime(store=store, persona_id="persona:neuro")
+
+    result = runtime.apply_reflection(
+        scope_key="discord:guild:1",
+        payload={
+            "notes": "tool path",
+            "evidence": [],
+            "facts": [],
+            "opinion_edges": [],
+            "memory_documents": [],
+            "invalidate_facts": [],
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "record_evidence",
+                        "arguments": json.dumps(
+                            {
+                                "evidence_id": "evidence:tool",
+                                "episode_id": episode.episode_id,
+                                "quote": "use memory tools",
+                                "confidence": 0.91,
+                            }
+                        ),
+                    }
+                },
+                {
+                    "name": "upsert_fact",
+                    "arguments": {
+                        "fact_id": "fact:tool-memory",
+                        "subject_id": "discord_user:subby",
+                        "predicate": "prefers_memory_protocol",
+                        "object": "tool calls",
+                        "claim": "Subby wants GRILLO to use memory tool calls.",
+                        "evidence_ids": ["evidence:tool"],
+                        "confidence": 0.9,
+                    },
+                },
+                {
+                    "name": "upsert_opinion_edge",
+                    "arguments": {
+                        "edge_id": "opinion:tool-trust",
+                        "target_id": "discord_user:subby",
+                        "relation": "collaboration",
+                        "score": 0.8,
+                        "rationale": "The user is steering the memory protocol.",
+                        "evidence_ids": ["evidence:tool"],
+                    },
+                },
+                {
+                    "name": "upsert_memory_document",
+                    "arguments": {
+                        "memory_id": "memory:tool-diary",
+                        "document_type": "diary",
+                        "subject_id": "discord_user:subby",
+                        "title": "Tool protocol",
+                        "body": "I should use explicit memory tool calls when reflecting.",
+                        "evidence_ids": ["evidence:tool"],
+                        "importance": 0.86,
+                    },
+                },
+                {"name": "invalidate_fact", "arguments": {"fact_id": "fact:old-flat-log"}},
+            ],
+        },
+    )
+    packet = runtime.build_context_packet(
+        scope_key="discord:guild:1",
+        actor_id="discord_user:subby",
+        query="memory tools",
+    )
+
+    assert result.tool_calls == 5
+    assert result.evidence == 1
+    assert result.facts == 1
+    assert result.opinions == 1
+    assert result.memory_docs == 1
+    assert result.invalidated_facts == 1
+    assert result.ignored_tool_calls == 0
+    assert packet.active_facts[0]["id"] == "fact:tool-memory"
+    assert packet.relationship_state[0]["id"] == "opinion:tool-trust"
+    assert packet.memory_blocks[0]["id"] == "memory:tool-diary"
+    assert "fact:old-flat-log" not in packet.as_prompt_text()
 
 
 @pytest.mark.asyncio
@@ -239,6 +342,7 @@ async def test_grillo_v2_worker_tick_processes_unreflected_batches(tmp_path):
             "opinion_edges": [],
             "memory_documents": [],
             "invalidate_facts": [],
+            "tool_calls": [],
         }
 
     runtime = GrilloV2Runtime(store=store, completion=completion, persona_id="persona:neuro")
@@ -331,6 +435,7 @@ def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
                         "opinion_edges": [],
                         "memory_documents": [],
                         "invalidate_facts": [],
+                        "tool_calls": [],
                     }
                 )
             )

@@ -199,6 +199,7 @@ def _reflect_command(bot: DiscordBrainV2Bot):
             "GRILLO v2 reflection: "
             f"episodes=`{result.episodes}` evidence=`{result.evidence}` facts=`{result.facts}` "
             f"opinions=`{result.opinions}` memory_docs=`{result.memory_docs}` "
+            f"tool_calls=`{result.tool_calls}` ignored_tools=`{result.ignored_tool_calls}` "
             f"invalidated=`{result.invalidated_facts}` notes=`{result.notes}`",
             mention_author=False,
         )
@@ -286,7 +287,8 @@ def _format_worker_result(result: Any) -> str:
         f"scopes=`{getattr(result, 'scopes', 0)}` batches=`{getattr(result, 'batches', 0)}` "
         f"episodes=`{getattr(result, 'episodes', 0)}` evidence=`{getattr(result, 'evidence', 0)}` "
         f"facts=`{getattr(result, 'facts', 0)}` opinions=`{getattr(result, 'opinions', 0)}` "
-        f"memory_docs=`{getattr(result, 'memory_docs', 0)}` "
+        f"memory_docs=`{getattr(result, 'memory_docs', 0)}` tool_calls=`{getattr(result, 'tool_calls', 0)}` "
+        f"ignored_tools=`{getattr(result, 'ignored_tool_calls', 0)}` "
         f"invalidated=`{getattr(result, 'invalidated_facts', 0)}` notes=`{notes}`"
     )
 
