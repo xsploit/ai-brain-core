@@ -444,6 +444,76 @@ def test_discord_prompt_includes_reply_target_context(monkeypatch):
     assert "Karah" in prompt
     assert "should I move the model dropdown into a paginated UI?" in prompt
     assert "Interpret short responses like yes/no/yep/nope/that one" in prompt
+    assert "Current Discord message from Subsect (author_id=123):\nyep" in prompt
+
+
+def test_discord_prompt_distinguishes_current_speaker_from_replied_exchange(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    original = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    original.id = 555
+    original.guild = SimpleNamespace(id=222, name="Test Guild")
+    original.channel = channel
+    original.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    original.content = "are you using IST or PDT?"
+    original.clean_content = original.content
+    neuro_reply = _fake_message(datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc))
+    neuro_reply.id = 777
+    neuro_reply.guild = original.guild
+    neuro_reply.channel = channel
+    neuro_reply.author = SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True)
+    neuro_reply.content = "you are IST, GMT+5:30, obviously."
+    neuro_reply.clean_content = neuro_reply.content
+    neuro_reply.reference = SimpleNamespace(message_id=original.id, resolved=original)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = original.guild
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=neuro_reply.id, resolved=neuro_reply)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "PDT"))
+
+    assert "Neuro-sama (bot): you are IST, GMT+5:30, obviously." in prompt
+    assert "The replied-to message was itself replying to Karah (author_id=456)." in prompt
+    assert "Current speaker is Subsect (author_id=123)" in prompt
+    assert "Current Discord message from Subsect (author_id=123):\nPDT" in prompt
+
+
+def test_discord_prompt_uses_recent_cache_for_bot_reply_addressee(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    original = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    original.id = 555
+    original.guild = SimpleNamespace(id=222, name="Test Guild")
+    original.channel = channel
+    original.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    sent_neuro_message = SimpleNamespace(
+        id=777,
+        created_at=datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc),
+        author=SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True),
+        content="you are IST, GMT+5:30, obviously.",
+        clean_content="you are IST, GMT+5:30, obviously.",
+    )
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = original.guild
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=sent_neuro_message.id, resolved=sent_neuro_message)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot._connection = SimpleNamespace(user=sent_neuro_message.author)
+    bot._record_recent_assistant(original, sent_neuro_message.content, sent_message=sent_neuro_message)
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "PDT"))
+
+    assert "The replied-to message was itself replying to Karah (author_id=456)." in prompt
+    assert "Current speaker is Subsect (author_id=123)" in prompt
 
 
 def test_discord_prompt_notes_unresolved_reply_target(monkeypatch):

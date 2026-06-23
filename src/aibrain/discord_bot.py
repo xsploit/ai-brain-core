@@ -347,7 +347,44 @@ def _discord_message_metadata(message: discord.Message) -> dict[str, Any]:
     }
 
 
-def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
+def _reply_target_context(
+    message: discord.Message,
+    *,
+    recent_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    reference = getattr(message, "reference", None)
+    if reference is None:
+        return None
+    resolved = None
+    for attr in ("resolved", "cached_message"):
+        candidate = getattr(reference, attr, None)
+        if candidate is not None:
+            resolved = candidate
+            break
+    message_id = getattr(reference, "message_id", None)
+    if resolved is None:
+        return {"message_id": message_id} if message_id is not None else None
+    author = getattr(resolved, "author", None)
+    created_at = getattr(resolved, "created_at", None)
+    target = {
+        "message_id": getattr(resolved, "id", None) or message_id,
+        "author": _display_name(author) if author is not None else "unknown",
+        "author_id": getattr(author, "id", None),
+        "author_is_bot": bool(getattr(author, "bot", False)),
+        "content": _message_text(resolved)[:1500],
+        "created_at": created_at.isoformat() if created_at else None,
+        "jump_url": getattr(resolved, "jump_url", None),
+    }
+    reply_source = _message_reply_source_context(resolved)
+    if reply_source is None:
+        cached = _recent_message_by_id(recent_messages or [], target["message_id"])
+        reply_source = _recent_reply_source_context(cached)
+    if reply_source is not None:
+        target["reply_to"] = reply_source
+    return target
+
+
+def _message_reply_source_context(message: Any) -> dict[str, Any] | None:
     reference = getattr(message, "reference", None)
     if reference is None:
         return None
@@ -367,9 +404,32 @@ def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
         "author": _display_name(author) if author is not None else "unknown",
         "author_id": getattr(author, "id", None),
         "author_is_bot": bool(getattr(author, "bot", False)),
-        "content": _message_text(resolved)[:1500],
+        "content": _message_text(resolved)[:1000],
         "created_at": created_at.isoformat() if created_at else None,
-        "jump_url": getattr(resolved, "jump_url", None),
+    }
+
+
+def _recent_message_by_id(recent_messages: list[dict[str, Any]], message_id: Any) -> dict[str, Any] | None:
+    if message_id is None:
+        return None
+    for item in reversed(recent_messages):
+        if item.get("message_id") == message_id:
+            return item
+    return None
+
+
+def _recent_reply_source_context(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not item:
+        return None
+    reply_to_message_id = item.get("reply_to_message_id")
+    reply_to_author_id = item.get("reply_to_author_id")
+    if reply_to_message_id is None and reply_to_author_id is None:
+        return None
+    return {
+        "message_id": reply_to_message_id,
+        "author": item.get("reply_to_author"),
+        "author_id": reply_to_author_id,
+        "author_is_bot": bool(item.get("reply_to_author_is_bot", False)),
     }
 
 
@@ -392,7 +452,7 @@ def _discord_metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
 def _message_text(message: discord.Message) -> str:
     content = _message_content_text(message)
     attachments = []
-    for attachment in message.attachments:
+    for attachment in getattr(message, "attachments", None) or []:
         if _is_voice_message_attachment(attachment):
             attachments.append(_voice_attachment_summary(attachment))
         else:
@@ -2103,35 +2163,55 @@ class DiscordBrainBot(commands.Bot):
     def _record_recent(self, message: discord.Message) -> None:
         scope = _scope_for_message(message)
         recent = self.recent_by_scope.setdefault(scope, [])
+        reply_source = _message_reply_source_context(message)
         if not getattr(message.author, "bot", False) and hasattr(message.channel, "send"):
             self.heartbeat_last_channel = message.channel
             self.heartbeat_last_channel_id = getattr(message.channel, "id", None)
-        recent.append(
-            {
-                "author": _display_name(message.author),
-                "author_id": message.author.id,
-                "author_is_bot": bool(getattr(message.author, "bot", False)),
-                "message_id": getattr(message, "id", None),
-                "content": _message_text(message)[:1000],
-                "created_at": message.created_at.isoformat() if message.created_at else None,
-            }
-        )
+        item = {
+            "author": _display_name(message.author),
+            "author_id": message.author.id,
+            "author_is_bot": bool(getattr(message.author, "bot", False)),
+            "message_id": getattr(message, "id", None),
+            "content": _message_text(message)[:1000],
+            "created_at": message.created_at.isoformat() if message.created_at else None,
+        }
+        if reply_source is not None:
+            item.update(
+                {
+                    "reply_to_message_id": reply_source.get("message_id"),
+                    "reply_to_author": reply_source.get("author"),
+                    "reply_to_author_id": reply_source.get("author_id"),
+                    "reply_to_author_is_bot": bool(reply_source.get("author_is_bot", False)),
+                }
+            )
+        recent.append(item)
         del recent[:-12]
 
-    def _record_recent_assistant(self, message: discord.Message, text: str) -> None:
+    def _record_recent_assistant(
+        self,
+        message: discord.Message,
+        text: str,
+        *,
+        sent_message: discord.Message | None = None,
+    ) -> None:
         if not text.strip():
             return
         scope = _scope_for_message(message)
         recent = self.recent_by_scope.setdefault(scope, [])
         author = getattr(self, "user", None)
+        created_at = getattr(sent_message, "created_at", None) or datetime.now(timezone.utc)
         recent.append(
             {
                 "author": _display_name(author) if author is not None else getattr(self.persona, "name", "assistant"),
                 "author_id": getattr(author, "id", None),
                 "author_is_bot": True,
-                "message_id": None,
+                "message_id": getattr(sent_message, "id", None),
                 "content": text[:1000],
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": created_at.isoformat() if created_at else None,
+                "reply_to_message_id": getattr(message, "id", None),
+                "reply_to_author": _display_name(message.author),
+                "reply_to_author_id": getattr(message.author, "id", None),
+                "reply_to_author_is_bot": bool(getattr(message.author, "bot", False)),
             }
         )
         del recent[:-12]
@@ -2141,7 +2221,7 @@ class DiscordBrainBot(commands.Bot):
         persona = getattr(self, "persona", None)
         grillo_scope = _grillo_scope_for_message(message, getattr(persona, "id", None))
         metadata = _discord_message_metadata(message)
-        return {
+        context = {
             "scope": scope,
             "channel_scope": scope,
             "grillo_scope": grillo_scope,
@@ -2155,8 +2235,9 @@ class DiscordBrainBot(commands.Bot):
             "discord_metadata": metadata,
             **_time_context(message.created_at),
             "recent_messages": self.recent_by_scope.get(scope, [])[-8:],
-            "reply_target": _reply_target_context(message),
         }
+        context["reply_target"] = _reply_target_context(message, recent_messages=context["recent_messages"])
+        return context
 
     async def _remember_text(self, scope: str, author_id: int, content: str, *, source: str):
         state = await self.brain.open_thread(thread_id=scope, persona=self.persona)
@@ -2723,8 +2804,8 @@ class DiscordBrainBot(commands.Bot):
                     final_text = retry_buffer.strip()
                     if not final_text:
                         raise RuntimeError("model returned an empty response after retry")
-                await self._send_final_reply(message, final_text)
-                self._record_recent_assistant(message, final_text)
+                sent_message = await self._send_final_reply(message, final_text)
+                self._record_recent_assistant(message, final_text, sent_message=sent_message)
                 await self._maybe_send_tts_reply(message, final_text)
                 if record_grillo:
                     self._schedule_grillo_ingest(message, grillo_scope, memory_text, final_text)
@@ -2783,7 +2864,13 @@ class DiscordBrainBot(commands.Bot):
     ) -> str:
         discord_context = self._context_for_message(message)
         metadata_block = "\n".join(_discord_metadata_prompt_lines(discord_context["discord_metadata"]))
-        reply_target_block = "\n".join(_reply_target_prompt_lines(discord_context.get("reply_target")))
+        reply_target_block = "\n".join(
+            _reply_target_prompt_lines(
+                discord_context.get("reply_target"),
+                current_author=discord_context.get("author"),
+                current_author_id=discord_context.get("author_id"),
+            )
+        )
         recent_block = "\n".join(
             _recent_messages_prompt_lines(
                 discord_context.get("recent_messages", []),
@@ -2794,6 +2881,11 @@ class DiscordBrainBot(commands.Bot):
         recent_section = f"{recent_block}\n\n" if recent_block else ""
         codex_block = "\n".join(self._codex_bridge_updates_for_message(message))
         codex_section = f"{codex_block}\n\n" if codex_block else ""
+        current_message = (
+            f"Current Discord message from {discord_context['author']} "
+            f"(author_id={discord_context['author_id']}):\n"
+            f"{user_text}"
+        )
         prompt = (
             f"Discord message from {_display_name(message.author)} in "
             f"{discord_context['guild'] or 'DM'}#{discord_context['channel']}:\n"
@@ -2804,7 +2896,7 @@ class DiscordBrainBot(commands.Bot):
             f"{reply_target_section}"
             f"{recent_section}"
             f"{codex_section}"
-            f"{user_text}"
+            f"{current_message}"
         )
         if one_shot_pre_prompt:
             prompt = (
@@ -2943,8 +3035,8 @@ class DiscordBrainBot(commands.Bot):
 
     async def _reply_with_shitlist(self, message: discord.Message, entry: DiscordShitlistEntry) -> None:
         final_text = format_shitlist_reply(entry)
-        await self._send_final_reply(message, final_text)
-        self._record_recent_assistant(message, final_text)
+        sent_message = await self._send_final_reply(message, final_text)
+        self._record_recent_assistant(message, final_text, sent_message=sent_message)
 
     async def _edit_reply(self, reply: discord.Message, text: str, *, final: bool = False) -> None:
         chunks = _split_discord_text(text, self.max_reply_chars)
@@ -2957,13 +3049,15 @@ class DiscordBrainBot(commands.Bot):
             else:
                 await reply.channel.send(chunk)
 
-    async def _send_final_reply(self, message: discord.Message, text: str) -> None:
+    async def _send_final_reply(self, message: discord.Message, text: str) -> discord.Message | None:
         chunks = _split_discord_text(text, self.max_reply_chars)
+        first_sent = None
         for index, chunk in enumerate(chunks):
             if index == 0:
-                await message.reply(chunk, mention_author=False)
+                first_sent = await message.reply(chunk, mention_author=False)
             else:
                 await message.channel.send(chunk)
+        return first_sent
 
 
 def _brain_retry_options(response_options: dict[str, Any]) -> dict[str, Any]:
@@ -3032,7 +3126,12 @@ def _recent_messages_prompt_lines(
     return ["Recent channel context before this message:", *lines]
 
 
-def _reply_target_prompt_lines(reply_target: dict[str, Any] | None) -> list[str]:
+def _reply_target_prompt_lines(
+    reply_target: dict[str, Any] | None,
+    *,
+    current_author: str | None = None,
+    current_author_id: int | None = None,
+) -> list[str]:
     if not reply_target:
         return []
     message_id = reply_target.get("message_id")
@@ -3047,8 +3146,30 @@ def _reply_target_prompt_lines(reply_target: dict[str, Any] | None) -> list[str]
     return [
         "Discord reply context: the current user message is a direct reply to this message.",
         f"- [{created_at}] {author}{marker}: {content[:1000]}",
-        "Interpret short responses like yes/no/yep/nope/that one as referring to the replied-to message unless the user says otherwise.",
+        *_reply_chain_identity_lines(reply_target, current_author=current_author, current_author_id=current_author_id),
+        "Interpret short responses like yes/no/yep/nope/that one as referring to the replied-to message, but do not assume the current speaker is the same person the replied-to message was originally addressing.",
     ]
+
+
+def _reply_chain_identity_lines(
+    reply_target: dict[str, Any],
+    *,
+    current_author: str | None,
+    current_author_id: int | None,
+) -> list[str]:
+    source = reply_target.get("reply_to")
+    if not isinstance(source, dict):
+        return []
+    source_author = source.get("author") or source.get("author_id") or "unknown"
+    source_author_id = source.get("author_id")
+    lines = [
+        f"The replied-to message was itself replying to {source_author} (author_id={source_author_id}).",
+    ]
+    if current_author_id is not None and source_author_id is not None and str(current_author_id) != str(source_author_id):
+        lines.append(
+            f"Current speaker is {current_author} (author_id={current_author_id}), so this is a different participant entering or reacting to that exchange."
+        )
+    return lines
 
 
 def _read_codex_bridge_result(path: Path) -> dict[str, Any] | None:
