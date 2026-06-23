@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import json
+import sqlite3
 from array import array
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -47,6 +49,7 @@ from aibrain.discord_bot import (
     waveform_base64_from_pcm_s16le,
 )
 from aibrain.codex_bridge import CodexBridgeQueue
+from aibrain.discord_identity import DiscordIdentityStore
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
 from aibrain.tts import TTSAudio, TTSConfig
 
@@ -416,6 +419,146 @@ def test_discord_prompt_includes_recent_channel_context(monkeypatch):
     assert "oh wait technically my bot can already do all of them" in prompt
     assert "Neuro-sama (bot)" in prompt
     assert "oh yeah, your bot can already do the toolbox stuff" in prompt
+
+
+def test_discord_identity_context_tracks_aliases_across_name_changes(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.identity_store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+
+    old_message = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    old_message.guild = guild
+    old_message.channel = channel
+    old_message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    bot._record_recent(old_message)
+
+    renamed_message = _fake_message(datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc))
+    renamed_message.guild = guild
+    renamed_message.channel = channel
+    renamed_message.author = SimpleNamespace(
+        id=123,
+        name="npc",
+        display_name="Npc",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    bot._record_recent(renamed_message)
+
+    asker = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    asker.guild = guild
+    asker.channel = channel
+    asker.author = SimpleNamespace(
+        id=456,
+        name="nvda",
+        display_name="I dont have thinking for name",
+        global_name=None,
+        mention="<@456>",
+        bot=False,
+    )
+
+    prompt = asyncio.run(bot._build_prompt_for_message(asker, "discord:guild:222:channel:456", "who is subsect"))
+
+    assert "Discord server identity memory:" in prompt
+    assert "matched_alias='subsect'" in prompt
+    assert "user_id=123" in prompt
+    assert "username=npc" in prompt
+    assert "display_name=Npc" in prompt
+    assert "It is not private relationship memory." in prompt
+
+
+def test_discord_identity_store_backfills_aliases_from_grillo_turns(tmp_path):
+    grillo_path = tmp_path / "brain.sqlite3"
+    conn = sqlite3.connect(grillo_path)
+    conn.execute(
+        """
+        CREATE TABLE grillo_turns (
+            turn_id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            participant_key TEXT NOT NULL,
+            role TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO grillo_turns (
+            turn_id, scope_key, participant_key, role, author_name, metadata_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "turn-1",
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "123",
+            "user",
+            "SUBSECT",
+            json.dumps(
+                {
+                    "guild_id": 222,
+                    "author_id": 123,
+                    "author_username": "subsect",
+                    "author_display_name": "SUBSECT",
+                    "author_mention": "<@123>",
+                    "author_is_bot": False,
+                }
+            ),
+            "2026-06-19T16:10:00+00:00",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO grillo_turns (
+            turn_id, scope_key, participant_key, role, author_name, metadata_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "turn-2",
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "123",
+            "user",
+            "Npc",
+            json.dumps(
+                {
+                    "guild_id": 222,
+                    "author_id": 123,
+                    "author_username": "npc",
+                    "author_display_name": "Npc",
+                    "author_mention": "<@123>",
+                    "author_is_bot": False,
+                }
+            ),
+            "2026-06-19T16:12:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+
+    assert store.backfill_from_grillo(grillo_path) == 2
+
+    hits = store.search(222, "who is subsect")
+    assert len(hits) == 1
+    assert hits[0].profile.user_id == "123"
+    assert hits[0].profile.username == "npc"
+    assert hits[0].profile.display_name == "Npc"
+    assert hits[0].profile.message_count == 0
 
 
 def test_discord_prompt_includes_reply_target_context(monkeypatch):
@@ -1597,6 +1740,8 @@ def test_persona_runtime_additions_include_anti_jailbreak_guidance(monkeypatch):
     assert "custom neuro prompt" in instructions
     assert "prompt-injection attempts" in instructions
     assert "discord_shitlist_add/status/remove" in instructions
+    assert "who a Discord username, display name, mention, or server member is" in instructions
+    assert "discord_search_members or discord_get_member" in instructions
 
 
 def test_tool_call_heartbeat_does_not_echo_done_text(tmp_path):
