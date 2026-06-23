@@ -57,6 +57,34 @@ class BrainV2:
     def append_episode(self, episode: GrilloEpisode) -> GrilloEpisode:
         return self.grillo.append_episode(episode)
 
+    def record_message(
+        self,
+        *,
+        scope_key: str,
+        actor_id: str,
+        user_text: str,
+        source: str = "brain_v2",
+        channel_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> GrilloEpisode:
+        self.upsert_actor_entity(
+            actor_id=actor_id,
+            name=_actor_name_from_metadata(metadata or {}) or actor_id,
+            aliases=_actor_aliases_from_metadata(metadata or {}),
+            metadata=metadata or {},
+        )
+        return self.append_episode(
+            GrilloEpisode.create(
+                scope_key=scope_key,
+                source=source,
+                actor_id=actor_id,
+                participant_ids=[actor_id, self.config.persona_id],
+                channel_id=channel_id,
+                content=user_text,
+                metadata=metadata or {},
+            )
+        )
+
     def upsert_actor_entity(
         self,
         *,
@@ -84,23 +112,27 @@ class BrainV2:
         source: str = "brain_v2",
         channel_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        rolling_context: list[dict[str, Any]] | None = None,
+        record_user_episode: bool = True,
+        reply_to_episode_id: str | None = None,
     ) -> str:
-        self.upsert_actor_entity(
-            actor_id=actor_id,
-            name=_actor_name_from_metadata(metadata or {}) or actor_id,
-            aliases=_actor_aliases_from_metadata(metadata or {}),
-            metadata=metadata or {},
-        )
-        user_episode = GrilloEpisode.create(
-            scope_key=scope_key,
-            source=source,
-            actor_id=actor_id,
-            participant_ids=[actor_id, self.config.persona_id],
-            channel_id=channel_id,
-            content=user_text,
-            metadata=metadata or {},
-        )
-        self.append_episode(user_episode)
+        if record_user_episode:
+            user_episode = self.record_message(
+                scope_key=scope_key,
+                actor_id=actor_id,
+                user_text=user_text,
+                source=source,
+                channel_id=channel_id,
+                metadata=metadata,
+            )
+            reply_to_episode_id = user_episode.episode_id
+        else:
+            self.upsert_actor_entity(
+                actor_id=actor_id,
+                name=_actor_name_from_metadata(metadata or {}) or actor_id,
+                aliases=_actor_aliases_from_metadata(metadata or {}),
+                metadata=metadata or {},
+            )
         packet = self.build_context_packet(
             scope_key=scope_key,
             actor_id=actor_id,
@@ -112,10 +144,16 @@ class BrainV2:
                 persona_name=self.config.persona_name,
                 persona_prompt=self.config.persona_prompt,
             ),
-            prompt=_response_prompt(packet=packet, user_text=user_text),
+            prompt=_response_prompt(
+                packet=packet,
+                user_text=user_text,
+                metadata=metadata or {},
+                rolling_context=rolling_context or [],
+            ),
             store=False,
         )
         if response_text.strip():
+            assistant_metadata = {"reply_to_episode_id": reply_to_episode_id} if reply_to_episode_id else {}
             self.append_episode(
                 GrilloEpisode.create(
                     scope_key=scope_key,
@@ -124,7 +162,7 @@ class BrainV2:
                     participant_ids=[actor_id, self.config.persona_id],
                     channel_id=channel_id,
                     content=response_text.strip(),
-                    metadata={"reply_to_episode_id": user_episode.episode_id},
+                    metadata=assistant_metadata,
                 )
             )
         return response_text.strip()
@@ -258,15 +296,25 @@ def _response_instructions(*, persona_name: str, persona_prompt: str = "") -> st
     return "\n".join(lines)
 
 
-def _response_prompt(*, packet: GrilloContextPacket, user_text: str) -> str:
-    return "\n\n".join(
-        [
-            "# GRILLO v2 Context",
-            packet.as_prompt_text(),
-            "# Current User Message",
-            user_text,
-        ]
-    )
+def _response_prompt(
+    *,
+    packet: GrilloContextPacket,
+    user_text: str,
+    metadata: dict[str, Any] | None = None,
+    rolling_context: list[dict[str, Any]] | None = None,
+) -> str:
+    sections = [
+        "# GRILLO v2 Context",
+        packet.as_prompt_text(),
+    ]
+    metadata_lines = _metadata_prompt_lines(metadata or {})
+    if metadata_lines:
+        sections.extend(["# Current Discord Metadata", "\n".join(metadata_lines)])
+    context_lines = _rolling_context_prompt_lines(rolling_context or [], current_message_id=metadata.get("message_id") if metadata else None)
+    if context_lines:
+        sections.extend(["# Recent Discord Channel Context", "\n".join(context_lines)])
+    sections.extend(["# Current User Message", user_text])
+    return "\n\n".join(sections)
 
 
 def _actor_name_from_metadata(metadata: dict[str, Any]) -> str | None:
@@ -287,6 +335,57 @@ def _actor_aliases_from_metadata(metadata: dict[str, Any]) -> list[str]:
     if author_id:
         aliases.extend([str(author_id), f"<@{author_id}>"])
     return _dedupe(aliases)
+
+
+def _metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in (
+        "guild_name",
+        "guild_id",
+        "channel_name",
+        "channel_id",
+        "author_display_name",
+        "author_username",
+        "author_global_name",
+        "author_id",
+        "author_is_bot",
+        "message_id",
+    ):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            lines.append(f"{key}: {value}")
+    reply_target = metadata.get("reply_target")
+    if isinstance(reply_target, dict):
+        lines.append("reply_target:")
+        for key in ("message_id", "author", "author_id", "author_is_bot", "content"):
+            value = reply_target.get(key)
+            if value not in (None, ""):
+                lines.append(f"- {key}: {value}")
+    return lines
+
+
+def _rolling_context_prompt_lines(
+    rolling_context: list[dict[str, Any]],
+    *,
+    current_message_id: Any | None = None,
+) -> list[str]:
+    lines: list[str] = []
+    current_id = str(current_message_id) if current_message_id is not None else None
+    for item in rolling_context[-15:]:
+        if current_id is not None and str(item.get("message_id")) == current_id:
+            continue
+        content = " ".join(str(item.get("content") or "").split())
+        if not content:
+            continue
+        author = str(item.get("author") or item.get("author_id") or "unknown")
+        marker = " (bot)" if item.get("author_is_bot") else ""
+        created_at = item.get("created_at") or "unknown time"
+        reply = ""
+        if item.get("reply_to_author") or item.get("reply_to_message_id"):
+            reply_author = item.get("reply_to_author") or item.get("reply_to_author_id") or item.get("reply_to_message_id")
+            reply = f" [replying to {reply_author}]"
+        lines.append(f"- [{created_at}] {author}{marker}{reply}: {content[:500]}")
+    return lines
 
 
 def _dedupe(items: list[str]) -> list[str]:

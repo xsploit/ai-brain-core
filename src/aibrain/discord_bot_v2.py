@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict, deque
 from contextlib import suppress
 import io
 import logging
@@ -10,10 +11,11 @@ from typing import Any
 
 import discord
 from discord.ext import commands
-from grillo_v2 import GrilloV2Worker, GrilloV2WorkerConfig
+from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
 
 from .brain_v2 import BrainV2, BrainV2Config
 from .env import load_env_file
+from .tavily_tools import TavilyConfigError, tavily_search
 
 
 DEFAULT_DISCORD_V2_PREFIX = "!n2"
@@ -27,8 +29,9 @@ class DiscordBrainV2Bot(commands.Bot):
         intents.guilds = True
         intents.messages = True
         intents.members = _env_bool("DISCORD_BRAIN_V2_MEMBERS_INTENT", False)
+        self.command_prefix_text = os.getenv("DISCORD_BRAIN_V2_COMMAND_PREFIX", DEFAULT_DISCORD_V2_PREFIX).strip() or DEFAULT_DISCORD_V2_PREFIX
         super().__init__(
-            command_prefix=os.getenv("DISCORD_BRAIN_V2_COMMAND_PREFIX", DEFAULT_DISCORD_V2_PREFIX),
+            command_prefix=_build_command_prefix(self.command_prefix_text),
             help_command=None,
             intents=intents,
         )
@@ -40,6 +43,10 @@ class DiscordBrainV2Bot(commands.Bot):
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_MENTIONS", True)
         self.require_mention_in_guilds = _env_bool("DISCORD_BRAIN_V2_REQUIRE_MENTION_IN_GUILDS", True)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
+        self.rolling_context_messages = max(1, _env_int("DISCORD_BRAIN_V2_ROLLING_CONTEXT_MESSAGES", 15))
+        self.recent_by_scope: dict[str, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=max(self.rolling_context_messages * 4, 32))
+        )
         self.worker_enabled = _env_bool("DISCORD_BRAIN_V2_WORKER_ENABLED", True)
         self.worker = GrilloV2Worker(
             runtime=self.brain_v2.grillo,
@@ -55,8 +62,13 @@ class DiscordBrainV2Bot(commands.Bot):
             on_error=self._on_worker_error,
         )
         self.worker_task: asyncio.Task | None = None
+        self.add_command(_help_command(self))
         self.add_command(_status_command(self))
         self.add_command(_context_command(self))
+        self.add_command(_remember_command(self))
+        self.add_command(_summary_command(self))
+        self.add_command(_search_command(self))
+        self.add_command(_ping_command(self))
         self.add_command(_reflect_command(self))
         self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
@@ -96,11 +108,16 @@ class DiscordBrainV2Bot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         if self.user is not None and message.author.id == self.user.id:
             return
-        if message.content.startswith(str(self.command_prefix)):
-            await self.process_commands(message)
+        ctx = await self.get_context(message)
+        if ctx.command is not None:
+            await self.invoke(ctx)
             return
-        if not self._allowed(message) or not self._should_respond(message):
+        if not self._allowed(message):
             return
+        recorded_episode = self._record_discord_message(message)
+        if not self._should_respond(message):
+            return
+        rolling_context = self._recent_messages(message)
         async with message.channel.typing():
             response = await self.brain_v2.respond(
                 scope_key=_scope_for_message(message),
@@ -109,6 +126,9 @@ class DiscordBrainV2Bot(commands.Bot):
                 source="discord",
                 channel_id=str(message.channel.id),
                 metadata=_discord_metadata(message),
+                rolling_context=rolling_context,
+                record_user_episode=recorded_episode is None,
+                reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
             )
         if response:
             await message.reply(response[: self.max_reply_chars], mention_author=False)
@@ -130,7 +150,28 @@ class DiscordBrainV2Bot(commands.Bot):
             return True
         reference = getattr(message, "reference", None)
         resolved = getattr(reference, "resolved", None) if reference is not None else None
-        return bool(resolved is not None and self.user is not None and getattr(getattr(resolved, "author", None), "id", None) == self.user.id)
+        cached = getattr(reference, "cached_message", None) if reference is not None else None
+        target = resolved or cached
+        return bool(target is not None and self.user is not None and getattr(getattr(target, "author", None), "id", None) == self.user.id)
+
+    def _record_discord_message(self, message: discord.Message):
+        text = _message_text(message)
+        if not text:
+            return None
+        scope_key = _scope_for_message(message)
+        item = _recent_message_item(message)
+        self.recent_by_scope[scope_key].append(item)
+        return self.brain_v2.record_message(
+            scope_key=scope_key,
+            actor_id=_actor_id(message.author),
+            user_text=text,
+            source="discord",
+            channel_id=str(message.channel.id),
+            metadata=_discord_metadata(message),
+        )
+
+    def _recent_messages(self, message: discord.Message) -> list[dict[str, Any]]:
+        return list(self.recent_by_scope.get(_scope_for_message(message), []))[-self.rolling_context_messages :]
 
 
 def build_brain_v2() -> BrainV2:
@@ -147,6 +188,32 @@ def build_brain_v2() -> BrainV2:
             ),
         )
     )
+
+
+def _help_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="help")
+    async def help_command(ctx: commands.Context) -> None:
+        prefix = bot.command_prefix_text
+        await ctx.reply(
+            "\n".join(
+                [
+                    "**Brain v2 commands**",
+                    "`!help` - show this menu",
+                    "`!summary [limit]` - summarize recent channel messages",
+                    "`!search <query>` - explicit Tavily web search",
+                    "`!remember <text>` - pin a manual GRILLO v2 memory for you",
+                    "`!ping @user` - tag someone with a short hello",
+                    f"`{prefix} status` - show v2 model and GRILLO counts",
+                    f"`{prefix} context [query]` - owner-only context packet export",
+                    f"`{prefix} reflect [limit]` - owner-only reflection pass",
+                    f"`{prefix} worker [batch_size] [max_batches]` - owner-only worker tick",
+                    f"`{prefix} backfill [limit]` - owner-only v1 to v2 backfill",
+                ]
+            ),
+            mention_author=False,
+        )
+
+    return help_command
 
 
 def _status_command(bot: DiscordBrainV2Bot):
@@ -184,6 +251,94 @@ def _context_command(bot: DiscordBrainV2Bot):
         )
 
     return context
+
+
+def _remember_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="remember")
+    async def remember(ctx: commands.Context, *, content: str = "") -> None:
+        content = content.strip()
+        if not content:
+            await ctx.reply("usage: `!remember <text>`", mention_author=False)
+            return
+        document = GrilloMemoryDocument.create(
+            scope_key=_scope_for_message(ctx.message),
+            document_type="manual_memory",
+            subject_id=_actor_id(ctx.author),
+            title=f"Manual memory from {_display_name(ctx.author)}",
+            body=content,
+            importance=0.9,
+            metadata=_discord_metadata(ctx.message),
+        )
+        bot.brain_v2.store.upsert_memory_document(document)
+        await ctx.reply(f"remembered `{document.memory_id}`", mention_author=False)
+
+    return remember
+
+
+def _summary_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="summary", aliases=["summarize"])
+    async def summary(ctx: commands.Context, limit: int = 50) -> None:
+        limit = max(1, min(100, int(limit)))
+        messages: list[str] = []
+        async for item in ctx.channel.history(limit=limit):
+            text = _message_text(item)
+            if not text:
+                continue
+            author = _display_name(item.author)
+            marker = " (bot)" if getattr(item.author, "bot", False) else ""
+            created_at = getattr(item, "created_at", None)
+            stamp = created_at.isoformat() if created_at else "unknown time"
+            messages.append(f"[{stamp}] {author}{marker}: {text[:700]}")
+        messages.reverse()
+        if not messages:
+            await ctx.reply("no readable recent messages.", mention_author=False)
+            return
+        async with ctx.channel.typing():
+            text = await bot.brain_v2.json_client.complete_text(
+                instructions="Summarize these Discord channel messages. Keep names, decisions, unresolved questions, and notable context. Do not invent facts.",
+                prompt="\n".join(messages),
+                store=False,
+            )
+        await ctx.reply((text.strip() or "no summary generated.")[: bot.max_reply_chars], mention_author=False)
+
+    return summary
+
+
+def _search_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="search")
+    async def search(ctx: commands.Context, *, query: str = "") -> None:
+        query = query.strip()
+        if not query:
+            await ctx.reply("usage: `!search <query>`", mention_author=False)
+            return
+        try:
+            result = await tavily_search(query, max_results=_env_int("DISCORD_BRAIN_V2_SEARCH_RESULTS", 5))
+        except TavilyConfigError as exc:
+            await ctx.reply(str(exc), mention_author=False)
+            return
+        except Exception as exc:
+            await ctx.reply(f"search failed: {exc}", mention_author=False)
+            return
+        await ctx.reply(_format_tavily_search_result(result)[: bot.max_reply_chars], mention_author=False)
+
+    return search
+
+
+def _ping_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="ping")
+    async def ping(ctx: commands.Context, *, target: str = "") -> None:
+        target = target.strip()
+        if ctx.message.mentions:
+            target = ctx.message.mentions[0].mention
+        if not target:
+            await ctx.reply("usage: `!ping @user`", mention_author=False)
+            return
+        await ctx.send(
+            f"{target} yo, what up fam",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+
+    return ping
 
 
 def _reflect_command(bot: DiscordBrainV2Bot):
@@ -310,6 +465,25 @@ def _format_worker_loop_status(bot: DiscordBrainV2Bot) -> str:
     )
 
 
+def _build_command_prefix(command_prefix_text: str):
+    direct_prefix_commands = (
+        "help",
+        "summary",
+        "summarize",
+        "search",
+        "remember",
+        "ping",
+    )
+
+    def command_prefix(bot: commands.Bot, message: discord.Message):
+        stripped = message.content.strip()
+        if any(stripped == f"!{name}" or stripped.startswith(f"!{name} ") for name in direct_prefix_commands):
+            return "!"
+        return f"{command_prefix_text} "
+
+    return command_prefix
+
+
 def _scope_for_message(message: discord.Message) -> str:
     if message.guild is None:
         return f"discord:dm:{message.author.id}:persona:v2"
@@ -324,11 +498,20 @@ def _message_text(message: discord.Message) -> str:
     return (getattr(message, "clean_content", None) or getattr(message, "content", "") or "").strip()
 
 
+def _display_name(user: Any) -> str:
+    return (
+        getattr(user, "display_name", None)
+        or getattr(user, "global_name", None)
+        or getattr(user, "name", None)
+        or str(getattr(user, "id", "unknown"))
+    )
+
+
 def _discord_metadata(message: discord.Message) -> dict[str, Any]:
     guild = message.guild
     channel = message.channel
     author = message.author
-    return {
+    metadata = {
         "message_id": str(getattr(message, "id", "")),
         "guild_id": str(guild.id) if guild else None,
         "guild_name": guild.name if guild else None,
@@ -341,6 +524,69 @@ def _discord_metadata(message: discord.Message) -> dict[str, Any]:
         "author_is_bot": bool(getattr(author, "bot", False)),
         "jump_url": getattr(message, "jump_url", None),
     }
+    reply_target = _reply_target_context(message)
+    if reply_target is not None:
+        metadata["reply_target"] = reply_target
+    return metadata
+
+
+def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
+    reference = getattr(message, "reference", None)
+    if reference is None:
+        return None
+    resolved = None
+    for attr in ("resolved", "cached_message"):
+        candidate = getattr(reference, attr, None)
+        if candidate is not None:
+            resolved = candidate
+            break
+    message_id = getattr(reference, "message_id", None)
+    if resolved is None:
+        return {"message_id": str(message_id)} if message_id is not None else None
+    author = getattr(resolved, "author", None)
+    return {
+        "message_id": str(getattr(resolved, "id", None) or message_id or ""),
+        "author": _display_name(author) if author is not None else "unknown",
+        "author_id": str(getattr(author, "id", "")) if author is not None else None,
+        "author_is_bot": bool(getattr(author, "bot", False)),
+        "content": _message_text(resolved)[:1000],
+        "jump_url": getattr(resolved, "jump_url", None),
+    }
+
+
+def _recent_message_item(message: discord.Message) -> dict[str, Any]:
+    reply_target = _reply_target_context(message) or {}
+    created_at = getattr(message, "created_at", None)
+    return {
+        "message_id": str(getattr(message, "id", "")),
+        "author": _display_name(message.author),
+        "author_id": str(getattr(message.author, "id", "")),
+        "author_is_bot": bool(getattr(message.author, "bot", False)),
+        "content": _message_text(message),
+        "created_at": created_at.isoformat() if created_at else None,
+        "reply_to_message_id": reply_target.get("message_id"),
+        "reply_to_author": reply_target.get("author"),
+        "reply_to_author_id": reply_target.get("author_id"),
+        "reply_to_author_is_bot": reply_target.get("author_is_bot"),
+    }
+
+
+def _format_tavily_search_result(result: dict[str, Any]) -> str:
+    lines = ["search results:"]
+    answer = result.get("answer")
+    if answer:
+        lines.append(str(answer).strip())
+    for index, item in enumerate(result.get("results") or [], start=1):
+        title = item.get("title") or item.get("url") or f"result {index}"
+        url = item.get("url") or ""
+        content = " ".join(str(item.get("content") or "").split())
+        line = f"{index}. {title}"
+        if url:
+            line += f" - {url}"
+        if content:
+            line += f"\n{content[:240]}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _csv_ints(name: str) -> set[int]:

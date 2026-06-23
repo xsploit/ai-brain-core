@@ -13,6 +13,7 @@ from aibrain.discord_bot_v2 import (
     _format_status,
     _format_worker_loop_status,
     _format_worker_result,
+    _recent_message_item,
     _scope_for_message,
     build_brain_v2,
 )
@@ -540,6 +541,94 @@ async def test_brain_v2_respond_includes_persona_prompt(tmp_path):
     assert "Keep Neuro's sharp streamer persona intact." in calls[0]["instructions"]
 
 
+@pytest.mark.asyncio
+async def test_brain_v2_respond_includes_metadata_and_rolling_context_without_double_recording(tmp_path):
+    calls = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text="got context")
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=json_client,
+    )
+    recorded = brain.record_message(
+        scope_key="discord:guild:1",
+        actor_id="discord_user:subby",
+        user_text="yep",
+        source="discord",
+        channel_id="bot-chat",
+        metadata={
+            "message_id": "m2",
+            "guild_name": "Test Guild",
+            "channel_name": "bot-chat",
+            "author_display_name": "Subby",
+            "author_username": "subsect",
+            "author_id": "123",
+            "reply_target": {
+                "message_id": "m1",
+                "author": "Neuro-sama",
+                "author_id": "999",
+                "author_is_bot": True,
+                "content": "Do you want me to check that?",
+            },
+        },
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1",
+        actor_id="discord_user:subby",
+        user_text="yep",
+        source="discord",
+        channel_id="bot-chat",
+        metadata={
+            "message_id": "m2",
+            "guild_name": "Test Guild",
+            "channel_name": "bot-chat",
+            "author_display_name": "Subby",
+            "author_username": "subsect",
+            "author_id": "123",
+            "reply_target": {
+                "message_id": "m1",
+                "author": "Neuro-sama",
+                "author_id": "999",
+                "author_is_bot": True,
+                "content": "Do you want me to check that?",
+            },
+        },
+        rolling_context=[
+            {
+                "message_id": "m1",
+                "author": "Neuro-sama",
+                "author_is_bot": True,
+                "content": "Do you want me to check that?",
+                "created_at": "2026-06-23T12:00:00+00:00",
+            },
+            {
+                "message_id": "m2",
+                "author": "Subby",
+                "content": "yep",
+                "created_at": "2026-06-23T12:00:02+00:00",
+            },
+        ],
+        record_user_episode=False,
+        reply_to_episode_id=recorded.episode_id,
+    )
+    episodes = brain.store.list_recent_episodes("discord:guild:1", limit=10)
+
+    assert response == "got context"
+    assert "# Current Discord Metadata" in calls[0]["input"]
+    assert "guild_name: Test Guild" in calls[0]["input"]
+    assert "- content: Do you want me to check that?" in calls[0]["input"]
+    assert "# Recent Discord Channel Context" in calls[0]["input"]
+    assert "Neuro-sama (bot): Do you want me to check that?" in calls[0]["input"]
+    assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
 def test_discord_bot_v2_loads_persona_prompt_path(tmp_path, monkeypatch):
     prompt_path = tmp_path / "neuro.persona.txt"
     prompt_path.write_text("Neuro persona from disk.", encoding="utf-8")
@@ -576,6 +665,37 @@ def test_discord_bot_v2_helpers_make_server_scope_and_metadata():
     assert metadata["channel_name"] == "bot-chat"
     assert metadata["author_username"] == "subsect"
     assert metadata["author_display_name"] == "Npc"
+
+
+def test_discord_bot_v2_metadata_and_recent_item_include_reply_target():
+    bot_author = SimpleNamespace(id=999, name="neuro", display_name="Neuro-sama", global_name=None, bot=True)
+    user = SimpleNamespace(id=123, name="subsect", display_name="Subby", global_name=None, bot=False)
+    target = SimpleNamespace(
+        id=444,
+        author=bot_author,
+        clean_content="Do you want me to check that?",
+        content="Do you want me to check that?",
+        jump_url="https://discord.example/target",
+    )
+    message = SimpleNamespace(
+        id=445,
+        guild=SimpleNamespace(id=222, name="Test Guild"),
+        channel=SimpleNamespace(id=333, name="bot-chat"),
+        author=user,
+        clean_content="yep",
+        content="yep",
+        reference=SimpleNamespace(resolved=target, cached_message=None, message_id=444),
+        jump_url="https://discord.example/message",
+        created_at=None,
+    )
+
+    metadata = _discord_metadata(message)
+    recent = _recent_message_item(message)
+
+    assert metadata["reply_target"]["author"] == "Neuro-sama"
+    assert metadata["reply_target"]["content"] == "Do you want me to check that?"
+    assert recent["reply_to_author"] == "Neuro-sama"
+    assert recent["reply_to_message_id"] == "444"
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):
