@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .models import Evidence, EvidenceGap, GrilloMemoryDocument, OpinionEdge, TemporalFact
+from .safety import is_unsafe_memory_payload
 from .store import SQLiteGrilloV2Store
 
 
@@ -85,7 +86,7 @@ def _apply_memory_tool(
     if normalized == "record_evidence":
         return _record_evidence(store=store, scope_key=scope_key, args=args)
     if normalized == "upsert_fact":
-        return _upsert_fact(store=store, scope_key=scope_key, args=args)
+        return _upsert_fact(store=store, scope_key=scope_key, persona_id=persona_id, args=args)
     if normalized in {"upsert_opinion", "upsert_opinion_edge"}:
         return _upsert_opinion_edge(store=store, scope_key=scope_key, persona_id=persona_id, args=args)
     if normalized in {"upsert_memory_document", "write_memory_document"}:
@@ -112,7 +113,13 @@ def _record_evidence(*, store: SQLiteGrilloV2Store, scope_key: str, args: dict[s
     return GrilloMemoryToolResult(evidence=1)
 
 
-def _upsert_fact(*, store: SQLiteGrilloV2Store, scope_key: str, args: dict[str, Any]) -> GrilloMemoryToolResult:
+def _upsert_fact(
+    *,
+    store: SQLiteGrilloV2Store,
+    scope_key: str,
+    persona_id: str,
+    args: dict[str, Any],
+) -> GrilloMemoryToolResult:
     fact = TemporalFact.create(
         scope_key=scope_key,
         subject_id=str(args.get("subject_id") or args.get("subject") or ""),
@@ -139,6 +146,13 @@ def _upsert_fact(*, store: SQLiteGrilloV2Store, scope_key: str, args: dict[str, 
         fact.fact_id = str(args["fact_id"])
     if not fact.subject_id or not fact.predicate or not fact.claim:
         return GrilloMemoryToolResult(ignored=1, notes=["upsert_fact_missing_required_fields"])
+    if is_unsafe_memory_payload(
+        text=" ".join([fact.predicate, fact.object_value, fact.claim]),
+        subject_id=fact.subject_id,
+        predicate=fact.predicate,
+        persona_id=persona_id,
+    ):
+        return GrilloMemoryToolResult(ignored=1, notes=["blocked_user_behavior_rule_fact"])
     store.upsert_fact(fact)
     return GrilloMemoryToolResult(facts=1)
 
@@ -183,6 +197,12 @@ def _upsert_memory_document(*, store: SQLiteGrilloV2Store, scope_key: str, args:
         document.memory_id = str(args["memory_id"])
     if not document.document_type or not document.title or not document.body:
         return GrilloMemoryToolResult(ignored=1, notes=["upsert_memory_document_missing_required_fields"])
+    if is_unsafe_memory_payload(
+        text=" ".join([document.title, document.body]),
+        document_type=document.document_type,
+        subject_id=document.subject_id or "",
+    ):
+        return GrilloMemoryToolResult(ignored=1, notes=["blocked_user_behavior_rule_memory_document"])
     store.upsert_memory_document(document)
     return GrilloMemoryToolResult(memory_docs=1)
 
