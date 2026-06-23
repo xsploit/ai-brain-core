@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict, deque
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -1084,6 +1085,84 @@ def test_discord_bot_v2_bots_need_toggle_and_directed_message():
     message.mentions = []
 
     assert bot._should_respond(message) is False
+
+
+def test_discord_bot_v2_direct_prefix_routes_side_feature_commands():
+    command_prefix = discord_bot_v2_module._build_command_prefix("!n2")
+
+    for content in ("!recall Subby", "!shitlist status", "!codex status", "!heartbeat tick"):
+        message = SimpleNamespace(content=content)
+        assert command_prefix(None, message) == "!"
+
+
+def test_discord_bot_v2_default_heartbeat_tools_include_shitlist(monkeypatch):
+    for name in ("DISCORD_BRAIN_V2_HEARTBEAT_TOOL_NAMES", "DISCORD_BRAIN_HEARTBEAT_TOOL_NAMES"):
+        monkeypatch.delenv(name, raising=False)
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.heartbeat_tools_enabled = True
+
+    tool_names = bot._heartbeat_tool_names()
+
+    assert "discord_shitlist_status" in tool_names
+    assert "discord_shitlist_add" in tool_names
+    assert "discord_shitlist_remove" in tool_names
+
+
+def test_discord_bot_v2_record_message_tracks_last_active_human_channel():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.recent_by_scope = defaultdict(lambda: deque(maxlen=32))
+    bot.heartbeat_last_channel = None
+    bot.heartbeat_last_channel_id = None
+    bot.brain_v2 = SimpleNamespace(record_message=lambda **kwargs: SimpleNamespace(episode_id="ep1"))
+    channel = SimpleNamespace(id=333, name="bot-chat")
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    channel.guild = guild
+    message = SimpleNamespace(
+        id=111,
+        author=SimpleNamespace(id=123, bot=False, name="subsect", display_name="Subby", global_name=None),
+        guild=guild,
+        channel=channel,
+        clean_content="hello",
+        content="hello",
+        created_at=datetime.now(timezone.utc),
+        jump_url="https://discord.test/111",
+        reference=None,
+    )
+
+    bot._record_discord_message(message)
+
+    assert bot.heartbeat_last_channel is channel
+    assert bot.heartbeat_last_channel_id == 333
+
+
+def test_discord_bot_v2_codex_bridge_results_inject_into_relevant_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_V2_CODEX_CONTEXT_ENABLED", "true")
+    queue = discord_bot_v2_module.CodexBridgeQueue(tmp_path / "bridge", enabled=True)
+    payload = {
+        "schema": "neuro_codex_bridge.final_result.v1",
+        "status": "complete",
+        "processed_at": "2026-06-23T01:00:00Z",
+        "summary": "Ported the side tools.",
+        "commit_id": "abc1234",
+        "origin": {
+            "requester_id": "120418341775998976",
+            "guild_id": "222",
+            "channel_id": "333",
+        },
+    }
+    queue.outbox.joinpath("result.json").write_text(json.dumps(payload), encoding="utf-8")
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.codex_bridge = queue
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=120418341775998976),
+        channel=SimpleNamespace(id=333),
+        guild=SimpleNamespace(id=222),
+    )
+
+    lines = bot._codex_bridge_updates_for_message(message)
+
+    assert any("Ported the side tools." in line for line in lines)
+    assert any("abc1234" in line for line in lines)
 
 
 def test_discord_bot_v2_pause_blocks_normal_responses():
