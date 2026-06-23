@@ -168,3 +168,20 @@ The host supplies `completion(request) -> dict`. The request includes:
 - `episodes`
 
 Return `tool_calls` using the memory tools above.
+
+## Parity Decision
+
+Current decision: GRILLO v2 does not replace the V1/WebWaifu GRILLO implementation one-to-one.
+
+Why:
+
+- V2 uses a new temporal graph schema: episodes, evidence, temporal facts, opinion edges, memory documents, and reflection cursors.
+- V1/WebWaifu-style GRILLO behavior is organized around turns, candidates, diary entries, slots, relationship cadence beats, and worker traces.
+- V2 can backfill some V1 data and expose Ladybug-compatible diagnostics, but that is compatibility, not parity.
+- The Discord V2 bot now uses V1 Brain streaming/tool/memory response plumbing while keeping V2 GRILLO context packets. That makes the bot more capable, but it does not make the memory worker one-to-one.
+
+Required direction:
+
+- Keep V2 diagnostics honest: label them as GRILLO v2 / Ladybug-compatible graph views.
+- Restore true WebWaifu/V1 parity only by porting the original prompt contract, JSON schema, cadence beats, diary/slot/candidate lifecycle, and worker trace semantics directly.
+- Do not call V2 "real one-to-one GRILLO" until those behaviors are implemented and verified against the source WebWaifu/V1 flow.
