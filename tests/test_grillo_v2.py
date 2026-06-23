@@ -13,6 +13,7 @@ from grillo_v2 import (
     EvidenceGap,
     GrilloEpisode,
     GrilloEntity,
+    GrilloMemoryDocument,
     GrilloV2Runtime,
     OpinionEdge,
     SQLiteGrilloV2Store,
@@ -84,6 +85,17 @@ def test_grillo_v2_context_packet_uses_temporal_facts_and_opinion_edges(tmp_path
             evidence_ids=[evidence.evidence_id],
         )
     )
+    store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key="discord:guild:1",
+            document_type="diary",
+            subject_id="discord_user:subby",
+            title="Name correction",
+            body="I should remember Subby corrected me away from LO and sounded annoyed about it.",
+            evidence_ids=[evidence.evidence_id],
+            importance=0.9,
+        )
+    )
     runtime = GrilloV2Runtime(store=store, persona_id="persona:neuro")
 
     packet = runtime.build_context_packet(
@@ -101,6 +113,8 @@ def test_grillo_v2_context_packet_uses_temporal_facts_and_opinion_edges(tmp_path
     assert "Subby prefers being called Subby." in prompt
     assert "<relationship_state>" in prompt
     assert "familiarity" in prompt
+    assert "<memory_blocks>" in prompt
+    assert "Name correction" in prompt
     assert "<evidence_gaps>" in prompt
     assert "Is LO still acceptable?" in prompt
     assert "<recent_episode_summary>" in prompt
@@ -154,6 +168,17 @@ async def test_grillo_v2_reflection_worker_writes_evidence_facts_and_opinions(tm
                     "evidence_ids": ["evidence:manual"],
                 }
             ],
+            "memory_documents": [
+                {
+                    "memory_id": "memory:diary-subby-temporal",
+                    "document_type": "diary",
+                    "subject_id": "discord_user:subby",
+                    "title": "Subby steering GRILLO v2",
+                    "body": "I noticed Subby wants memory to be temporal, evidence-backed, and not a flat log.",
+                    "evidence_ids": ["evidence:manual"],
+                    "importance": 0.85,
+                }
+            ],
             "invalidate_facts": [],
         }
 
@@ -170,8 +195,11 @@ async def test_grillo_v2_reflection_worker_writes_evidence_facts_and_opinions(tm
     assert result.evidence == 1
     assert result.facts == 1
     assert result.opinions == 1
+    assert result.memory_docs == 1
     assert packet.active_facts[0]["id"] == "fact:temporal-memory"
     assert packet.relationship_state[0]["id"] == "opinion:trust-subby"
+    assert packet.memory_blocks[0]["id"] == "memory:diary-subby-temporal"
+    assert "not a flat log" in packet.as_prompt_text()
 
 
 def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
@@ -180,7 +208,18 @@ def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
     class FakeResponses:
         async def create(self, **kwargs):
             calls.append(kwargs)
-            return SimpleNamespace(output_text=json.dumps({"notes": "ok", "evidence": [], "facts": [], "opinion_edges": [], "invalidate_facts": []}))
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "notes": "ok",
+                        "evidence": [],
+                        "facts": [],
+                        "opinion_edges": [],
+                        "memory_documents": [],
+                        "invalidate_facts": [],
+                    }
+                )
+            )
 
     fake_client = SimpleNamespace(responses=FakeResponses())
     json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")

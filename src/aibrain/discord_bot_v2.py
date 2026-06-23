@@ -148,7 +148,8 @@ def _reflect_command(bot: DiscordBrainV2Bot):
         await ctx.reply(
             "GRILLO v2 reflection: "
             f"episodes=`{result.episodes}` evidence=`{result.evidence}` facts=`{result.facts}` "
-            f"opinions=`{result.opinions}` invalidated=`{result.invalidated_facts}` notes=`{result.notes}`",
+            f"opinions=`{result.opinions}` memory_docs=`{result.memory_docs}` "
+            f"invalidated=`{result.invalidated_facts}` notes=`{result.notes}`",
             mention_author=False,
         )
 
@@ -193,7 +194,8 @@ def _format_status(status: dict[str, Any]) -> str:
         "Brain v2 online. "
         f"model=`{status.get('model')}` provider=`{status.get('provider')}` grillo=`v2` "
         f"entities=`{counts.get('entities', 0)}` episodes=`{counts.get('episodes', 0)}` "
-        f"facts=`{counts.get('active_facts', 0)}` opinions=`{counts.get('active_opinion_edges', 0)}`"
+        f"facts=`{counts.get('active_facts', 0)}` opinions=`{counts.get('active_opinion_edges', 0)}` "
+        f"memory_docs=`{counts.get('memory_docs', 0)}`"
     )
 
 

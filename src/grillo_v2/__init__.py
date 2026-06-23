@@ -7,6 +7,7 @@ from .models import (
     GrilloContextPacket,
     GrilloEntity,
     GrilloEpisode,
+    GrilloMemoryDocument,
     OpinionEdge,
     TemporalFact,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "GrilloContextPacket",
     "GrilloEntity",
     "GrilloEpisode",
+    "GrilloMemoryDocument",
     "GrilloV2Runtime",
     "OpinionEdge",
     "ReflectionResult",

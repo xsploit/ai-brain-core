@@ -10,6 +10,7 @@ from .models import (
     EvidenceGap,
     GrilloEntity,
     GrilloEpisode,
+    GrilloMemoryDocument,
     OpinionEdge,
     TemporalFact,
     dataclass_dict,
@@ -125,6 +126,23 @@ class SQLiteGrilloV2Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_grillo_v2_opinions_scope_target
                     ON grillo_v2_opinion_edges(scope_key, target_id, valid_to, relation);
+
+                CREATE TABLE IF NOT EXISTS grillo_v2_memory_docs (
+                    memory_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    document_type TEXT NOT NULL,
+                    subject_id TEXT,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    importance REAL NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_grillo_v2_memory_docs_scope_subject
+                    ON grillo_v2_memory_docs(scope_key, subject_id, importance, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_grillo_v2_memory_docs_scope_type
+                    ON grillo_v2_memory_docs(scope_key, document_type, importance, updated_at);
 
                 CREATE TABLE IF NOT EXISTS grillo_v2_reflection_cursors (
                     cursor_key TEXT PRIMARY KEY,
@@ -326,6 +344,73 @@ class SQLiteGrilloV2Store:
             )
         return edge
 
+    def upsert_memory_document(self, document: GrilloMemoryDocument) -> GrilloMemoryDocument:
+        document.updated_at = utc_now()
+        with self._lock:
+            self._connect().execute(
+                """
+                INSERT OR REPLACE INTO grillo_v2_memory_docs (
+                    memory_id, scope_key, document_type, subject_id, title, body,
+                    evidence_ids_json, importance, metadata_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document.memory_id,
+                    document.scope_key,
+                    document.document_type,
+                    document.subject_id,
+                    document.title,
+                    document.body,
+                    to_json(document.evidence_ids),
+                    document.importance,
+                    to_json(document.metadata),
+                    document.updated_at,
+                ),
+            )
+        return document
+
+    def list_memory_documents(
+        self,
+        scope_key: str,
+        *,
+        subject_id: str | None = None,
+        document_type: str | None = None,
+        query: str = "",
+        limit: int = 6,
+    ) -> list[GrilloMemoryDocument]:
+        where = ["scope_key = ?"]
+        params: list[Any] = [scope_key]
+        if subject_id is not None:
+            where.append("(subject_id = ? OR subject_id IS NULL)")
+            params.append(subject_id)
+        if document_type is not None:
+            where.append("document_type = ?")
+            params.append(document_type)
+        params.append(max(1, int(limit)) * 4)
+        with self._lock:
+            rows = self._connect().execute(
+                f"""
+                SELECT * FROM grillo_v2_memory_docs
+                WHERE {' AND '.join(where)}
+                ORDER BY importance DESC, updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        documents = [_memory_document_from_row(row) for row in rows]
+        if query.strip():
+            documents = sorted(
+                documents,
+                key=lambda document: (
+                    max(_text_score(query, document.title), _text_score(query, document.body)),
+                    document.importance,
+                    document.updated_at,
+                ),
+                reverse=True,
+            )
+        return documents[: max(1, int(limit))]
+
     def list_recent_episodes(
         self,
         scope_key: str,
@@ -451,6 +536,7 @@ class SQLiteGrilloV2Store:
             "active_facts": "grillo_v2_temporal_facts WHERE valid_to IS NULL",
             "opinion_edges": "grillo_v2_opinion_edges",
             "active_opinion_edges": "grillo_v2_opinion_edges WHERE valid_to IS NULL",
+            "memory_docs": "grillo_v2_memory_docs",
         }
         out: dict[str, int] = {}
         with self._lock:
@@ -537,6 +623,21 @@ def _opinion_from_row(row: sqlite3.Row) -> OpinionEdge:
         evidence_ids=[str(item) for item in from_json_list(row["evidence_ids_json"])],
         valid_from=row["valid_from"],
         valid_to=row["valid_to"],
+        metadata=from_json_dict(row["metadata_json"]),
+        updated_at=row["updated_at"],
+    )
+
+
+def _memory_document_from_row(row: sqlite3.Row) -> GrilloMemoryDocument:
+    return GrilloMemoryDocument(
+        memory_id=row["memory_id"],
+        scope_key=row["scope_key"],
+        document_type=row["document_type"],
+        subject_id=row["subject_id"],
+        title=row["title"],
+        body=row["body"],
+        evidence_ids=[str(item) for item in from_json_list(row["evidence_ids_json"])],
+        importance=float(row["importance"]),
         metadata=from_json_dict(row["metadata_json"]),
         updated_at=row["updated_at"],
     )

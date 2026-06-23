@@ -204,6 +204,9 @@ GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(
         "Extract only evidence-backed memory from the provided episodes.",
         "Write temporal facts with subject, predicate, object, claim, confidence, valid_from, and evidence_ids.",
         "Write opinion_edges only as computed relationship state from the persona to an entity.",
+        "Write memory_documents for durable diary/profile/slot/procedural context that should be pinned into future prompts.",
+        "Use document_type values like diary, profile, relationship_profile, preference_slot, or procedural_note.",
+        "Keep memory_documents compact, first-person when diary-like, and grounded with evidence_ids.",
         "Use missing_evidence when a claim is plausible but not proven.",
         "Invalidate old facts when newer evidence supersedes them.",
         "Return only JSON matching the supplied schema.",
@@ -216,6 +219,7 @@ def _response_instructions(persona_name: str) -> str:
         [
             f"You are {persona_name}.",
             "Use the GRILLO v2 context packet as structured memory.",
+            "Use memory_blocks for durable diary/profile/slot continuity, while treating active_facts as evidence-backed claims.",
             "Do not treat evidence_gaps as facts.",
             "If memory conflicts with the current message, trust the current message.",
             "Reply naturally and do not expose internal XML tags unless asked for a diagnostic export.",

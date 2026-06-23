@@ -200,12 +200,52 @@ class OpinionEdge:
 
 
 @dataclass(slots=True)
+class GrilloMemoryDocument:
+    memory_id: str
+    scope_key: str
+    document_type: str
+    title: str
+    body: str
+    subject_id: str | None = None
+    evidence_ids: list[str] = field(default_factory=list)
+    importance: float = 0.5
+    metadata: dict[str, Any] = field(default_factory=dict)
+    updated_at: str = field(default_factory=utc_now)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        scope_key: str,
+        document_type: str,
+        title: str,
+        body: str,
+        subject_id: str | None = None,
+        evidence_ids: list[str] | None = None,
+        importance: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+    ) -> "GrilloMemoryDocument":
+        return cls(
+            memory_id=new_id("memory"),
+            scope_key=scope_key,
+            document_type=document_type,
+            subject_id=subject_id,
+            title=title,
+            body=body,
+            evidence_ids=evidence_ids or [],
+            importance=max(0.0, min(1.0, float(importance))),
+            metadata=metadata or {},
+        )
+
+
+@dataclass(slots=True)
 class GrilloContextPacket:
     scope_key: str
     actor_id: str | None = None
     version: str = "2.0"
     current_actor: dict[str, Any] = field(default_factory=dict)
     relationship_state: list[dict[str, Any]] = field(default_factory=list)
+    memory_blocks: list[dict[str, Any]] = field(default_factory=list)
     active_facts: list[dict[str, Any]] = field(default_factory=list)
     evidence_gaps: list[dict[str, Any]] = field(default_factory=list)
     recent_episode_summary: list[dict[str, Any]] = field(default_factory=list)
@@ -217,6 +257,7 @@ class GrilloContextPacket:
         if self.current_actor:
             sections.extend(_json_section("current_actor", [self.current_actor]))
         sections.extend(_json_section("relationship_state", self.relationship_state))
+        sections.extend(_json_section("memory_blocks", self.memory_blocks))
         sections.extend(_json_section("active_facts", self.active_facts))
         sections.extend(_json_section("evidence_gaps", self.evidence_gaps))
         sections.extend(_json_section("recent_episode_summary", self.recent_episode_summary))

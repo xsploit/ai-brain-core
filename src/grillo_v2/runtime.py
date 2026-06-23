@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .context import GrilloContextBuilder
-from .models import Evidence, EvidenceGap, GrilloEpisode, OpinionEdge, TemporalFact
+from .models import Evidence, EvidenceGap, GrilloEpisode, GrilloMemoryDocument, OpinionEdge, TemporalFact
 from .store import SQLiteGrilloV2Store
 
 
@@ -18,6 +18,7 @@ class ReflectionResult:
     evidence: int = 0
     facts: int = 0
     opinions: int = 0
+    memory_docs: int = 0
     invalidated_facts: int = 0
     notes: str = ""
 
@@ -152,6 +153,22 @@ class GrilloV2Runtime:
             if edge.source_id and edge.target_id and edge.relation:
                 self.store.upsert_opinion_edge(edge)
                 result.opinions += 1
+        for item in _list(payload.get("memory_documents")):
+            document = GrilloMemoryDocument.create(
+                scope_key=scope_key,
+                document_type=str(item.get("document_type") or item.get("type") or ""),
+                subject_id=str(item.get("subject_id") or item.get("subject") or "") or None,
+                title=str(item.get("title") or ""),
+                body=str(item.get("body") or item.get("content") or ""),
+                evidence_ids=[str(value) for value in _list(item.get("evidence_ids"))],
+                importance=_float(item.get("importance"), 0.5),
+                metadata=_dict(item.get("metadata")),
+            )
+            if item.get("memory_id"):
+                document.memory_id = str(item["memory_id"])
+            if document.document_type and document.title and document.body:
+                self.store.upsert_memory_document(document)
+                result.memory_docs += 1
         for item in _list(payload.get("invalidate_facts")):
             fact_id = str(item.get("fact_id") or "") if isinstance(item, dict) else str(item)
             if fact_id:
@@ -176,9 +193,10 @@ GRILLO_V2_REFLECTION_SCHEMA: dict[str, Any] = {
             "evidence": {"type": "array"},
             "facts": {"type": "array"},
             "opinion_edges": {"type": "array"},
+            "memory_documents": {"type": "array"},
             "invalidate_facts": {"type": "array"},
         },
-        "required": ["notes", "evidence", "facts", "opinion_edges", "invalidate_facts"],
+        "required": ["notes", "evidence", "facts", "opinion_edges", "memory_documents", "invalidate_facts"],
     },
 }
 
