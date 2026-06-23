@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from aibrain.brain_v2 import BrainV2, BrainV2Config
-from aibrain.discord_bot_v2 import _discord_metadata, _format_backfill_results, _format_status, _scope_for_message
+from aibrain.discord_bot_v2 import (
+    _discord_metadata,
+    _format_backfill_results,
+    _format_status,
+    _format_worker_result,
+    _scope_for_message,
+)
 from grillo_v2 import (
     Evidence,
     EvidenceGap,
@@ -200,6 +206,55 @@ async def test_grillo_v2_reflection_worker_writes_evidence_facts_and_opinions(tm
     assert packet.relationship_state[0]["id"] == "opinion:trust-subby"
     assert packet.memory_blocks[0]["id"] == "memory:diary-subby-temporal"
     assert "not a flat log" in packet.as_prompt_text()
+
+
+@pytest.mark.asyncio
+async def test_grillo_v2_worker_tick_processes_unreflected_batches(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    scope_key = "discord:guild:1"
+    episodes = [
+        store.append_episode(
+            GrilloEpisode.create(
+                scope_key=scope_key,
+                source="discord",
+                actor_id="discord_user:subby",
+                content=f"worker message {index}",
+                occurred_at=f"2026-06-20T00:00:0{index}+00:00",
+            )
+        )
+        for index in range(3)
+    ]
+    seen_batches = []
+
+    async def completion(request):
+        seen_batches.append([episode["episode_id"] for episode in request["episodes"]])
+        return {
+            "notes": f"batch {len(seen_batches)}",
+            "evidence": [],
+            "facts": [],
+            "opinion_edges": [],
+            "memory_documents": [],
+            "invalidate_facts": [],
+        }
+
+    runtime = GrilloV2Runtime(store=store, completion=completion, persona_id="persona:neuro")
+
+    first = await runtime.worker_tick(scope_key=scope_key, batch_size=2, max_batches=1)
+    cursor = json.loads(store.get_cursor(runtime.worker_cursor_key(scope_key)))
+    second = await runtime.worker_tick(scope_key=scope_key, batch_size=2, max_batches=1)
+    third = await runtime.worker_tick(scope_key=scope_key, batch_size=2, max_batches=1)
+
+    assert seen_batches == [
+        [episodes[0].episode_id, episodes[1].episode_id],
+        [episodes[2].episode_id],
+    ]
+    assert first.batches == 1
+    assert first.episodes == 2
+    assert cursor["episode_id"] == episodes[1].episode_id
+    assert second.batches == 1
+    assert second.episodes == 1
+    assert third.batches == 0
+    assert third.notes == ["no_unprocessed_episodes"]
 
 
 def test_brain_v2_uses_vercel_gateway_and_grillo_v2_store(tmp_path):
@@ -494,4 +549,17 @@ def test_brain_v2_backfill_and_status_formatting(tmp_path):
     assert "entities=`1`" in _format_status(status)
     assert "grillo_v1" in _format_backfill_results(
         {"grillo_v1": SimpleNamespace(episodes=1, entities=0, evidence=2, facts=3, skipped=0)}
+    )
+    assert "memory_docs=`1`" in _format_worker_result(
+        SimpleNamespace(
+            scopes=1,
+            batches=1,
+            episodes=2,
+            evidence=0,
+            facts=0,
+            opinions=0,
+            memory_docs=1,
+            invalidated_facts=0,
+            notes=["ok"],
+        )
     )

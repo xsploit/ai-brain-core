@@ -440,6 +440,46 @@ class SQLiteGrilloV2Store:
             ).fetchall()
         return [_episode_from_row(row) for row in reversed(rows)]
 
+    def list_episode_scopes(self, *, limit: int = 50) -> list[str]:
+        with self._lock:
+            rows = self._connect().execute(
+                """
+                SELECT scope_key, MAX(occurred_at) AS latest
+                FROM grillo_v2_episodes
+                GROUP BY scope_key
+                ORDER BY latest ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [str(row["scope_key"]) for row in rows]
+
+    def list_episodes_after(
+        self,
+        scope_key: str,
+        *,
+        after_occurred_at: str | None = None,
+        after_episode_id: str | None = None,
+        limit: int = 12,
+    ) -> list[GrilloEpisode]:
+        where = ["scope_key = ?"]
+        params: list[Any] = [scope_key]
+        if after_occurred_at is not None:
+            where.append("(occurred_at > ? OR (occurred_at = ? AND episode_id > ?))")
+            params.extend([after_occurred_at, after_occurred_at, after_episode_id or ""])
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._connect().execute(
+                f"""
+                SELECT * FROM grillo_v2_episodes
+                WHERE {' AND '.join(where)}
+                ORDER BY occurred_at ASC, episode_id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_episode_from_row(row) for row in rows]
+
     def list_active_facts(
         self,
         scope_key: str,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .context import GrilloContextBuilder
-from .models import Evidence, EvidenceGap, GrilloEpisode, GrilloMemoryDocument, OpinionEdge, TemporalFact
+from .models import Evidence, EvidenceGap, GrilloEpisode, GrilloMemoryDocument, OpinionEdge, TemporalFact, from_json_dict
 from .store import SQLiteGrilloV2Store
 
 
@@ -21,6 +22,32 @@ class ReflectionResult:
     memory_docs: int = 0
     invalidated_facts: int = 0
     notes: str = ""
+
+
+@dataclass(slots=True)
+class WorkerTickResult:
+    scopes: int = 0
+    batches: int = 0
+    episodes: int = 0
+    evidence: int = 0
+    facts: int = 0
+    opinions: int = 0
+    memory_docs: int = 0
+    invalidated_facts: int = 0
+    notes: list[str] | None = None
+
+    def add(self, result: ReflectionResult) -> None:
+        self.batches += 1
+        self.episodes += result.episodes
+        self.evidence += result.evidence
+        self.facts += result.facts
+        self.opinions += result.opinions
+        self.memory_docs += result.memory_docs
+        self.invalidated_facts += result.invalidated_facts
+        if result.notes:
+            if self.notes is None:
+                self.notes = []
+            self.notes.append(result.notes)
 
 
 class GrilloV2Runtime:
@@ -92,6 +119,85 @@ class GrilloV2Runtime:
         result = self.apply_reflection(scope_key=scope_key, payload=payload)
         result.episodes = len(episodes)
         return result
+
+    async def reflect_unprocessed(
+        self,
+        *,
+        scope_key: str,
+        cursor_key: str | None = None,
+        limit: int = 12,
+    ) -> ReflectionResult:
+        if self.completion is None:
+            return ReflectionResult(notes="no_completion")
+        cursor_key = cursor_key or self.worker_cursor_key(scope_key)
+        cursor = _cursor_value(self.store.get_cursor(cursor_key))
+        episodes = self.store.list_episodes_after(
+            scope_key,
+            after_occurred_at=cursor.get("occurred_at"),
+            after_episode_id=cursor.get("episode_id"),
+            limit=limit,
+        )
+        if not episodes:
+            return ReflectionResult(notes="no_unprocessed_episodes")
+        packet = self.build_context_packet(
+            scope_key=scope_key,
+            actor_id=episodes[-1].actor_id,
+            channel_id=episodes[-1].channel_id,
+            query="\n".join(episode.content for episode in episodes[-3:]),
+        )
+        payload = await self.completion(
+            {
+                "schema": GRILLO_V2_REFLECTION_SCHEMA,
+                "mode": "worker_tick",
+                "scope_key": scope_key,
+                "cursor_key": cursor_key,
+                "cursor": cursor,
+                "persona_id": self.persona_id,
+                "context_packet": packet.as_prompt_text(),
+                "episodes": [_episode_payload(episode) for episode in episodes],
+            }
+        )
+        result = self.apply_reflection(scope_key=scope_key, payload=payload)
+        result.episodes = len(episodes)
+        last = episodes[-1]
+        self.store.set_cursor(
+            cursor_key,
+            scope_key,
+            json.dumps(
+                {"occurred_at": last.occurred_at, "episode_id": last.episode_id},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        return result
+
+    async def worker_tick(
+        self,
+        *,
+        scope_key: str | None = None,
+        scope_limit: int = 10,
+        batch_size: int = 12,
+        max_batches: int = 3,
+    ) -> WorkerTickResult:
+        scopes = [scope_key] if scope_key is not None else self.store.list_episode_scopes(limit=scope_limit)
+        result = WorkerTickResult(scopes=len(scopes), notes=[])
+        for scope in scopes:
+            if result.batches >= max(1, int(max_batches)):
+                break
+            batch = await self.reflect_unprocessed(
+                scope_key=scope,
+                limit=max(1, int(batch_size)),
+            )
+            if batch.notes == "no_unprocessed_episodes":
+                continue
+            result.add(batch)
+        if not result.notes:
+            result.notes = ["no_unprocessed_episodes" if scopes else "no_scopes"]
+        return result
+
+    def worker_cursor_key(self, scope_key: str) -> str:
+        return f"grillo_v2_worker:{self.persona_id}:{scope_key}"
 
     def apply_reflection(self, *, scope_key: str, payload: dict[str, Any]) -> ReflectionResult:
         result = ReflectionResult(notes=str(payload.get("notes") or ""))
@@ -212,6 +318,16 @@ def _episode_payload(episode: GrilloEpisode) -> dict[str, Any]:
         "content": episode.content,
         "occurred_at": episode.occurred_at,
         "metadata": episode.metadata,
+    }
+
+
+def _cursor_value(value: str | None) -> dict[str, str | None]:
+    data = from_json_dict(value)
+    occurred_at = data.get("occurred_at")
+    episode_id = data.get("episode_id")
+    return {
+        "occurred_at": str(occurred_at) if occurred_at else None,
+        "episode_id": str(episode_id) if episode_id else None,
     }
 
 

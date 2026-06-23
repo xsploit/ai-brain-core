@@ -11,7 +11,7 @@ from .models import (
     OpinionEdge,
     TemporalFact,
 )
-from .runtime import GrilloV2Runtime, ReflectionResult
+from .runtime import GrilloV2Runtime, ReflectionResult, WorkerTickResult
 from .store import SQLiteGrilloV2Store
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "SQLiteGrilloV2Store",
     "TemporalFact",
     "VercelAIGatewayJSONClient",
+    "WorkerTickResult",
     "backfill_discord_identity",
     "backfill_grillo_v1",
 ]

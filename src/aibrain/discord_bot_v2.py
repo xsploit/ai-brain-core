@@ -41,6 +41,7 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_status_command(self))
         self.add_command(_context_command(self))
         self.add_command(_reflect_command(self))
+        self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
 
     async def on_ready(self) -> None:
@@ -156,6 +157,23 @@ def _reflect_command(bot: DiscordBrainV2Bot):
     return reflect
 
 
+def _worker_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="worker")
+    async def worker(ctx: commands.Context, batch_size: int = 12, max_batches: int = 1) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        async with ctx.channel.typing():
+            result = await bot.brain_v2.worker_tick(
+                scope_key=_scope_for_message(ctx.message),
+                batch_size=max(1, min(50, int(batch_size))),
+                max_batches=max(1, min(10, int(max_batches))),
+            )
+        await ctx.reply(_format_worker_result(result), mention_author=False)
+
+    return worker
+
+
 def _backfill_command(bot: DiscordBrainV2Bot):
     @commands.command(name="backfill")
     async def backfill(ctx: commands.Context, limit: int = 10_000) -> None:
@@ -210,6 +228,18 @@ def _format_backfill_results(results: dict[str, Any]) -> str:
             f"skipped=`{getattr(result, 'skipped', 0)}`"
         )
     return "\n".join(parts)
+
+
+def _format_worker_result(result: Any) -> str:
+    notes = ", ".join(getattr(result, "notes", []) or [])
+    return (
+        "GRILLO v2 worker: "
+        f"scopes=`{getattr(result, 'scopes', 0)}` batches=`{getattr(result, 'batches', 0)}` "
+        f"episodes=`{getattr(result, 'episodes', 0)}` evidence=`{getattr(result, 'evidence', 0)}` "
+        f"facts=`{getattr(result, 'facts', 0)}` opinions=`{getattr(result, 'opinions', 0)}` "
+        f"memory_docs=`{getattr(result, 'memory_docs', 0)}` "
+        f"invalidated=`{getattr(result, 'invalidated_facts', 0)}` notes=`{notes}`"
+    )
 
 
 def _scope_for_message(message: discord.Message) -> str:

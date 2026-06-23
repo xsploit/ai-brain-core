@@ -155,6 +155,21 @@ class BrainV2:
             limit=limit,
         )
 
+    async def worker_tick(
+        self,
+        *,
+        scope_key: str | None = None,
+        scope_limit: int = 10,
+        batch_size: int = 12,
+        max_batches: int = 3,
+    ):
+        return await self.grillo.worker_tick(
+            scope_key=scope_key,
+            scope_limit=scope_limit,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+
     def backfill_from_v1(
         self,
         *,
