@@ -4,6 +4,7 @@ import asyncio
 from collections import defaultdict, deque
 from contextlib import suppress
 import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,11 +19,13 @@ from .discord_bot import (
     DEFAULT_DISCORD_TOOL_NAMES,
     DISCORD_CONTEXT,
     JBPromptAddView,
+    ModelSelectView,
     _build_jb_persona,
     _image_inputs as _v1_image_inputs,
     _jb_prompt_cache_key,
     _load_jb_prompt,
     _match_piper_voice,
+    _ordered_model_choices as _ordered_model_choices_for_v2,
     _text_attachment_context as _v1_text_attachment_context,
     _tts_spoken_text,
     build_brain,
@@ -33,6 +36,7 @@ from .discord_bot import (
 )
 from .discord_tools import DISCORD_TOOL_CONTEXT, DiscordToolRuntime
 from .env import load_env_file
+from .model_catalog import ModelChoice, list_model_choices
 from .policy import MemoryPolicy
 from .tavily_tools import TavilyConfigError, tavily_search
 
@@ -74,6 +78,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
         self.tts_voice = os.getenv("DISCORD_BRAIN_V2_TTS_VOICE") or os.getenv("DISCORD_BRAIN_TTS_VOICE") or os.getenv("AIBRAIN_TTS_VOICE") or os.getenv("PIPER_VOICE")
         self.send_tts_replies = _env_bool("DISCORD_BRAIN_V2_TTS_REPLIES", _env_bool("DISCORD_BRAIN_TTS_REPLIES", False))
+        self.model_cache: dict[str, Any] = {"expires_at": 0.0, "models": None}
+        self.model_cache_lock = asyncio.Lock()
         self.rolling_context_messages = max(1, _env_int("DISCORD_BRAIN_V2_ROLLING_CONTEXT_MESSAGES", 15))
         self.recent_by_scope: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=max(self.rolling_context_messages * 4, 32))
@@ -100,6 +106,7 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_summary_command(self))
         self.add_command(_search_command(self))
         self.add_command(_ping_command(self))
+        self.add_command(_model_control_group(self))
         self.add_command(_jb_command(self))
         self.add_command(_say_command(self))
         self.add_command(_tts_control_group(self))
@@ -222,6 +229,49 @@ class DiscordBrainV2Bot(commands.Bot):
     def _bot_interactions_enabled(self) -> bool:
         return bool(not self.ignore_bots and self.respond_to_bots)
 
+    def _current_model(self) -> str:
+        response_persona = getattr(self.brain_v2, "response_persona", None)
+        response_model = getattr(response_persona, "model", None)
+        if response_model:
+            return str(response_model)
+        response_brain = getattr(self.brain_v2, "response_brain", None)
+        response_config = getattr(response_brain, "config", None)
+        default_model = getattr(response_config, "default_model", None)
+        if default_model:
+            return str(default_model)
+        return str(self.brain_v2.config.model)
+
+    def _set_runtime_model(self, model_id: str) -> None:
+        model_id = model_id.strip()
+        self.brain_v2.config.model = model_id
+        if hasattr(self.brain_v2.json_client, "model"):
+            self.brain_v2.json_client.model = model_id
+        response_brain = getattr(self.brain_v2, "response_brain", None)
+        if response_brain is not None and hasattr(getattr(response_brain, "config", None), "default_model"):
+            response_brain.config.default_model = model_id
+        response_persona = getattr(self.brain_v2, "response_persona", None)
+        if response_persona is not None:
+            if hasattr(response_persona, "model_copy"):
+                self.brain_v2.response_persona = response_persona.model_copy(update={"model": model_id})
+            else:
+                setattr(response_persona, "model", model_id)
+
+    async def _load_model_choices(self, *, refresh: bool = False) -> list[ModelChoice]:
+        response_brain = getattr(self.brain_v2, "response_brain", None)
+        if response_brain is None:
+            response_brain = _JSONClientModelCatalogAdapter(self.brain_v2.json_client)
+        ttl = int(getattr(getattr(response_brain, "config", None), "models_cache_ttl_seconds", 300) or 300)
+        choices = await list_model_choices(
+            response_brain,
+            cache=self.model_cache,
+            cache_lock=self.model_cache_lock,
+            ttl_seconds=ttl,
+            refresh=refresh,
+            default_models=(self._current_model(), self.brain_v2.config.model),
+            log=logger,
+        )
+        return _ordered_model_choices_for_v2(choices, self._current_model())
+
     async def _maybe_send_tts_reply(self, message: discord.Message, text: str) -> None:
         if not self.send_tts_replies or not self.discord_token or not text.strip():
             return
@@ -298,6 +348,7 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!search <query>` - explicit Tavily web search",
                     "`!remember <text>` - pin a manual GRILLO v2 memory for you",
                     "`!ping @user` - tag someone with a short hello",
+                    "`!model` / `!model set/info/export/refresh` - admin/owner model control",
                     "`!jb <message>` - separate one-shot JB path with no memory/tools",
                     "`!say <text>` - send a Piper Discord voice clip",
                     "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
@@ -439,6 +490,94 @@ def _ping_command(bot: DiscordBrainV2Bot):
         )
 
     return ping
+
+
+def _model_control_group(bot: DiscordBrainV2Bot):
+    @commands.group(name="model", invoke_without_command=True)
+    async def model_control(ctx: commands.Context) -> None:
+        await _send_model_picker(bot, ctx)
+
+    @model_control.command(name="refresh")
+    async def model_refresh(ctx: commands.Context) -> None:
+        await _send_model_picker(bot, ctx, refresh=True)
+
+    @model_control.command(name="set")
+    async def model_set(ctx: commands.Context, *, model_id: str) -> None:
+        if not await _require_admin_or_owner(bot, ctx, "model control"):
+            return
+        model_id = model_id.strip()
+        if not model_id:
+            await ctx.reply("usage: `!model set <model-id>`", mention_author=False)
+            return
+        choices = await bot._load_model_choices()
+        known = {choice.id for choice in choices}
+        bot._set_runtime_model(model_id)
+        note = "" if model_id in known else " (manual id; not in cached model metadata)"
+        await ctx.reply(f"model set to `{model_id}`{note}", mention_author=False)
+
+    @model_control.command(name="info")
+    async def model_info(ctx: commands.Context, *, model_id: str = "") -> None:
+        await _send_model_info(bot, ctx, model_id=model_id or None)
+
+    @model_control.command(name="export")
+    async def model_export(ctx: commands.Context) -> None:
+        await _send_model_metadata_export(bot, ctx)
+
+    return model_control
+
+
+async def _send_model_picker(bot: DiscordBrainV2Bot, ctx: commands.Context, *, refresh: bool = False) -> None:
+    if not await _require_admin_or_owner(bot, ctx, "model control"):
+        return
+    choices = await bot._load_model_choices(refresh=refresh)
+    if not choices:
+        await ctx.reply("no model choices are available.", mention_author=False)
+        return
+    view = ModelSelectView(bot, ctx.author.id, choices)
+    await ctx.reply(view.message_text(), view=view, mention_author=False)
+
+
+async def _send_model_metadata_export(bot: DiscordBrainV2Bot, ctx: commands.Context, *, refresh: bool = False) -> None:
+    if not await _require_admin_or_owner(bot, ctx, "model metadata export"):
+        return
+    choices = await bot._load_model_choices(refresh=refresh)
+    payload = [
+        {
+            "id": choice.id,
+            "label": choice.label,
+            "owned_by": choice.owned_by,
+            "created": choice.created,
+            "metadata": choice.metadata or {},
+        }
+        for choice in choices
+    ]
+    data = io.BytesIO(json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8"))
+    await ctx.reply(
+        "model metadata export",
+        file=discord.File(data, filename="discord-models.json"),
+        mention_author=False,
+    )
+
+
+async def _send_model_info(bot: DiscordBrainV2Bot, ctx: commands.Context, *, model_id: str | None = None) -> None:
+    if not await _require_admin_or_owner(bot, ctx, "model info"):
+        return
+    target = (model_id or bot._current_model()).strip()
+    choices = await bot._load_model_choices()
+    choice = next((item for item in choices if item.id == target), None)
+    if choice is None:
+        await ctx.reply(f"`{target}` is not in cached model metadata.", mention_author=False)
+        return
+    metadata = choice.metadata or {}
+    lines = [
+        f"id: `{choice.id}`",
+        f"owned_by: `{choice.owned_by or metadata.get('owned_by') or 'unknown'}`",
+        f"created: `{choice.created or metadata.get('created') or 'unknown'}`",
+    ]
+    for key in ("provider", "context_window", "max_output_tokens", "input_modalities", "output_modalities"):
+        if key in metadata:
+            lines.append(f"{key}: `{metadata[key]}`")
+    await ctx.reply("\n".join(lines)[: bot.max_reply_chars], mention_author=False)
 
 
 def _jb_command(bot: DiscordBrainV2Bot):
@@ -730,6 +869,12 @@ async def _require_admin_or_owner(bot: DiscordBrainV2Bot, ctx: commands.Context,
     return False
 
 
+class _JSONClientModelCatalogAdapter:
+    def __init__(self, json_client: Any):
+        self.client = getattr(json_client, "client", None)
+        self.config = type("ModelCatalogConfig", (), {"models_cache_ttl_seconds": 300})()
+
+
 def _format_status(status: dict[str, Any]) -> str:
     counts = status.get("counts") if isinstance(status.get("counts"), dict) else {}
     return (
@@ -788,6 +933,7 @@ def _build_command_prefix(command_prefix_text: str):
         "search",
         "remember",
         "ping",
+        "model",
         "jb",
         "say",
         "tts",

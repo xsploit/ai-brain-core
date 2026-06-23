@@ -8,6 +8,7 @@ import pytest
 
 import aibrain.discord_bot_v2 as discord_bot_v2_module
 from aibrain.brain_v2 import BrainV2, BrainV2Config
+from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     DiscordBrainV2Bot,
@@ -1048,6 +1049,46 @@ async def test_discord_bot_v2_tts_reply_uses_v1_voice_clip_builder(monkeypatch):
         ("clip", response_brain, "ok", "neuro-sama"),
         ("send", 333, "discord-token", b"ogg"),
     ]
+
+
+def test_discord_bot_v2_runtime_model_set_updates_all_backends():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    response_persona = SimpleNamespace(model="old-model")
+    response_brain = SimpleNamespace(config=SimpleNamespace(default_model="old-model"))
+    json_client = SimpleNamespace(model="old-model")
+    bot.brain_v2 = SimpleNamespace(
+        config=SimpleNamespace(model="old-model"),
+        json_client=json_client,
+        response_brain=response_brain,
+        response_persona=response_persona,
+    )
+
+    bot._set_runtime_model("deepseek/new-model")
+
+    assert bot._current_model() == "deepseek/new-model"
+    assert bot.brain_v2.config.model == "deepseek/new-model"
+    assert json_client.model == "deepseek/new-model"
+    assert response_brain.config.default_model == "deepseek/new-model"
+    assert response_persona.model == "deepseek/new-model"
+
+
+def test_discord_bot_v2_uses_v1_model_select_view():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.brain_v2 = SimpleNamespace(
+        config=SimpleNamespace(model="deepseek/current"),
+        json_client=SimpleNamespace(model="deepseek/current"),
+        response_brain=SimpleNamespace(config=SimpleNamespace(default_model="deepseek/current")),
+        response_persona=SimpleNamespace(model="deepseek/current"),
+    )
+    choices = [
+        ModelChoice(id="openai/other", label="openai/other"),
+        ModelChoice(id="deepseek/current", label="deepseek/current"),
+    ]
+
+    view = discord_bot_v2_module.ModelSelectView(bot, owner_id=123, choices=choices)
+
+    assert "current model: `deepseek/current`" in view.message_text()
+    assert view.choices[0].id == "deepseek/current"
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):
