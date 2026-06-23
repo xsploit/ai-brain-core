@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -1128,6 +1129,29 @@ def test_discord_bot_v2_formats_grillo_diagnostics():
     assert "context continuity" in documents
     assert "trust" in opinions
     assert "+0.75" in opinions
+
+
+def test_discord_bot_v2_remember_text_supports_summary_action_view(tmp_path):
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3"),
+        json_client=SimpleNamespace(),
+    )
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.brain_v2 = brain
+
+    record = asyncio.run(
+        bot._remember_text(
+            "discord:guild:1:persona:v2",
+            120418341775998976,
+            "Channel summary from bot-chat:\nSubby fixed context.",
+            source="discord_summary_panel",
+        )
+    )
+    documents = brain.store.list_memory_documents("discord:guild:1:persona:v2", limit=10)
+
+    assert record.id == documents[0].memory_id
+    assert documents[0].metadata["source"] == "discord_summary_panel"
+    assert "Subby fixed context." in documents[0].body
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):

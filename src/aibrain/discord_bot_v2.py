@@ -21,6 +21,7 @@ from .discord_bot import (
     DISCORD_CONTEXT,
     JBPromptAddView,
     ModelSelectView,
+    SummaryActionView,
     _build_jb_persona,
     _image_inputs as _v1_image_inputs,
     _jb_prompt_cache_key,
@@ -231,6 +232,19 @@ class DiscordBrainV2Bot(commands.Bot):
 
     def _bot_interactions_enabled(self) -> bool:
         return bool(not self.ignore_bots and self.respond_to_bots)
+
+    async def _remember_text(self, scope: str, author_id: int, content: str, *, source: str):
+        document = GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="manual_memory",
+            subject_id=f"discord_user:{author_id}",
+            title=f"Manual memory from {source}",
+            body=content,
+            importance=0.85,
+            metadata={"source": source, "author_id": author_id},
+        )
+        self.brain_v2.store.upsert_memory_document(document)
+        return type("RememberedDocument", (), {"id": document.memory_id})()
 
     def _current_model(self) -> str:
         response_persona = getattr(self.brain_v2, "response_persona", None)
@@ -455,7 +469,10 @@ def _summary_command(bot: DiscordBrainV2Bot):
                 prompt="\n".join(messages),
                 store=False,
             )
-        await ctx.reply((text.strip() or "no summary generated.")[: bot.max_reply_chars], mention_author=False)
+        summary_text = (text.strip() or "no summary generated.")[: bot.max_reply_chars]
+        source_label = getattr(ctx.channel, "name", None) or str(getattr(ctx.channel, "id", "channel"))
+        view = SummaryActionView(bot, ctx.author.id, _scope_for_message(ctx.message), summary_text, source_label)
+        await ctx.reply(summary_text, mention_author=False, view=view)
 
     return summary
 
