@@ -319,7 +319,7 @@ class _FakeModelBot:
 
 
 def _fake_message(created_at: datetime):
-    author = SimpleNamespace(id=123, display_name="Subsect", global_name=None, bot=False)
+    author = SimpleNamespace(id=123, name="subsect", display_name="Subsect", global_name=None, bot=False)
     channel = _FakeChannel()
     reply = _FakeReply(channel)
     events = []
@@ -444,7 +444,8 @@ def test_discord_prompt_includes_reply_target_context(monkeypatch):
     assert "Karah" in prompt
     assert "should I move the model dropdown into a paginated UI?" in prompt
     assert "Interpret short responses like yes/no/yep/nope/that one" in prompt
-    assert "Current Discord message from Subsect (author_id=123):\nyep" in prompt
+    assert "Current Discord message from Subsect (username=subsect, display_name=Subsect, author_id=123" in prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):\nyep" in prompt
 
 
 def test_discord_prompt_distinguishes_current_speaker_from_replied_exchange(monkeypatch):
@@ -480,7 +481,8 @@ def test_discord_prompt_distinguishes_current_speaker_from_replied_exchange(monk
     assert "Neuro-sama (bot): you are IST, GMT+5:30, obviously." in prompt
     assert "The replied-to message was itself replying to Karah (author_id=456)." in prompt
     assert "Current speaker is Subsect (author_id=123)" in prompt
-    assert "Current Discord message from Subsect (author_id=123):\nPDT" in prompt
+    assert "Current Discord message from Subsect (username=subsect, display_name=Subsect, author_id=123" in prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):\nPDT" in prompt
 
 
 def test_discord_prompt_uses_recent_cache_for_bot_reply_addressee(monkeypatch):
@@ -570,11 +572,15 @@ def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
     assert "author_id: 123" in brain.prompt
     assert "author_username: subsect" in brain.prompt
     assert "author_display_name: SUBSECT" in brain.prompt
+    assert "guild_name: Test Guild" in brain.prompt
+    assert "Current Discord message from SUBSECT (username=subsect, display_name=SUBSECT, author_id=123" in brain.prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):" in brain.prompt
     metadata = grillo.ingests[0]["metadata"]
     assert metadata["author_id"] == 123
     assert metadata["author_username"] == "subsect"
     assert metadata["author_display_name"] == "SUBSECT"
     assert metadata["guild_id"] == 222
+    assert metadata["guild_name"] == "Test Guild"
     assert metadata["channel_id"] == 456
     assert grillo.ingests[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
     assert grillo.ingests[0]["run_tick"] is False

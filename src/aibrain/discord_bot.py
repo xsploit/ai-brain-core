@@ -2881,9 +2881,17 @@ class DiscordBrainBot(commands.Bot):
         recent_section = f"{recent_block}\n\n" if recent_block else ""
         codex_block = "\n".join(self._codex_bridge_updates_for_message(message))
         codex_section = f"{codex_block}\n\n" if codex_block else ""
+        metadata = discord_context["discord_metadata"]
+        author_display_name = metadata.get("author_display_name") or discord_context["author"]
+        author_username = metadata.get("author_username") or "unknown"
+        server_name = metadata.get("guild_name") or "DM"
+        server_id = metadata.get("guild_id") or "none"
+        channel_name = metadata.get("channel_name") or discord_context["channel"]
+        channel_id = metadata.get("channel_id") or "none"
         current_message = (
-            f"Current Discord message from {discord_context['author']} "
-            f"(author_id={discord_context['author_id']}):\n"
+            f"Current Discord message from {author_display_name} "
+            f"(username={author_username}, display_name={author_display_name}, author_id={discord_context['author_id']}, "
+            f"server_name={server_name}, server_id={server_id}, channel_name={channel_name}, channel_id={channel_id}):\n"
             f"{user_text}"
         )
         prompt = (
