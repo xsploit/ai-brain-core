@@ -826,11 +826,41 @@ async def test_brain_v2_can_use_v1_stream_backend_with_tools_and_memory(tmp_path
     assert call["thread_id"] == "discord:guild:1:persona:v2:actor:discord_user:subby"
     assert call["tool_names"] == ["discord_context", "tavily_search"]
     assert call["use_memory"] is memory_policy
+    assert call["persona"].tools == ["discord_context", "tavily_search"]
     assert "# GRILLO v2 Context" in call["prompt"]
     assert "Karah: previous" in call["prompt"]
     assert "Yappy Neuro persona." in call["persona"].instructions
     assert "Use the GRILLO v2 context packet" in call["persona"].instructions
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_send_final_reply_splits_long_messages():
+    events = []
+
+    class FakeChannel:
+        async def send(self, content):
+            events.append(("send", content))
+
+    class FakeMessage:
+        def __init__(self):
+            self.channel = FakeChannel()
+
+        async def reply(self, content, mention_author=False):
+            events.append(("reply", content, mention_author))
+            return SimpleNamespace(id=1)
+
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.max_reply_chars = 20
+    message = FakeMessage()
+
+    sent = await bot._send_final_reply(message, "alpha beta gamma delta epsilon")
+
+    assert sent.id == 1
+    assert events == [
+        ("reply", "alpha beta gamma", False),
+        ("send", "delta epsilon"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ from .discord_bot import (
     _load_jb_prompt,
     _match_piper_voice,
     _ordered_model_choices as _ordered_model_choices_for_v2,
+    _split_discord_text,
     _text_attachment_context as _v1_text_attachment_context,
     _tts_spoken_text,
     build_brain,
@@ -243,7 +244,7 @@ class DiscordBrainV2Bot(commands.Bot):
             DISCORD_TOOL_CONTEXT.reset(tool_token)
             DISCORD_CONTEXT.reset(context_token)
         if response:
-            await message.reply(response[: self.max_reply_chars], mention_author=False)
+            await self._send_final_reply(message, response)
             await self._maybe_send_tts_reply(message, response)
 
     def _allowed(self, message: discord.Message) -> bool:
@@ -355,6 +356,16 @@ class DiscordBrainV2Bot(commands.Bot):
             await send_discord_voice_message(message.channel.id, self.discord_token, clip)
         except Exception:
             logger.exception("Failed to send Discord Brain v2 TTS reply")
+
+    async def _send_final_reply(self, message: discord.Message, text: str) -> discord.Message | None:
+        chunks = _split_discord_text(text, min(self.max_reply_chars, 1900))
+        first_sent = None
+        for index, chunk in enumerate(chunks):
+            if index == 0:
+                first_sent = await message.reply(chunk, mention_author=False)
+            else:
+                await message.channel.send(chunk)
+        return first_sent
 
     def _record_discord_message(self, message: discord.Message):
         text = _message_text(message)
