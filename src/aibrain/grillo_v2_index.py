@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from grillo_v2 import (
+    Evidence,
     GrilloMemoryDocument,
+    GrilloEntity,
+    GrilloEpisode,
     OpinionEdge,
     SQLiteGrilloV2Store,
     TemporalFact as GrilloTemporalFact,
@@ -22,6 +26,388 @@ class GrilloV2PackageRecall:
     graph_facts: list[TemporalFact] = field(default_factory=list)
     vector_hits: list[RecallHit] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+class GrilloV2LadybugMirror:
+    """Structured Ladybug mirror for GRILLO v2 graph diagnostics/traversal."""
+
+    def __init__(self, graph_store: Any, *, persona_id: str):
+        self.graph_store = graph_store
+        self.conn = graph_store.conn
+        self.persona_id = persona_id
+        self.last_counts: dict[str, int] = {}
+        self._initialized = False
+
+    @classmethod
+    def from_graph_store(cls, graph_store: Any, *, persona_id: str) -> "GrilloV2LadybugMirror | None":
+        if type(graph_store).__name__ != "LadybugGraphMemoryStore":
+            return None
+        if getattr(graph_store, "conn", None) is None or not hasattr(graph_store, "_call_locked"):
+            return None
+        return cls(graph_store, persona_id=persona_id)
+
+    async def sync_scope(
+        self,
+        *,
+        entities: list[GrilloEntity],
+        episodes: list[GrilloEpisode],
+        evidence: list[Evidence],
+        facts: list[GrilloTemporalFact],
+        opinions: list[OpinionEdge],
+        documents: list[GrilloMemoryDocument],
+    ) -> None:
+        await self.graph_store._call_locked(
+            self._sync_scope_sync,
+            entities,
+            episodes,
+            evidence,
+            facts,
+            opinions,
+            documents,
+        )
+
+    def _sync_scope_sync(
+        self,
+        entities: list[GrilloEntity],
+        episodes: list[GrilloEpisode],
+        evidence: list[Evidence],
+        facts: list[GrilloTemporalFact],
+        opinions: list[OpinionEdge],
+        documents: list[GrilloMemoryDocument],
+    ) -> None:
+        self._init_schema()
+        for entity in entities:
+            self._upsert_entity(entity)
+        for episode in episodes:
+            self._upsert_episode(episode)
+        for item in evidence:
+            self._upsert_evidence(item)
+        for fact in facts:
+            self._upsert_fact(fact)
+        for edge in opinions:
+            self._upsert_opinion(edge)
+        for document in documents:
+            self._upsert_document(document)
+        self.last_counts = {
+            "entities": len(entities),
+            "episodes": len(episodes),
+            "evidence": len(evidence),
+            "facts": len(facts),
+            "opinions": len(opinions),
+            "memory_docs": len(documents),
+        }
+
+    def _init_schema(self) -> None:
+        if self._initialized:
+            return
+        for statement in (
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloEntity(
+                id STRING PRIMARY KEY,
+                entity_type STRING,
+                name STRING,
+                aliases_json STRING,
+                metadata_json STRING,
+                updated_at STRING
+            );
+            """,
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloEpisode(
+                id STRING PRIMARY KEY,
+                scope_key STRING,
+                source STRING,
+                actor_id STRING,
+                participant_ids_json STRING,
+                channel_id STRING,
+                content_preview STRING,
+                metadata_json STRING,
+                occurred_at STRING
+            );
+            """,
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloEvidence(
+                id STRING PRIMARY KEY,
+                scope_key STRING,
+                episode_id STRING,
+                quote STRING,
+                extractor STRING,
+                confidence DOUBLE,
+                metadata_json STRING,
+                created_at STRING
+            );
+            """,
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloTemporalFact(
+                id STRING PRIMARY KEY,
+                scope_key STRING,
+                subject_id STRING,
+                predicate STRING,
+                object_value STRING,
+                claim STRING,
+                confidence DOUBLE,
+                valid_from STRING,
+                valid_to STRING,
+                evidence_ids_json STRING,
+                contradicts_json STRING,
+                missing_evidence_json STRING,
+                metadata_json STRING,
+                updated_at STRING
+            );
+            """,
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloOpinionEdge(
+                id STRING PRIMARY KEY,
+                scope_key STRING,
+                source_id STRING,
+                target_id STRING,
+                relation STRING,
+                score DOUBLE,
+                rationale STRING,
+                evidence_ids_json STRING,
+                valid_from STRING,
+                valid_to STRING,
+                metadata_json STRING,
+                updated_at STRING
+            );
+            """,
+            """
+            CREATE NODE TABLE IF NOT EXISTS GrilloMemoryDocument(
+                id STRING PRIMARY KEY,
+                scope_key STRING,
+                document_type STRING,
+                subject_id STRING,
+                title STRING,
+                body_preview STRING,
+                importance DOUBLE,
+                evidence_ids_json STRING,
+                metadata_json STRING,
+                updated_at STRING
+            );
+            """,
+            "CREATE REL TABLE IF NOT EXISTS EPISODE_ACTOR(FROM GrilloEpisode TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS EPISODE_PARTICIPANT(FROM GrilloEpisode TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS EVIDENCE_FROM_EPISODE(FROM GrilloEvidence TO GrilloEpisode);",
+            "CREATE REL TABLE IF NOT EXISTS FACT_SUBJECT(FROM GrilloTemporalFact TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS FACT_EVIDENCE(FROM GrilloTemporalFact TO GrilloEvidence);",
+            "CREATE REL TABLE IF NOT EXISTS OPINION_SOURCE(FROM GrilloOpinionEdge TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS OPINION_TARGET(FROM GrilloOpinionEdge TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS OPINION_EVIDENCE(FROM GrilloOpinionEdge TO GrilloEvidence);",
+            "CREATE REL TABLE IF NOT EXISTS MEMORY_SUBJECT(FROM GrilloMemoryDocument TO GrilloEntity);",
+            "CREATE REL TABLE IF NOT EXISTS MEMORY_EVIDENCE(FROM GrilloMemoryDocument TO GrilloEvidence);",
+        ):
+            self.conn.execute(statement)
+        self._initialized = True
+
+    def _upsert_entity(self, entity: GrilloEntity) -> None:
+        self.conn.execute(
+            """
+            MERGE (e:GrilloEntity {id: $id})
+            SET e.entity_type = $entity_type,
+                e.name = $name,
+                e.aliases_json = $aliases_json,
+                e.metadata_json = $metadata_json,
+                e.updated_at = $updated_at
+            """,
+            {
+                "id": entity.entity_id,
+                "entity_type": entity.entity_type,
+                "name": entity.name,
+                "aliases_json": _json(entity.aliases),
+                "metadata_json": _json(entity.metadata),
+                "updated_at": str(entity.metadata.get("updated_at") or ""),
+            },
+        )
+
+    def _upsert_stub_entity(self, entity_id: str | None) -> None:
+        if not entity_id:
+            return
+        self.conn.execute(
+            """
+            MERGE (e:GrilloEntity {id: $id})
+            """,
+            {"id": entity_id},
+        )
+
+    def _upsert_episode(self, episode: GrilloEpisode) -> None:
+        self._upsert_stub_entity(episode.actor_id)
+        for participant_id in episode.participant_ids:
+            self._upsert_stub_entity(participant_id)
+        self.conn.execute(
+            """
+            MERGE (e:GrilloEpisode {id: $id})
+            SET e.scope_key = $scope_key,
+                e.source = $source,
+                e.actor_id = $actor_id,
+                e.participant_ids_json = $participant_ids_json,
+                e.channel_id = $channel_id,
+                e.content_preview = $content_preview,
+                e.metadata_json = $metadata_json,
+                e.occurred_at = $occurred_at
+            """,
+            {
+                "id": episode.episode_id,
+                "scope_key": episode.scope_key,
+                "source": episode.source,
+                "actor_id": episode.actor_id,
+                "participant_ids_json": _json(episode.participant_ids),
+                "channel_id": episode.channel_id,
+                "content_preview": _preview(episode.content),
+                "metadata_json": _json(episode.metadata),
+                "occurred_at": episode.occurred_at,
+            },
+        )
+        if episode.actor_id:
+            self._rel("GrilloEpisode", episode.episode_id, "EPISODE_ACTOR", "GrilloEntity", episode.actor_id)
+        for participant_id in episode.participant_ids:
+            self._rel("GrilloEpisode", episode.episode_id, "EPISODE_PARTICIPANT", "GrilloEntity", participant_id)
+
+    def _upsert_evidence(self, evidence: Evidence) -> None:
+        self.conn.execute(
+            """
+            MERGE (e:GrilloEvidence {id: $id})
+            SET e.scope_key = $scope_key,
+                e.episode_id = $episode_id,
+                e.quote = $quote,
+                e.extractor = $extractor,
+                e.confidence = $confidence,
+                e.metadata_json = $metadata_json,
+                e.created_at = $created_at
+            """,
+            {
+                "id": evidence.evidence_id,
+                "scope_key": evidence.scope_key,
+                "episode_id": evidence.episode_id,
+                "quote": _preview(evidence.quote, limit=1200),
+                "extractor": evidence.extractor,
+                "confidence": float(evidence.confidence),
+                "metadata_json": _json(evidence.metadata),
+                "created_at": evidence.created_at,
+            },
+        )
+        self._rel("GrilloEvidence", evidence.evidence_id, "EVIDENCE_FROM_EPISODE", "GrilloEpisode", evidence.episode_id)
+
+    def _upsert_fact(self, fact: GrilloTemporalFact) -> None:
+        self._upsert_stub_entity(fact.subject_id)
+        self.conn.execute(
+            """
+            MERGE (f:GrilloTemporalFact {id: $id})
+            SET f.scope_key = $scope_key,
+                f.subject_id = $subject_id,
+                f.predicate = $predicate,
+                f.object_value = $object_value,
+                f.claim = $claim,
+                f.confidence = $confidence,
+                f.valid_from = $valid_from,
+                f.valid_to = $valid_to,
+                f.evidence_ids_json = $evidence_ids_json,
+                f.contradicts_json = $contradicts_json,
+                f.missing_evidence_json = $missing_evidence_json,
+                f.metadata_json = $metadata_json,
+                f.updated_at = $updated_at
+            """,
+            {
+                "id": fact.fact_id,
+                "scope_key": fact.scope_key,
+                "subject_id": fact.subject_id,
+                "predicate": fact.predicate,
+                "object_value": fact.object_value,
+                "claim": fact.claim,
+                "confidence": float(fact.confidence),
+                "valid_from": fact.valid_from,
+                "valid_to": fact.valid_to,
+                "evidence_ids_json": _json(fact.evidence_ids),
+                "contradicts_json": _json(fact.contradicts),
+                "missing_evidence_json": _json([dataclass_dict(gap) for gap in fact.missing_evidence]),
+                "metadata_json": _json(fact.metadata),
+                "updated_at": fact.updated_at,
+            },
+        )
+        self._rel("GrilloTemporalFact", fact.fact_id, "FACT_SUBJECT", "GrilloEntity", fact.subject_id)
+        for evidence_id in fact.evidence_ids:
+            self._rel("GrilloTemporalFact", fact.fact_id, "FACT_EVIDENCE", "GrilloEvidence", evidence_id)
+
+    def _upsert_opinion(self, edge: OpinionEdge) -> None:
+        self._upsert_stub_entity(edge.source_id)
+        self._upsert_stub_entity(edge.target_id)
+        self.conn.execute(
+            """
+            MERGE (o:GrilloOpinionEdge {id: $id})
+            SET o.scope_key = $scope_key,
+                o.source_id = $source_id,
+                o.target_id = $target_id,
+                o.relation = $relation,
+                o.score = $score,
+                o.rationale = $rationale,
+                o.evidence_ids_json = $evidence_ids_json,
+                o.valid_from = $valid_from,
+                o.valid_to = $valid_to,
+                o.metadata_json = $metadata_json,
+                o.updated_at = $updated_at
+            """,
+            {
+                "id": edge.edge_id,
+                "scope_key": edge.scope_key,
+                "source_id": edge.source_id,
+                "target_id": edge.target_id,
+                "relation": edge.relation,
+                "score": float(edge.score),
+                "rationale": edge.rationale,
+                "evidence_ids_json": _json(edge.evidence_ids),
+                "valid_from": edge.valid_from,
+                "valid_to": edge.valid_to,
+                "metadata_json": _json(edge.metadata),
+                "updated_at": edge.updated_at,
+            },
+        )
+        self._rel("GrilloOpinionEdge", edge.edge_id, "OPINION_SOURCE", "GrilloEntity", edge.source_id)
+        self._rel("GrilloOpinionEdge", edge.edge_id, "OPINION_TARGET", "GrilloEntity", edge.target_id)
+        for evidence_id in edge.evidence_ids:
+            self._rel("GrilloOpinionEdge", edge.edge_id, "OPINION_EVIDENCE", "GrilloEvidence", evidence_id)
+
+    def _upsert_document(self, document: GrilloMemoryDocument) -> None:
+        self._upsert_stub_entity(document.subject_id)
+        self.conn.execute(
+            """
+            MERGE (m:GrilloMemoryDocument {id: $id})
+            SET m.scope_key = $scope_key,
+                m.document_type = $document_type,
+                m.subject_id = $subject_id,
+                m.title = $title,
+                m.body_preview = $body_preview,
+                m.importance = $importance,
+                m.evidence_ids_json = $evidence_ids_json,
+                m.metadata_json = $metadata_json,
+                m.updated_at = $updated_at
+            """,
+            {
+                "id": document.memory_id,
+                "scope_key": document.scope_key,
+                "document_type": document.document_type,
+                "subject_id": document.subject_id,
+                "title": document.title,
+                "body_preview": _preview(document.body),
+                "importance": float(document.importance),
+                "evidence_ids_json": _json(document.evidence_ids),
+                "metadata_json": _json(document.metadata),
+                "updated_at": document.updated_at,
+            },
+        )
+        if document.subject_id:
+            self._rel("GrilloMemoryDocument", document.memory_id, "MEMORY_SUBJECT", "GrilloEntity", document.subject_id)
+        for evidence_id in document.evidence_ids:
+            self._rel("GrilloMemoryDocument", document.memory_id, "MEMORY_EVIDENCE", "GrilloEvidence", evidence_id)
+
+    def _rel(self, from_label: str, from_id: str | None, rel: str, to_label: str, to_id: str | None) -> None:
+        if not from_id or not to_id:
+            return
+        self.conn.execute(
+            f"""
+            MATCH (a:{from_label}), (b:{to_label})
+            WHERE a.id = $from_id AND b.id = $to_id
+            MERGE (a)-[:{rel}]->(b)
+            """,
+            {"from_id": from_id, "to_id": to_id},
+        )
 
 
 class GrilloV2PackageIndex:
@@ -48,6 +434,7 @@ class GrilloV2PackageIndex:
         self.sync_limit = max(1, int(sync_limit))
         self.recall_top_k = max(1, int(recall_top_k))
         self._synced: dict[str, str] = {}
+        self.structured_graph = GrilloV2LadybugMirror.from_graph_store(graph_store, persona_id=persona_id)
 
     @classmethod
     def from_path(
@@ -82,6 +469,8 @@ class GrilloV2PackageIndex:
         return {
             "graph_backend": type(self.graph_store).__name__,
             "vector_backend": type(self.vector_store).__name__ if self.vector_store is not None else None,
+            "structured_graph": type(self.structured_graph).__name__ if self.structured_graph is not None else None,
+            "structured_graph_last_counts": self.structured_graph.last_counts if self.structured_graph is not None else None,
             "synced_items": len(self._synced),
             "sync_limit": self.sync_limit,
             "recall_top_k": self.recall_top_k,
@@ -97,12 +486,23 @@ class GrilloV2PackageIndex:
                 close()
 
     async def sync_scope(self, store: SQLiteGrilloV2Store, scope_key: str) -> None:
-        facts = store.list_active_facts(scope_key, limit=self.sync_limit)
+        active_facts = store.list_active_facts(scope_key, limit=self.sync_limit)
+        all_facts = store.list_temporal_facts(scope_key, include_expired=True, limit=self.sync_limit)
         documents = store.list_memory_documents(scope_key, limit=self.sync_limit)
-        opinions = store.list_opinion_edges(scope_key, limit=self.sync_limit)
-        for fact in facts:
+        active_opinions = store.list_opinion_edges(scope_key, limit=self.sync_limit)
+        all_opinions = store.list_opinion_edges(scope_key, include_expired=True, limit=self.sync_limit)
+        if self.structured_graph is not None:
+            await self.structured_graph.sync_scope(
+                entities=store.list_entities(limit=self.sync_limit),
+                episodes=store.list_recent_episodes(scope_key, limit=self.sync_limit),
+                evidence=store.list_evidence(scope_key, limit=self.sync_limit),
+                facts=all_facts,
+                opinions=all_opinions,
+                documents=documents,
+            )
+        for fact in active_facts:
             await self._sync_fact(fact)
-        for edge in opinions:
+        for edge in active_opinions:
             await self._sync_opinion(edge)
         if self.vector_store is not None:
             for document in documents:
@@ -309,3 +709,12 @@ def _dedupe_graph_hits(hits: list[TemporalFact]) -> list[TemporalFact]:
         seen.add(hit.id)
         out.append(hit)
     return out
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _preview(value: str, *, limit: int = 2400) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."

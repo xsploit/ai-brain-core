@@ -662,16 +662,35 @@ async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
     scope = "discord:guild:1:persona:v2"
     actor = "discord_user:subby"
     store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
-    store.upsert_fact(
-        TemporalFact.create(
+    episode = store.append_episode(
+        GrilloEpisode.create(
             scope_key=scope,
-            subject_id=actor,
-            predicate="preferred_name",
-            object_value="Subby",
-            claim="Subby prefers being called Subby.",
-            confidence=0.92,
+            source="discord",
+            actor_id=actor,
+            participant_ids=[actor, "neuro-sama-v2"],
+            channel_id="333",
+            content="Subby prefers grounded memory.",
         )
     )
+    evidence = store.append_evidence(
+        Evidence.create(
+            scope_key=scope,
+            episode_id=episode.episode_id,
+            quote="prefers grounded memory",
+            extractor="test",
+            confidence=0.9,
+        )
+    )
+    fact = TemporalFact.create(
+        scope_key=scope,
+        subject_id=actor,
+        predicate="preferred_name",
+        object_value="Subby",
+        claim="Subby prefers being called Subby.",
+        evidence_ids=[evidence.evidence_id],
+        confidence=0.92,
+    )
+    store.upsert_fact(fact)
     store.upsert_opinion_edge(
         OpinionEdge.create(
             scope_key=scope,
@@ -680,6 +699,7 @@ async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
             relation="trust",
             score=0.7,
             rationale="Subby keeps checking whether memory is grounded.",
+            evidence_ids=[evidence.evidence_id],
         )
     )
     store.upsert_memory_document(
@@ -689,6 +709,7 @@ async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
             subject_id=actor,
             title="Context continuity",
             body="I noticed Subby cares about cross-channel context continuity.",
+            evidence_ids=[evidence.evidence_id],
             importance=0.85,
         )
     )
@@ -713,8 +734,31 @@ async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
 
     assert status["graph_backend"] == "LadybugGraphMemoryStore"
     assert status["vector_backend"] == "TurboVecRecallStore"
+    assert status["structured_graph"] == "GrilloV2LadybugMirror"
+    assert status["structured_graph_last_counts"]["evidence"] == 1
     assert {fact.metadata["grillo_v2_kind"] for fact in recall.graph_facts} >= {"temporal_fact", "opinion_edge"}
     assert any(hit.metadata["grillo_v2_kind"] == "memory_document" for hit in recall.vector_hits)
+    fact_edges = index.graph_store.conn.execute(
+        """
+        MATCH (f:GrilloTemporalFact)-[:FACT_SUBJECT]->(e:GrilloEntity)
+        RETURN f.id AS fact_id, e.id AS entity_id
+        """
+    ).rows_as_dict().get_all()
+    evidence_edges = index.graph_store.conn.execute(
+        """
+        MATCH (f:GrilloTemporalFact)-[:FACT_EVIDENCE]->(e:GrilloEvidence)-[:EVIDENCE_FROM_EPISODE]->(ep:GrilloEpisode)
+        RETURN f.id AS fact_id, e.id AS evidence_id, ep.id AS episode_id
+        """
+    ).rows_as_dict().get_all()
+
+    assert fact_edges == [{"fact_id": fact.fact_id, "entity_id": actor}]
+    assert evidence_edges == [
+        {
+            "fact_id": fact.fact_id,
+            "evidence_id": evidence.evidence_id,
+            "episode_id": episode.episode_id,
+        }
+    ]
     index.close()
 
 

@@ -220,6 +220,19 @@ class SQLiteGrilloV2Store:
             ).fetchall()
         return [_entity_from_row(row) for row in rows]
 
+    def list_evidence(self, scope_key: str, *, limit: int = 50) -> list[Evidence]:
+        with self._lock:
+            rows = self._connect().execute(
+                """
+                SELECT * FROM grillo_v2_evidence
+                WHERE scope_key = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (scope_key, max(1, int(limit))),
+            ).fetchall()
+        return [_evidence_from_row(row) for row in rows]
+
     def append_episode(self, episode: GrilloEpisode) -> GrilloEpisode:
         with self._lock:
             self._connect().execute(
@@ -488,13 +501,12 @@ class SQLiteGrilloV2Store:
         query: str = "",
         limit: int = 8,
     ) -> list[TemporalFact]:
-        where = ["scope_key = ?", "valid_to IS NULL"]
-        params: list[Any] = [scope_key]
-        if subject_id is not None:
-            where.append("subject_id = ?")
-            params.append(subject_id)
-        rows = self._fact_rows(where, params, limit=max(1, int(limit)) * 4)
-        facts = [_fact_from_row(row) for row in rows]
+        facts = self.list_temporal_facts(
+            scope_key,
+            subject_id=subject_id,
+            include_expired=False,
+            limit=max(1, int(limit)) * 4,
+        )
         if query.strip():
             facts = sorted(
                 facts,
@@ -504,6 +516,24 @@ class SQLiteGrilloV2Store:
             if subject_id is None:
                 facts = [fact for fact in facts if _text_score(query, fact.claim) > 0]
         return facts[: max(1, int(limit))]
+
+    def list_temporal_facts(
+        self,
+        scope_key: str,
+        *,
+        subject_id: str | None = None,
+        include_expired: bool = False,
+        limit: int = 50,
+    ) -> list[TemporalFact]:
+        where = ["scope_key = ?"]
+        params: list[Any] = [scope_key]
+        if not include_expired:
+            where.append("valid_to IS NULL")
+        if subject_id is not None:
+            where.append("subject_id = ?")
+            params.append(subject_id)
+        rows = self._fact_rows(where, params, limit=max(1, int(limit)))
+        return [_fact_from_row(row) for row in rows]
 
     def search_facts(self, scope_key: str, query: str, *, limit: int = 8) -> list[TemporalFact]:
         rows = self._fact_rows(["scope_key = ?", "valid_to IS NULL"], [scope_key], limit=500)
@@ -522,10 +552,13 @@ class SQLiteGrilloV2Store:
         *,
         source_id: str | None = None,
         target_id: str | None = None,
+        include_expired: bool = False,
         limit: int = 8,
     ) -> list[OpinionEdge]:
-        where = ["scope_key = ?", "valid_to IS NULL"]
+        where = ["scope_key = ?"]
         params: list[Any] = [scope_key]
+        if not include_expired:
+            where.append("valid_to IS NULL")
         if source_id is not None:
             where.append("source_id = ?")
             params.append(source_id)
@@ -621,6 +654,19 @@ def _episode_from_row(row: sqlite3.Row) -> GrilloEpisode:
         channel_id=row["channel_id"],
         occurred_at=row["occurred_at"],
         metadata=from_json_dict(row["metadata_json"]),
+    )
+
+
+def _evidence_from_row(row: sqlite3.Row) -> Evidence:
+    return Evidence(
+        evidence_id=row["evidence_id"],
+        scope_key=row["scope_key"],
+        episode_id=row["episode_id"],
+        quote=row["quote"],
+        extractor=row["extractor"],
+        confidence=float(row["confidence"]),
+        metadata=from_json_dict(row["metadata_json"]),
+        created_at=row["created_at"],
     )
 
 

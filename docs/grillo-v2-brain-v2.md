@@ -92,6 +92,8 @@ This is deliberate:
 
 - SQLite remains the write-ahead source for episodes, evidence, facts, opinion edges, memory docs, entities, and cursors.
 - `aibrain.grillo_v2_index.GrilloV2PackageIndex` mirrors active temporal facts and opinion edges into the existing Ladybug graph adapter.
+- When the graph backend is Ladybug, the index also writes a structured GRILLO v2 graph mirror with `GrilloEntity`, `GrilloEpisode`, `GrilloEvidence`, `GrilloTemporalFact`, `GrilloOpinionEdge`, and `GrilloMemoryDocument` nodes.
+- The structured mirror links episodes to actors/participants, evidence to episodes, facts to subjects/evidence, opinions to source/target/evidence, and memory docs to subjects/evidence.
 - The same index mirrors facts, opinion edges, and memory docs into the existing TurboVec/vector recall adapter.
 - Brain v2 syncs the current scope before response context assembly when package memory is enabled.
 - Package recall augments the GRILLO context packet with additional facts, relationship state, memory blocks, and retrieval notes.
