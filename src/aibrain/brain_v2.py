@@ -18,6 +18,7 @@ class BrainV2Config:
     provider: str = "vercel"
     persona_id: str = "neuro-sama"
     persona_name: str = "Neuro-sama"
+    persona_prompt: str = ""
 
 
 class BrainV2:
@@ -107,7 +108,10 @@ class BrainV2:
             channel_id=channel_id,
         )
         response_text = await self.json_client.complete_text(
-            instructions=_response_instructions(self.config.persona_name),
+            instructions=_response_instructions(
+                persona_name=self.config.persona_name,
+                persona_prompt=self.config.persona_prompt,
+            ),
             prompt=_response_prompt(packet=packet, user_text=user_text),
             store=False,
         )
@@ -231,10 +235,19 @@ GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(
 )
 
 
-def _response_instructions(persona_name: str) -> str:
-    return "\n".join(
+def _response_instructions(*, persona_name: str, persona_prompt: str = "") -> str:
+    lines = [
+        f"You are {persona_name}.",
+    ]
+    if persona_prompt.strip():
+        lines.extend(
+            [
+                "# Persona",
+                persona_prompt.strip(),
+            ]
+        )
+    lines.extend(
         [
-            f"You are {persona_name}.",
             "Use the GRILLO v2 context packet as structured memory.",
             "Use memory_blocks for durable diary/profile/slot continuity, while treating active_facts as evidence-backed claims.",
             "Do not treat evidence_gaps as facts.",
@@ -242,6 +255,7 @@ def _response_instructions(persona_name: str) -> str:
             "Reply naturally and do not expose internal XML tags unless asked for a diagnostic export.",
         ]
     )
+    return "\n".join(lines)
 
 
 def _response_prompt(*, packet: GrilloContextPacket, user_text: str) -> str:

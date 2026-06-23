@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .claude/
 .lean-ctx/
+local/
 *.egg-info/
 build/
 dist/

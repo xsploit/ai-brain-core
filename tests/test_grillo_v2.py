@@ -14,6 +14,7 @@ from aibrain.discord_bot_v2 import (
     _format_worker_loop_status,
     _format_worker_result,
     _scope_for_message,
+    build_brain_v2,
 )
 from grillo_v2 import (
     Evidence,
@@ -507,6 +508,48 @@ async def test_brain_v2_respond_compiles_grillo_context_and_stores_assistant_epi
     assert "<grillo_context" in calls[0]["input"]
     assert "Subby prefers being called Subby." in calls[0]["input"]
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_respond_includes_persona_prompt(tmp_path):
+    calls = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text="persona loaded")
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")
+    brain = BrainV2(
+        BrainV2Config(
+            database_path=tmp_path / "brain-v2.sqlite3",
+            model="deepseek/test",
+            persona_prompt="Keep Neuro's sharp streamer persona intact.",
+        ),
+        json_client=json_client,
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1",
+        actor_id="discord_user:subby",
+        user_text="hello",
+    )
+
+    assert response == "persona loaded"
+    assert "Keep Neuro's sharp streamer persona intact." in calls[0]["instructions"]
+
+
+def test_discord_bot_v2_loads_persona_prompt_path(tmp_path, monkeypatch):
+    prompt_path = tmp_path / "neuro.persona.txt"
+    prompt_path.write_text("Neuro persona from disk.", encoding="utf-8")
+    monkeypatch.setenv("DISCORD_BRAIN_V2_DATABASE_PATH", str(tmp_path / "brain.sqlite3"))
+    monkeypatch.setenv("DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH", str(prompt_path))
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-key")
+
+    brain = build_brain_v2()
+
+    assert brain.config.persona_prompt == "Neuro persona from disk."
 
 
 def test_discord_bot_v2_helpers_make_server_scope_and_metadata():

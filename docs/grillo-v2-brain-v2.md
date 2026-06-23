@@ -71,6 +71,7 @@ brain = BrainV2(
         model="deepseek/deepseek-v4-flash",
         persona_id="neuro-sama-v2",
         persona_name="Neuro-sama",
+        persona_prompt=Path("local/neuro-sama.persona.txt").read_text(encoding="utf-8"),
     )
 )
 ```
@@ -105,6 +106,7 @@ $env:DISCORD_BRAIN_V2_DATABASE_PATH = "discord_brain_v2.sqlite3"
 $env:DISCORD_BRAIN_V2_MODEL = "deepseek/deepseek-v4-flash"
 $env:DISCORD_BRAIN_V2_PERSONA_ID = "neuro-sama-v2"
 $env:DISCORD_BRAIN_V2_PERSONA_NAME = "Neuro-sama"
+$env:DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH = "local/neuro-sama.persona.txt"
 $env:DISCORD_BRAIN_V2_COMMAND_PREFIX = "!n2"
 $env:DISCORD_BRAIN_V2_REQUIRE_MENTION_IN_GUILDS = "true"
 $env:DISCORD_BRAIN_V2_WORKER_ENABLED = "true"

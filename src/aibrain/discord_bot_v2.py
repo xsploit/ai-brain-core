@@ -141,6 +141,10 @@ def build_brain_v2() -> BrainV2:
             provider="vercel",
             persona_id=os.getenv("DISCORD_BRAIN_V2_PERSONA_ID", "neuro-sama-v2"),
             persona_name=os.getenv("DISCORD_BRAIN_V2_PERSONA_NAME", "Neuro-sama"),
+            persona_prompt=_env_text(
+                value_name="DISCORD_BRAIN_V2_PERSONA_PROMPT",
+                path_name="DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH",
+            ),
         )
     )
 
@@ -378,6 +382,21 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _env_text(*, value_name: str, path_name: str) -> str:
+    raw = os.getenv(value_name)
+    if raw:
+        return raw
+    raw_path = os.getenv(path_name)
+    if not raw_path:
+        return ""
+    path = Path(raw_path).expanduser()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read %s=%s: %s", path_name, path, exc)
+        return ""
 
 
 def main() -> None:
