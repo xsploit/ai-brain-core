@@ -13,6 +13,7 @@ from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     DiscordBrainV2Bot,
+    V2RelationshipGraphView,
     _append_readable_attachment_context,
     _complete_jb_turn,
     _discord_metadata,
@@ -24,6 +25,8 @@ from aibrain.discord_bot_v2 import (
     _format_worker_loop_status,
     _format_worker_result,
     _recent_message_item,
+    _relationship_v2_embed,
+    _relationship_v2_snapshot,
     _scope_for_message,
     build_brain_v2,
 )
@@ -1129,6 +1132,55 @@ def test_discord_bot_v2_formats_grillo_diagnostics():
     assert "context continuity" in documents
     assert "trust" in opinions
     assert "+0.75" in opinions
+
+
+def test_discord_bot_v2_relationship_graph_snapshot_and_embed(tmp_path):
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", persona_id="neuro-sama-v2"),
+        json_client=SimpleNamespace(),
+    )
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    brain.store.upsert_fact(
+        TemporalFact.create(
+            scope_key=scope,
+            subject_id=actor,
+            predicate="preferred_name",
+            object_value="Subby",
+            claim="Subby prefers being called Subby.",
+            confidence=0.9,
+        )
+    )
+    brain.store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="diary",
+            subject_id=actor,
+            title="Reflection",
+            body="I noticed Subby checks memory carefully.",
+        )
+    )
+    brain.store.upsert_opinion_edge(
+        OpinionEdge.create(
+            scope_key=scope,
+            source_id="neuro-sama-v2",
+            target_id=actor,
+            relation="trust",
+            score=0.8,
+            rationale="Subby verifies claims.",
+        )
+    )
+    bot = SimpleNamespace(brain_v2=brain)
+
+    snapshot = _relationship_v2_snapshot(bot, scope, actor)
+    embed = _relationship_v2_embed(snapshot, page="overview")
+    view = V2RelationshipGraphView(bot, owner_id=120418341775998976, scope=scope, actor_id=actor)
+
+    assert snapshot["facts"][0]["claim"] == "Subby prefers being called Subby."
+    assert snapshot["memory_documents"][0]["title"] == "Reflection"
+    assert snapshot["opinion_edges"][0]["relation"] == "trust"
+    assert embed.title == "Ladybug / GRILLO v2 Relationship Graph"
+    assert len(view.children) == 4
 
 
 def test_discord_bot_v2_remember_text_supports_summary_action_view(tmp_path):

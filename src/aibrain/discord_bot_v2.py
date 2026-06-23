@@ -47,6 +47,57 @@ DEFAULT_DISCORD_V2_PREFIX = "!n2"
 logger = logging.getLogger("aibrain.discord_v2")
 
 
+class V2RelationshipGraphView(discord.ui.View):
+    def __init__(self, bot: Any, owner_id: int, scope: str, actor_id: str):
+        super().__init__(timeout=_env_int("DISCORD_BRAIN_V2_RELATIONSHIP_VIEW_TIMEOUT_SECONDS", 300))
+        self.bot_ref = bot
+        self.owner_id = owner_id
+        self.scope = scope
+        self.actor_id = actor_id
+        self.page = "overview"
+        self.snapshot = _relationship_v2_snapshot(bot, scope, actor_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the requester can use this relationship panel.", ephemeral=True)
+        return False
+
+    def embed(self) -> discord.Embed:
+        return _relationship_v2_embed(self.snapshot, page=self.page)
+
+    def refresh(self) -> None:
+        self.snapshot = _relationship_v2_snapshot(self.bot_ref, self.scope, self.actor_id)
+
+    async def edit_page(self, interaction: discord.Interaction, page: str, *, refresh: bool = False) -> None:
+        self.page = page
+        if refresh:
+            self.refresh()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary, row=0)
+    async def overview_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "overview", refresh=True)
+
+    @discord.ui.button(label="Facts", style=discord.ButtonStyle.secondary, row=0)
+    async def facts_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "facts")
+
+    @discord.ui.button(label="Memory", style=discord.ButtonStyle.secondary, row=0)
+    async def memory_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.edit_page(interaction, "memory")
+
+    @discord.ui.button(label="Export", style=discord.ButtonStyle.secondary, row=1)
+    async def export_relationships(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.refresh()
+        data = io.BytesIO(json.dumps(self.snapshot, indent=2, sort_keys=True, default=str).encode("utf-8"))
+        await interaction.response.send_message(
+            "relationship graph export",
+            file=discord.File(data, filename="ladybug-v2-relationship-graph.json"),
+            ephemeral=True,
+        )
+
+
 class DiscordBrainV2Bot(commands.Bot):
     def __init__(self, *, brain: BrainV2, discord_token: str | None = None):
         intents = discord.Intents.default()
@@ -745,13 +796,7 @@ def _grillo_control_group(bot: DiscordBrainV2Bot):
         if not _is_owner(bot, ctx):
             await ctx.reply("owner only", mention_author=False)
             return
-        edges = bot.brain_v2.store.list_opinion_edges(
-            _scope_for_message(ctx.message),
-            source_id=bot.brain_v2.config.persona_id,
-            target_id=_actor_id(ctx.author),
-            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_OPINION_LIMIT", 12),
-        )
-        await ctx.reply(_format_grillo_v2_opinions(edges), mention_author=False)
+        await _send_relationship_v2_panel(bot, ctx)
 
     @grillo.command(name="export")
     async def grillo_export(ctx: commands.Context, *, query: str = "") -> None:
@@ -795,13 +840,7 @@ def _ladybug_control_group(bot: DiscordBrainV2Bot):
         if not _is_owner(bot, ctx):
             await ctx.reply("owner only", mention_author=False)
             return
-        edges = bot.brain_v2.store.list_opinion_edges(
-            _scope_for_message(ctx.message),
-            source_id=bot.brain_v2.config.persona_id,
-            target_id=_actor_id(ctx.author),
-            limit=_env_int("DISCORD_BRAIN_V2_GRILLO_OPINION_LIMIT", 12),
-        )
-        await ctx.reply(_format_grillo_v2_opinions(edges), mention_author=False)
+        await _send_relationship_v2_panel(bot, ctx)
 
     @ladybug.command(name="export")
     async def ladybug_export(ctx: commands.Context, *, query: str = "") -> None:
@@ -889,6 +928,11 @@ async def _send_grillo_v2_export(
         file=discord.File(data, filename=filename),
         mention_author=False,
     )
+
+
+async def _send_relationship_v2_panel(bot: DiscordBrainV2Bot, ctx: commands.Context) -> None:
+    view = V2RelationshipGraphView(bot, ctx.author.id, _scope_for_message(ctx.message), _actor_id(ctx.author))
+    await ctx.reply(embed=view.embed(), view=view, mention_author=False)
 
 
 def _pause_command(bot: DiscordBrainV2Bot):
@@ -1156,6 +1200,79 @@ def _format_grillo_v2_opinions(edges: list[Any]) -> str:
             f"{getattr(edge, 'target_id', 'unknown')}: {getattr(edge, 'rationale', '')}"
         )
     return "\n".join(lines)[:1900]
+
+
+def _relationship_v2_snapshot(bot: Any, scope: str, actor_id: str) -> dict[str, Any]:
+    store = bot.brain_v2.store
+    persona_id = bot.brain_v2.config.persona_id
+    return {
+        "scope_key": scope,
+        "participant": actor_id,
+        "persona_id": persona_id,
+        "counts": store.counts(),
+        "facts": [_object_payload(fact) for fact in store.list_active_facts(scope, subject_id=actor_id, limit=12)],
+        "memory_documents": [_object_payload(document) for document in store.list_memory_documents(scope, subject_id=actor_id, limit=12)],
+        "opinion_edges": [
+            _object_payload(edge)
+            for edge in store.list_opinion_edges(
+                scope,
+                source_id=persona_id,
+                target_id=actor_id,
+                limit=_env_int("DISCORD_BRAIN_V2_GRILLO_OPINION_LIMIT", 12),
+            )
+        ],
+    }
+
+
+def _relationship_v2_embed(snapshot: dict[str, Any], *, page: str = "overview") -> discord.Embed:
+    embed = discord.Embed(
+        title="Ladybug / GRILLO v2 Relationship Graph",
+        description=f"scope `{snapshot.get('scope_key')}`\nparticipant `{snapshot.get('participant')}`",
+        color=0x5865F2,
+    )
+    counts = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
+    embed.add_field(
+        name="Counts",
+        value=(
+            f"facts `{counts.get('active_facts', 0)}`\n"
+            f"opinions `{counts.get('active_opinion_edges', 0)}`\n"
+            f"memory docs `{counts.get('memory_docs', 0)}`"
+        ),
+        inline=True,
+    )
+    if page == "facts":
+        _relationship_embed_list(embed, "Facts", snapshot.get("facts") or [], _relationship_fact_line)
+    elif page == "memory":
+        _relationship_embed_list(embed, "Memory", snapshot.get("memory_documents") or [], _relationship_memory_line)
+    else:
+        _relationship_embed_list(embed, "Opinion Edges", snapshot.get("opinion_edges") or [], _relationship_opinion_line)
+        if not snapshot.get("opinion_edges"):
+            _relationship_embed_list(embed, "Facts", snapshot.get("facts") or [], _relationship_fact_line)
+    embed.set_footer(text=f"page: {page}")
+    return embed
+
+
+def _relationship_embed_list(embed: discord.Embed, name: str, items: list[Any], formatter: Any) -> None:
+    if not items:
+        embed.add_field(name=name, value="(none)", inline=False)
+        return
+    lines = [formatter(item) for item in items[:6]]
+    if len(items) > len(lines):
+        lines.append(f"... {len(items) - len(lines)} more")
+    embed.add_field(name=name, value="\n".join(lines)[:1024] or "(none)", inline=False)
+
+
+def _relationship_fact_line(item: dict[str, Any]) -> str:
+    return f"`{float(item.get('confidence') or 0.0):.2f}` {item.get('predicate')}: {item.get('claim')}"
+
+
+def _relationship_memory_line(item: dict[str, Any]) -> str:
+    body = " ".join(str(item.get("body") or "").split())
+    return f"`{item.get('document_type')}` {item.get('title')}: {body[:140]}"
+
+
+def _relationship_opinion_line(item: dict[str, Any]) -> str:
+    return f"`{float(item.get('score') or 0.0):+.2f}` {item.get('relation')}: {item.get('rationale')}"
 
 
 def _object_payload(value: Any) -> Any:
