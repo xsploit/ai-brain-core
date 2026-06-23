@@ -1192,6 +1192,46 @@ async def test_ladybug_adapter_serializes_concurrent_async_calls(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ladybug_adapter_filters_by_thread_scope_when_requested(tmp_path):
+    if importlib.util.find_spec("ladybug") is None:
+        pytest.skip("ladybug extra not installed")
+
+    graph = LadybugGraphMemoryStore(tmp_path / "graph.ladybug")
+    await graph.upsert_fact(
+        TemporalFact(
+            id="fact-scope-a",
+            subject="Subby",
+            predicate="prefers",
+            object="scoped memory",
+            valid_from="2026-06-22T00:00:00+00:00",
+            source_session_id="discord:guild:1:persona:v2",
+        )
+    )
+    await graph.upsert_fact(
+        TemporalFact(
+            id="fact-scope-b",
+            subject="Subby",
+            predicate="prefers",
+            object="scoped memory",
+            valid_from="2026-06-22T00:00:00+00:00",
+            source_session_id="discord:guild:2:persona:v2",
+        )
+    )
+
+    hits = await graph.search_facts(
+        GraphQuery(
+            text="scoped memory",
+            thread_id="discord:guild:1:persona:v2",
+            persona_id="neuro-sama-v2",
+            top_k=5,
+        )
+    )
+
+    assert [hit.id for hit in hits] == ["fact-scope-a"]
+    graph.close()
+
+
+@pytest.mark.asyncio
 async def test_turbovec_search_maps_exact_numeric_ids_and_filters():
     class FakeIndex:
         def __init__(self):

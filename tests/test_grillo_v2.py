@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
+import importlib.util
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ import pytest
 
 import aibrain.discord_bot_v2 as discord_bot_v2_module
 from aibrain.brain_v2 import BrainV2, BrainV2Config
+from aibrain.grillo_v2_index import GrilloV2PackageIndex
 from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
@@ -650,6 +652,126 @@ async def test_brain_v2_respond_compiles_grillo_context_and_stores_assistant_epi
     assert "<grillo_context" in calls[0]["input"]
     assert "Subby prefers being called Subby." in calls[0]["input"]
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+@pytest.mark.asyncio
+async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
+    if importlib.util.find_spec("ladybug") is None or importlib.util.find_spec("turbovec") is None:
+        pytest.skip("ladybug/turbovec extras not installed")
+
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    store.upsert_fact(
+        TemporalFact.create(
+            scope_key=scope,
+            subject_id=actor,
+            predicate="preferred_name",
+            object_value="Subby",
+            claim="Subby prefers being called Subby.",
+            confidence=0.92,
+        )
+    )
+    store.upsert_opinion_edge(
+        OpinionEdge.create(
+            scope_key=scope,
+            source_id="neuro-sama-v2",
+            target_id=actor,
+            relation="trust",
+            score=0.7,
+            rationale="Subby keeps checking whether memory is grounded.",
+        )
+    )
+    store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="diary",
+            subject_id=actor,
+            title="Context continuity",
+            body="I noticed Subby cares about cross-channel context continuity.",
+            importance=0.85,
+        )
+    )
+    index = GrilloV2PackageIndex.from_path(
+        tmp_path / "package-memory.sqlite3",
+        persona_id="neuro-sama-v2",
+        graph_backend="ladybug",
+        vector_backend="turbovec",
+        embedding_dimensions=16,
+        sync_limit=20,
+        recall_top_k=6,
+    )
+
+    await index.sync_scope(store, scope)
+    recall = await index.recall(
+        scope_key=scope,
+        actor_id=actor,
+        query="Subby trust context continuity",
+        top_k=6,
+    )
+    status = index.status()
+
+    assert status["graph_backend"] == "LadybugGraphMemoryStore"
+    assert status["vector_backend"] == "TurboVecRecallStore"
+    assert {fact.metadata["grillo_v2_kind"] for fact in recall.graph_facts} >= {"temporal_fact", "opinion_edge"}
+    assert any(hit.metadata["grillo_v2_kind"] == "memory_document" for hit in recall.vector_hits)
+    index.close()
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_respond_includes_package_memory_retrieval_notes_when_enabled(tmp_path):
+    if importlib.util.find_spec("ladybug") is None or importlib.util.find_spec("turbovec") is None:
+        pytest.skip("ladybug/turbovec extras not installed")
+
+    calls = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text="got package memory")
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    brain = BrainV2(
+        BrainV2Config(
+            database_path=tmp_path / "brain-v2.sqlite3",
+            model="deepseek/test",
+            package_memory_enabled=True,
+            package_memory_path=tmp_path / "package-memory.sqlite3",
+            package_memory_graph_backend="ladybug",
+            package_memory_vector_backend="turbovec",
+            package_memory_embedding_dimensions=16,
+            package_memory_recall_top_k=6,
+        ),
+        json_client=json_client,
+    )
+    brain.store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="diary",
+            subject_id=actor,
+            title="Cross-channel context",
+            body="Subby wants memory to follow him across channels in the same server.",
+            importance=0.9,
+        )
+    )
+
+    response = await brain.respond(
+        scope_key=scope,
+        actor_id=actor,
+        user_text="what do you remember about cross channel context?",
+        source="discord",
+        channel_id="333",
+    )
+
+    assert response == "got package memory"
+    assert "memory to follow him across channels" in calls[0]["input"]
+    assert "package_graph=LadybugGraphMemoryStore" in calls[0]["input"]
+    assert "package_vector=TurboVecRecallStore" in calls[0]["input"]
+    assert "package_recall_vector=" in calls[0]["input"]
+    brain.close()
 
 
 @pytest.mark.asyncio

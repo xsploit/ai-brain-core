@@ -84,6 +84,43 @@ Useful methods:
 - `backfill_from_v1(...)`: migrate old GRILLO/identity databases into GRILLO v2.
 - `status()`: inspect model, provider, database path, and memory counts.
 
+## Package-Backed Memory Index
+
+Current decision: GRILLO v2 keeps `SQLiteGrilloV2Store` as the canonical source of truth and can optionally mirror that state into the existing package-backed memory adapters.
+
+This is deliberate:
+
+- SQLite remains the write-ahead source for episodes, evidence, facts, opinion edges, memory docs, entities, and cursors.
+- `aibrain.grillo_v2_index.GrilloV2PackageIndex` mirrors active temporal facts and opinion edges into the existing Ladybug graph adapter.
+- The same index mirrors facts, opinion edges, and memory docs into the existing TurboVec/vector recall adapter.
+- Brain v2 syncs the current scope before response context assembly when package memory is enabled.
+- Package recall augments the GRILLO context packet with additional facts, relationship state, memory blocks, and retrieval notes.
+- Hash embeddings are used for this package index by default, so enabling it does not require OpenAI embeddings or extra gateway calls.
+
+Enable deliberately:
+
+```powershell
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_ENABLED = "true"
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_GRAPH_BACKEND = "auto"     # auto/ladybug/sqlite
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_VECTOR_BACKEND = "auto"    # auto/turbovec/sqlite
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_EMBEDDING_DIMENSIONS = "256"
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_LIMIT = "500"
+$env:DISCORD_BRAIN_V2_PACKAGE_MEMORY_RECALL_TOP_K = "5"
+```
+
+Why not replace GRILLO v2 with Graphiti/Mem0/Letta immediately:
+
+- Ladybug is already installed locally and its Python API supports embedded on-disk graph use through `ladybug.Database`, `ladybug.Connection`, node tables, relationship tables, and Cypher queries. See <https://docs.ladybugdb.com/client-apis/python/>.
+- Graphiti is a strong design reference for temporal context graphs, provenance, incremental updates, and hybrid retrieval, but it is not installed in this repo and its current setup expects external graph backends plus LLM/embedding provider configuration. See <https://github.com/getzep/graphiti>.
+- Mem0 is a general memory layer and Letta has useful stateful-agent/memory-block concepts, but adopting either as the core would be a framework migration, not a grounded incremental fix. See <https://docs.mem0.ai/introduction> and <https://docs.letta.com/guides/core-concepts/stateful-agents/>.
+
+Near-term direction:
+
+- Keep GRILLO as the reflection/controller contract.
+- Keep SQLite as canonical until package-backed retrieval is stable under live Discord load.
+- Use Ladybug and TurboVec as real local indexes first.
+- Later, evaluate Graphiti as a full temporal graph engine only if the project accepts its storage/runtime dependencies.
+
 ## Discord v2
 
 Install with the Discord extra:

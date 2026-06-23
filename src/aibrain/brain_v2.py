@@ -12,6 +12,7 @@ from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONCli
 from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
 
 from .config import Persona
+from .grillo_v2_index import GrilloV2PackageIndex, GrilloV2PackageRecall
 
 
 @dataclass(slots=True)
@@ -22,6 +23,13 @@ class BrainV2Config:
     persona_id: str = "neuro-sama"
     persona_name: str = "Neuro-sama"
     persona_prompt: str = ""
+    package_memory_enabled: bool = False
+    package_memory_path: Path | None = None
+    package_memory_graph_backend: str = "auto"
+    package_memory_vector_backend: str = "auto"
+    package_memory_embedding_dimensions: int = 256
+    package_memory_sync_limit: int = 500
+    package_memory_recall_top_k: int = 5
 
 
 class BrainV2:
@@ -41,9 +49,11 @@ class BrainV2:
         response_persona: Persona | Any | None = None,
         response_tool_names: Sequence[str] | None = None,
         response_memory_policy: Any | None = None,
+        package_index: GrilloV2PackageIndex | None = None,
     ):
         self.config = config or BrainV2Config()
         self.store = store or SQLiteGrilloV2Store(self.config.database_path)
+        self.package_index = package_index or self._build_package_index()
         self.json_client = json_client or VercelAIGatewayJSONClient(
             model=self.config.model,
             api_key=os.getenv("AI_GATEWAY_API_KEY"),
@@ -149,12 +159,22 @@ class BrainV2:
                 aliases=_actor_aliases_from_metadata(metadata or {}),
                 metadata=metadata or {},
             )
+        if self.package_index is not None:
+            await self.package_index.sync_scope(self.store, scope_key)
         packet = self.build_context_packet(
             scope_key=scope_key,
             actor_id=actor_id,
             query=user_text,
             channel_id=channel_id,
         )
+        if self.package_index is not None:
+            recall = await self.package_index.recall(
+                scope_key=scope_key,
+                actor_id=actor_id,
+                query=user_text,
+                top_k=self.config.package_memory_recall_top_k,
+            )
+            _augment_packet_with_package_recall(packet, recall)
         instructions = _response_instructions(
             persona_name=self.config.persona_name,
             persona_prompt=self.config.persona_prompt,
@@ -277,7 +297,26 @@ class BrainV2:
             "database_path": str(self.config.database_path),
             "response_backend": "brain_stream" if self.response_brain is not None else "json_client",
             "counts": self.store.counts(),
+            "package_memory": self.package_index.status() if self.package_index is not None else None,
         }
+
+    def close(self) -> None:
+        self.store.close()
+        if self.package_index is not None:
+            self.package_index.close()
+
+    def _build_package_index(self) -> GrilloV2PackageIndex | None:
+        if not self.config.package_memory_enabled:
+            return None
+        return GrilloV2PackageIndex.from_path(
+            self.config.package_memory_path or self.config.database_path,
+            persona_id=self.config.persona_id,
+            graph_backend=self.config.package_memory_graph_backend,
+            vector_backend=self.config.package_memory_vector_backend,
+            embedding_dimensions=self.config.package_memory_embedding_dimensions,
+            sync_limit=self.config.package_memory_sync_limit,
+            recall_top_k=self.config.package_memory_recall_top_k,
+        )
 
     async def _complete_with_response_brain(
         self,
@@ -351,6 +390,79 @@ class BrainV2:
             payload=request,
             schema=GRILLO_V2_REFLECTION_SCHEMA,
         )
+
+
+def _augment_packet_with_package_recall(packet: GrilloContextPacket, recall: GrilloV2PackageRecall) -> None:
+    existing_fact_ids = {str(item.get("id")) for item in packet.active_facts if isinstance(item, dict)}
+    existing_opinion_ids = {str(item.get("id")) for item in packet.relationship_state if isinstance(item, dict)}
+    existing_memory_source_ids = {
+        str(item.get("metadata", {}).get("source_id") or item.get("id"))
+        for item in packet.memory_blocks
+        if isinstance(item, dict)
+    }
+    for fact in recall.graph_facts:
+        metadata = fact.metadata or {}
+        kind = str(metadata.get("grillo_v2_kind") or "temporal_fact")
+        if kind == "opinion_edge":
+            if fact.id in existing_opinion_ids:
+                continue
+            packet.relationship_state.append(
+                {
+                    "id": fact.id,
+                    "source": metadata.get("source_id") or fact.subject,
+                    "target": metadata.get("target_id") or fact.object,
+                    "relation": metadata.get("relation") or fact.predicate.removeprefix("opinion:"),
+                    "score": metadata.get("score", fact.confidence),
+                    "rationale": metadata.get("rationale") or fact.content,
+                    "evidence_ids": metadata.get("evidence_ids") or [],
+                    "valid_from": fact.valid_from,
+                    "valid_to": fact.valid_until,
+                    "retrieval_source": "package_graph",
+                }
+            )
+            existing_opinion_ids.add(fact.id)
+            continue
+        if fact.id in existing_fact_ids:
+            continue
+        packet.active_facts.append(
+            {
+                "id": fact.id,
+                "subject": fact.subject,
+                "predicate": fact.predicate,
+                "object": fact.object,
+                "claim": metadata.get("claim") or fact.content,
+                "confidence": round(float(fact.confidence), 4),
+                "valid_from": fact.valid_from,
+                "valid_to": fact.valid_until,
+                "evidence_ids": metadata.get("evidence_ids") or ([fact.source_event_id] if fact.source_event_id else []),
+                "contradicts": metadata.get("contradicts") or [],
+                "retrieval_source": "package_graph",
+            }
+        )
+        existing_fact_ids.add(fact.id)
+    for hit in recall.vector_hits:
+        source_id = str(hit.source_fact_id or hit.id)
+        if source_id in existing_memory_source_ids:
+            continue
+        metadata = dict(hit.metadata or {})
+        body = hit.text.strip()
+        if len(body) > 1200:
+            body = body[:1197].rstrip() + "..."
+        packet.memory_blocks.append(
+            {
+                "id": hit.id,
+                "type": f"package_recall:{metadata.get('grillo_v2_kind', 'memory')}",
+                "subject": metadata.get("subject_id") or metadata.get("target_id"),
+                "title": metadata.get("title") or metadata.get("predicate") or metadata.get("relation") or hit.id,
+                "body": body,
+                "importance": round(float(hit.importance), 4),
+                "evidence_ids": [hit.source_event_id] if hit.source_event_id else [],
+                "updated_at": hit.created_at,
+                "metadata": {**metadata, "source_id": source_id, "score": round(float(hit.score), 4)},
+            }
+        )
+        existing_memory_source_ids.add(source_id)
+    packet.retrieval_notes.extend(recall.notes)
 
 
 GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(

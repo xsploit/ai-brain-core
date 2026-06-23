@@ -149,6 +149,9 @@ class LadybugGraphMemoryStore:
             if value:
                 clauses.append(f"f.{field} = ${field}")
                 params[field] = value
+        if query.thread_id:
+            clauses.append("f.source_session_id = $thread_id")
+            params["thread_id"] = query.thread_id
         if query.text.strip():
             params["needle"] = query.text.lower()
             clauses.append(
