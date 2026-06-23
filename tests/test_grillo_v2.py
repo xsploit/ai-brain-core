@@ -10,6 +10,7 @@ from aibrain.brain_v2 import BrainV2, BrainV2Config
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     DiscordBrainV2Bot,
+    _append_readable_attachment_context,
     _discord_metadata,
     _format_backfill_results,
     _format_status,
@@ -889,6 +890,14 @@ def test_discord_bot_v2_metadata_and_recent_item_include_reply_target():
     assert metadata["reply_target"]["content"] == "Do you want me to check that?"
     assert recent["reply_to_author"] == "Neuro-sama"
     assert recent["reply_to_message_id"] == "444"
+
+
+def test_discord_bot_v2_appends_readable_attachment_context_without_indexing():
+    combined = _append_readable_attachment_context("read this", "file.txt:\nhello")
+
+    assert combined == "read this\n\n[Readable attachments]\nfile.txt:\nhello"
+    assert _append_readable_attachment_context("", "file.txt:\nhello") == "[Readable attachments]\nfile.txt:\nhello"
+    assert _append_readable_attachment_context("read this", "") == "read this"
 
 
 def test_discord_bot_v2_guild_humans_need_mention_or_reply():

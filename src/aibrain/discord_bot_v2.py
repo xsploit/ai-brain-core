@@ -14,7 +14,14 @@ from discord.ext import commands
 from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
 
 from .brain_v2 import BrainV2, BrainV2Config
-from .discord_bot import DEFAULT_DISCORD_TOOL_NAMES, DISCORD_CONTEXT, build_brain, build_persona
+from .discord_bot import (
+    DEFAULT_DISCORD_TOOL_NAMES,
+    DISCORD_CONTEXT,
+    _image_inputs as _v1_image_inputs,
+    _text_attachment_context as _v1_text_attachment_context,
+    build_brain,
+    build_persona,
+)
 from .discord_tools import DISCORD_TOOL_CONTEXT, DiscordToolRuntime
 from .env import load_env_file
 from .policy import MemoryPolicy
@@ -127,6 +134,10 @@ class DiscordBrainV2Bot(commands.Bot):
         if not self._should_respond(message):
             return
         rolling_context = self._recent_messages(message)
+        user_text = _message_text(message)
+        attachment_text = await _v1_text_attachment_context(message)
+        prompt_text = _append_readable_attachment_context(user_text, attachment_text)
+        images = _v1_image_inputs(message)
         context_token = DISCORD_CONTEXT.set(_discord_context_for_message(message, rolling_context))
         tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
         try:
@@ -134,13 +145,14 @@ class DiscordBrainV2Bot(commands.Bot):
                 response = await self.brain_v2.respond(
                     scope_key=_scope_for_message(message),
                     actor_id=_actor_id(message.author),
-                    user_text=_message_text(message),
+                    user_text=prompt_text,
                     source="discord",
                     channel_id=str(message.channel.id),
                     metadata=_discord_metadata(message),
                     rolling_context=rolling_context,
                     record_user_episode=recorded_episode is None,
                     reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
+                    images=images,
                     tool_names=DEFAULT_DISCORD_TOOL_NAMES,
                     use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8)),
                 )
@@ -605,6 +617,14 @@ def _actor_id(user: discord.abc.User) -> str:
 
 def _message_text(message: discord.Message) -> str:
     return (getattr(message, "clean_content", None) or getattr(message, "content", "") or "").strip()
+
+
+def _append_readable_attachment_context(user_text: str, attachment_text: str) -> str:
+    user_text = (user_text or "").strip()
+    attachment_text = (attachment_text or "").strip()
+    if not attachment_text:
+        return user_text
+    return f"{user_text}\n\n[Readable attachments]\n{attachment_text}".strip()
 
 
 def _display_name(user: Any) -> str:
