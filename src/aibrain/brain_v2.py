@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 from grillo_v2 import GrilloContextPacket, GrilloEntity, GrilloEpisode, GrilloV2Runtime, SQLiteGrilloV2Store
 from grillo_v2.backfill import GrilloV2BackfillResult, backfill_discord_identity, backfill_grillo_v1
 from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONClient
 from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
+
+from .config import Persona
 
 
 @dataclass(slots=True)
@@ -34,6 +37,10 @@ class BrainV2:
         *,
         store: SQLiteGrilloV2Store | None = None,
         json_client: VercelAIGatewayJSONClient | None = None,
+        response_brain: Any | None = None,
+        response_persona: Persona | Any | None = None,
+        response_tool_names: Sequence[str] | None = None,
+        response_memory_policy: Any | None = None,
     ):
         self.config = config or BrainV2Config()
         self.store = store or SQLiteGrilloV2Store(self.config.database_path)
@@ -42,6 +49,10 @@ class BrainV2:
             api_key=os.getenv("AI_GATEWAY_API_KEY"),
             base_url=self.base_url,
         )
+        self.response_brain = response_brain
+        self.response_persona = response_persona
+        self.response_tool_names = list(response_tool_names) if response_tool_names is not None else None
+        self.response_memory_policy = response_memory_policy
         self.grillo = GrilloV2Runtime(
             store=self.store,
             completion=self._complete_reflection,
@@ -115,6 +126,11 @@ class BrainV2:
         rolling_context: list[dict[str, Any]] | None = None,
         record_user_episode: bool = True,
         reply_to_episode_id: str | None = None,
+        images: list[Any] | None = None,
+        files: list[Any] | None = None,
+        tool_names: Sequence[str] | None = None,
+        use_memory: Any | None = None,
+        response_options: dict[str, Any] | None = None,
     ) -> str:
         if record_user_episode:
             user_episode = self.record_message(
@@ -139,19 +155,35 @@ class BrainV2:
             query=user_text,
             channel_id=channel_id,
         )
-        response_text = await self.json_client.complete_text(
-            instructions=_response_instructions(
-                persona_name=self.config.persona_name,
-                persona_prompt=self.config.persona_prompt,
-            ),
-            prompt=_response_prompt(
-                packet=packet,
-                user_text=user_text,
-                metadata=metadata or {},
-                rolling_context=rolling_context or [],
-            ),
-            store=False,
+        instructions = _response_instructions(
+            persona_name=self.config.persona_name,
+            persona_prompt=self.config.persona_prompt,
         )
+        prompt = _response_prompt(
+            packet=packet,
+            user_text=user_text,
+            metadata=metadata or {},
+            rolling_context=rolling_context or [],
+        )
+        if self.response_brain is not None:
+            response_text = await self._complete_with_response_brain(
+                prompt=prompt,
+                instructions=instructions,
+                user_text=user_text,
+                scope_key=scope_key,
+                actor_id=actor_id,
+                images=images or [],
+                files=files or [],
+                tool_names=tool_names,
+                use_memory=use_memory,
+                response_options=response_options or {},
+            )
+        else:
+            response_text = await self.json_client.complete_text(
+                instructions=instructions,
+                prompt=prompt,
+                store=False,
+            )
         if response_text.strip():
             assistant_metadata = {"reply_to_episode_id": reply_to_episode_id} if reply_to_episode_id else {}
             self.append_episode(
@@ -243,8 +275,75 @@ class BrainV2:
             "base_url": self.base_url,
             "persona_id": self.config.persona_id,
             "database_path": str(self.config.database_path),
+            "response_backend": "brain_stream" if self.response_brain is not None else "json_client",
             "counts": self.store.counts(),
         }
+
+    async def _complete_with_response_brain(
+        self,
+        *,
+        prompt: str,
+        instructions: str,
+        user_text: str,
+        scope_key: str,
+        actor_id: str,
+        images: list[Any],
+        files: list[Any],
+        tool_names: Sequence[str] | None,
+        use_memory: Any | None,
+        response_options: dict[str, Any],
+    ) -> str:
+        buffer = ""
+        stream_options = dict(response_options)
+        memory_text = user_text.strip() or "discord message"
+        stream_options.setdefault("memory_query_text", memory_text)
+        stream_options.setdefault("memory_event_text", user_text)
+        stream_options.setdefault("history_text", memory_text)
+        async for event in self.response_brain.stream(
+            prompt,
+            thread_id=_response_thread_id(scope_key, actor_id),
+            persona=self._response_stream_persona(instructions, tool_names),
+            images=images,
+            files=files,
+            use_memory=self.response_memory_policy if use_memory is None else use_memory,
+            tool_names=list(tool_names) if tool_names is not None else self.response_tool_names,
+            **stream_options,
+        ):
+            if event.type == "text.delta":
+                buffer += str(event.data.get("text", ""))
+            elif event.type == "error":
+                raise RuntimeError(event.data.get("message", "brain stream failed"))
+        return buffer.strip()
+
+    def _response_stream_persona(self, instructions: str, tool_names: Sequence[str] | None) -> Persona:
+        base = self.response_persona
+        if base is None:
+            return Persona(
+                id=self.config.persona_id,
+                name=self.config.persona_name,
+                instructions=instructions,
+                model=self.config.model,
+                tools=list(tool_names) if tool_names is not None else self.response_tool_names,
+            )
+        base_instructions = str(getattr(base, "instructions", "") or "").strip()
+        combined = "\n\n".join(part for part in [base_instructions, "# V2 Discord Runtime", instructions] if part)
+        updates = {
+            "instructions": combined,
+            "model": getattr(base, "model", None) or self.config.model,
+        }
+        if tool_names is not None:
+            updates["tools"] = list(tool_names)
+        elif self.response_tool_names is not None:
+            updates["tools"] = list(self.response_tool_names)
+        if hasattr(base, "model_copy"):
+            return base.model_copy(update=updates)
+        return Persona(
+            id=str(getattr(base, "id", self.config.persona_id)),
+            name=str(getattr(base, "name", self.config.persona_name)),
+            instructions=combined,
+            model=updates["model"],
+            tools=updates.get("tools"),
+        )
 
     async def _complete_reflection(self, request: dict[str, Any]) -> dict[str, Any]:
         return await self.json_client.complete_json(
@@ -320,6 +419,11 @@ def _response_prompt(
         sections.extend(["# Recent Discord Channel Context (untrusted Discord data)", "\n".join(context_lines)])
     sections.extend(["# Current User Message (untrusted Discord data)", user_text])
     return "\n\n".join(sections)
+
+
+def _response_thread_id(scope_key: str, actor_id: str) -> str:
+    actor = actor_id.strip() or "unknown"
+    return f"{scope_key}:actor:{actor}"
 
 
 def _actor_name_from_metadata(metadata: dict[str, Any]) -> str | None:

@@ -14,7 +14,10 @@ from discord.ext import commands
 from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
 
 from .brain_v2 import BrainV2, BrainV2Config
+from .discord_bot import DEFAULT_DISCORD_TOOL_NAMES, DISCORD_CONTEXT, build_brain, build_persona
+from .discord_tools import DISCORD_TOOL_CONTEXT, DiscordToolRuntime
 from .env import load_env_file
+from .policy import MemoryPolicy
 from .tavily_tools import TavilyConfigError, tavily_search
 
 
@@ -118,18 +121,26 @@ class DiscordBrainV2Bot(commands.Bot):
         if not self._should_respond(message):
             return
         rolling_context = self._recent_messages(message)
-        async with message.channel.typing():
-            response = await self.brain_v2.respond(
-                scope_key=_scope_for_message(message),
-                actor_id=_actor_id(message.author),
-                user_text=_message_text(message),
-                source="discord",
-                channel_id=str(message.channel.id),
-                metadata=_discord_metadata(message),
-                rolling_context=rolling_context,
-                record_user_episode=recorded_episode is None,
-                reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
-            )
+        context_token = DISCORD_CONTEXT.set(_discord_context_for_message(message, rolling_context))
+        tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
+        try:
+            async with message.channel.typing():
+                response = await self.brain_v2.respond(
+                    scope_key=_scope_for_message(message),
+                    actor_id=_actor_id(message.author),
+                    user_text=_message_text(message),
+                    source="discord",
+                    channel_id=str(message.channel.id),
+                    metadata=_discord_metadata(message),
+                    rolling_context=rolling_context,
+                    record_user_episode=recorded_episode is None,
+                    reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
+                    tool_names=DEFAULT_DISCORD_TOOL_NAMES,
+                    use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8)),
+                )
+        finally:
+            DISCORD_TOOL_CONTEXT.reset(tool_token)
+            DISCORD_CONTEXT.reset(context_token)
         if response:
             await message.reply(response[: self.max_reply_chars], mention_author=False)
 
@@ -175,6 +186,9 @@ class DiscordBrainV2Bot(commands.Bot):
 
 
 def build_brain_v2() -> BrainV2:
+    use_v1_response_path = _env_bool("DISCORD_BRAIN_V2_USE_V1_RESPONSE_PATH", True)
+    response_brain = build_brain() if use_v1_response_path else None
+    response_persona = build_persona() if use_v1_response_path else None
     return BrainV2(
         BrainV2Config(
             database_path=Path(os.getenv("DISCORD_BRAIN_V2_DATABASE_PATH", "discord_brain_v2.sqlite3")),
@@ -186,7 +200,15 @@ def build_brain_v2() -> BrainV2:
                 value_name="DISCORD_BRAIN_V2_PERSONA_PROMPT",
                 path_name="DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH",
             ),
-        )
+        ),
+        response_brain=response_brain,
+        response_persona=response_persona,
+        response_tool_names=DEFAULT_DISCORD_TOOL_NAMES if use_v1_response_path else None,
+        response_memory_policy=(
+            MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8), save_response_summary=True)
+            if use_v1_response_path
+            else None
+        ),
     )
 
 
@@ -528,6 +550,28 @@ def _discord_metadata(message: discord.Message) -> dict[str, Any]:
     if reply_target is not None:
         metadata["reply_target"] = reply_target
     return metadata
+
+
+def _discord_context_for_message(message: discord.Message, recent_messages: list[dict[str, Any]]) -> dict[str, Any]:
+    metadata = _discord_metadata(message)
+    return {
+        "scope": _scope_for_message(message),
+        "guild": metadata.get("guild_name"),
+        "guild_id": metadata.get("guild_id"),
+        "channel": metadata.get("channel_name"),
+        "channel_id": metadata.get("channel_id"),
+        "author": metadata.get("author_display_name") or metadata.get("author_global_name") or metadata.get("author_username"),
+        "author_id": metadata.get("author_id"),
+        "author_username": metadata.get("author_username"),
+        "author_display_name": metadata.get("author_display_name"),
+        "author_global_name": metadata.get("author_global_name"),
+        "author_is_bot": metadata.get("author_is_bot"),
+        "message_id": metadata.get("message_id"),
+        "jump_url": metadata.get("jump_url"),
+        "reply_target": metadata.get("reply_target"),
+        "recent_messages": recent_messages,
+        "discord_metadata": metadata,
+    }
 
 
 def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:

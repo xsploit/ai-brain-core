@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from aibrain.brain_v2 import BrainV2, BrainV2Config
+from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     _discord_metadata,
     _format_backfill_results,
@@ -757,6 +758,66 @@ async def test_brain_v2_respond_includes_metadata_and_rolling_context_without_do
     assert "- content: Do you want me to check that?" in calls[0]["input"]
     assert "# Recent Discord Channel Context" in calls[0]["input"]
     assert "Neuro-sama (bot): Do you want me to check that?" in calls[0]["input"]
+    assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_can_use_v1_stream_backend_with_tools_and_memory(tmp_path):
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            yield BrainEvent("memory.hit", {"id": "m1", "score": 0.8})
+            yield BrainEvent("text.delta", {"text": "streamed "})
+            yield BrainEvent("text.delta", {"text": "reply"})
+            yield BrainEvent("response.done", {})
+
+    fake_brain = FakeStreamBrain()
+    response_persona = SimpleNamespace(
+        id="neuro-sama",
+        name="Neuro-sama",
+        instructions="Yappy Neuro persona.",
+        model="deepseek/test",
+        tools=["discord_context"],
+    )
+    memory_policy = SimpleNamespace(top_k=8)
+    brain = BrainV2(
+        BrainV2Config(
+            database_path=tmp_path / "brain-v2.sqlite3",
+            model="deepseek/test",
+            persona_prompt="Use the live persona.",
+        ),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+        response_persona=response_persona,
+        response_tool_names=["discord_context", "tavily_search"],
+        response_memory_policy=memory_policy,
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1:persona:v2",
+        actor_id="discord_user:subby",
+        user_text="look this up",
+        source="discord",
+        channel_id="333",
+        metadata={"guild_name": "Guild", "author_display_name": "Subby", "message_id": "m1"},
+        rolling_context=[{"message_id": "m0", "author": "Karah", "content": "previous"}],
+        record_user_episode=True,
+    )
+    episodes = brain.store.list_recent_episodes("discord:guild:1:persona:v2", limit=10)
+
+    assert response == "streamed reply"
+    assert len(fake_brain.calls) == 1
+    call = fake_brain.calls[0]
+    assert call["thread_id"] == "discord:guild:1:persona:v2:actor:discord_user:subby"
+    assert call["tool_names"] == ["discord_context", "tavily_search"]
+    assert call["use_memory"] is memory_policy
+    assert "# GRILLO v2 Context" in call["prompt"]
+    assert "Karah: previous" in call["prompt"]
+    assert "Yappy Neuro persona." in call["persona"].instructions
+    assert "Use the GRILLO v2 context packet" in call["persona"].instructions
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
 
 
