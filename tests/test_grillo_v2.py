@@ -9,6 +9,7 @@ import pytest
 from aibrain.brain_v2 import BrainV2, BrainV2Config
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
+    DiscordBrainV2Bot,
     _discord_metadata,
     _format_backfill_results,
     _format_status,
@@ -888,6 +889,73 @@ def test_discord_bot_v2_metadata_and_recent_item_include_reply_target():
     assert metadata["reply_target"]["content"] == "Do you want me to check that?"
     assert recent["reply_to_author"] == "Neuro-sama"
     assert recent["reply_to_message_id"] == "444"
+
+
+def test_discord_bot_v2_guild_humans_need_mention_or_reply():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.paused = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.ignore_bots = True
+    bot.respond_to_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=123, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+        reference=None,
+    )
+
+    assert bot._should_respond(message) is False
+
+    message.mentions = [bot.user]
+
+    assert bot._should_respond(message) is True
+
+
+def test_discord_bot_v2_bots_need_toggle_and_directed_message():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.paused = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.ignore_bots = True
+    bot.respond_to_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=123, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
+        reference=None,
+    )
+
+    assert bot._should_respond(message) is False
+
+    bot.ignore_bots = False
+    bot.respond_to_bots = True
+
+    assert bot._should_respond(message) is True
+
+    message.mentions = []
+
+    assert bot._should_respond(message) is False
+
+
+def test_discord_bot_v2_pause_blocks_normal_responses():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.paused = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.ignore_bots = False
+    bot.respond_to_bots = True
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=123, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
+        reference=None,
+    )
+
+    assert bot._should_respond(message) is False
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):

@@ -45,6 +45,9 @@ class DiscordBrainV2Bot(commands.Bot):
         self.respond_to_dms = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_DMS", True)
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_MENTIONS", True)
         self.require_mention_in_guilds = _env_bool("DISCORD_BRAIN_V2_REQUIRE_MENTION_IN_GUILDS", True)
+        self.ignore_bots = _env_bool("DISCORD_BRAIN_V2_IGNORE_BOTS", _env_bool("DISCORD_BRAIN_IGNORE_BOTS", True))
+        self.respond_to_bots = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_BOTS", _env_bool("DISCORD_BRAIN_RESPOND_TO_BOTS", False))
+        self.paused = _env_bool("DISCORD_BRAIN_V2_PAUSED", _env_bool("DISCORD_BRAIN_PAUSED", False))
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
         self.rolling_context_messages = max(1, _env_int("DISCORD_BRAIN_V2_ROLLING_CONTEXT_MESSAGES", 15))
         self.recent_by_scope: dict[str, deque[dict[str, Any]]] = defaultdict(
@@ -72,6 +75,9 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_summary_command(self))
         self.add_command(_search_command(self))
         self.add_command(_ping_command(self))
+        self.add_command(_pause_command(self))
+        self.add_command(_resume_command(self))
+        self.add_command(_bot_control_group(self))
         self.add_command(_reflect_command(self))
         self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
@@ -153,17 +159,34 @@ class DiscordBrainV2Bot(commands.Bot):
         return True
 
     def _should_respond(self, message: discord.Message) -> bool:
+        if getattr(self, "paused", False):
+            return False
+        author_is_bot = bool(getattr(message.author, "bot", False))
+        directed = self._is_directed_at_self(message)
+        if author_is_bot:
+            return bool(self._bot_interactions_enabled() and directed)
         if message.guild is None:
             return self.respond_to_dms
-        if not self.require_mention_in_guilds:
-            return True
-        if self.respond_to_mentions and self.user is not None and self.user in message.mentions:
-            return True
+        return directed
+
+    def _is_directed_at_self(self, message: discord.Message) -> bool:
+        if not self.respond_to_mentions or self.user is None:
+            return False
+        user_id = getattr(self.user, "id", None)
+        mentioned = any(getattr(user, "id", None) == user_id for user in getattr(message, "mentions", []))
+        return bool(mentioned or self._is_reply_to_self(message))
+
+    def _is_reply_to_self(self, message: discord.Message) -> bool:
+        if self.user is None:
+            return False
         reference = getattr(message, "reference", None)
         resolved = getattr(reference, "resolved", None) if reference is not None else None
         cached = getattr(reference, "cached_message", None) if reference is not None else None
         target = resolved or cached
         return bool(target is not None and self.user is not None and getattr(getattr(target, "author", None), "id", None) == self.user.id)
+
+    def _bot_interactions_enabled(self) -> bool:
+        return bool(not self.ignore_bots and self.respond_to_bots)
 
     def _record_discord_message(self, message: discord.Message):
         text = _message_text(message)
@@ -225,6 +248,8 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!search <query>` - explicit Tavily web search",
                     "`!remember <text>` - pin a manual GRILLO v2 memory for you",
                     "`!ping @user` - tag someone with a short hello",
+                    "`!pause` / `!resume` - admin/owner normal reply control",
+                    "`!bot toggle` - admin/owner bot-to-bot reply control",
                     f"`{prefix} status` - show v2 model and GRILLO counts",
                     f"`{prefix} context [query]` - owner-only context packet export",
                     f"`{prefix} reflect [limit]` - owner-only reflection pass",
@@ -363,6 +388,50 @@ def _ping_command(bot: DiscordBrainV2Bot):
     return ping
 
 
+def _pause_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="pause")
+    async def pause(ctx: commands.Context) -> None:
+        if not await _require_admin_or_owner(bot, ctx, "pause control"):
+            return
+        bot.paused = True
+        await ctx.reply("normal replies paused. commands still work. use `!resume` to resume.", mention_author=False)
+
+    return pause
+
+
+def _resume_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="resume", aliases=["unpause"])
+    async def resume(ctx: commands.Context) -> None:
+        if not await _require_admin_or_owner(bot, ctx, "pause control"):
+            return
+        bot.paused = False
+        await ctx.reply("normal replies resumed.", mention_author=False)
+
+    return resume
+
+
+def _bot_control_group(bot: DiscordBrainV2Bot):
+    @commands.group(name="bot", invoke_without_command=True)
+    async def bot_control(ctx: commands.Context) -> None:
+        state = "enabled" if bot._bot_interactions_enabled() else "stopped"
+        await ctx.reply(f"bot-to-bot auto replies are `{state}`.", mention_author=False)
+
+    @bot_control.command(name="toggle")
+    async def bot_toggle(ctx: commands.Context) -> None:
+        if not await _require_admin_or_owner(bot, ctx, "bot interaction control"):
+            return
+        if bot._bot_interactions_enabled():
+            bot.respond_to_bots = False
+            state = "stopped"
+        else:
+            bot.ignore_bots = False
+            bot.respond_to_bots = True
+            state = "enabled"
+        await ctx.reply(f"bot-to-bot auto replies are now `{state}`.", mention_author=False)
+
+    return bot_control
+
+
 def _reflect_command(bot: DiscordBrainV2Bot):
     @commands.command(name="reflect")
     async def reflect(ctx: commands.Context, limit: int = 12) -> None:
@@ -437,6 +506,20 @@ def _is_owner(bot: DiscordBrainV2Bot, ctx: commands.Context) -> bool:
     return getattr(ctx.author, "id", None) in bot.owner_users
 
 
+def _is_admin_or_owner(bot: DiscordBrainV2Bot, ctx: commands.Context) -> bool:
+    if _is_owner(bot, ctx):
+        return True
+    permissions = getattr(ctx.author, "guild_permissions", None)
+    return bool(getattr(permissions, "administrator", False))
+
+
+async def _require_admin_or_owner(bot: DiscordBrainV2Bot, ctx: commands.Context, action: str) -> bool:
+    if _is_admin_or_owner(bot, ctx):
+        return True
+    await ctx.reply(f"{action} requires a Discord admin or bot owner.", mention_author=False)
+    return False
+
+
 def _format_status(status: dict[str, Any]) -> str:
     counts = status.get("counts") if isinstance(status.get("counts"), dict) else {}
     return (
@@ -444,7 +527,7 @@ def _format_status(status: dict[str, Any]) -> str:
         f"model=`{status.get('model')}` provider=`{status.get('provider')}` grillo=`v2` "
         f"entities=`{counts.get('entities', 0)}` episodes=`{counts.get('episodes', 0)}` "
         f"facts=`{counts.get('active_facts', 0)}` opinions=`{counts.get('active_opinion_edges', 0)}` "
-        f"memory_docs=`{counts.get('memory_docs', 0)}`"
+        f"memory_docs=`{counts.get('memory_docs', 0)}` response_backend=`{status.get('response_backend')}`"
     )
 
 
@@ -495,6 +578,10 @@ def _build_command_prefix(command_prefix_text: str):
         "search",
         "remember",
         "ping",
+        "pause",
+        "resume",
+        "unpause",
+        "bot",
     )
 
     def command_prefix(bot: commands.Bot, message: discord.Message):
