@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 from pathlib import Path
@@ -32,11 +33,15 @@ class DiscordBrainV2Bot(commands.Bot):
         self.brain_v2 = brain
         self.allowed_guilds = _csv_ints("DISCORD_BRAIN_V2_ALLOWED_GUILD_IDS")
         self.allowed_users = _csv_ints("DISCORD_BRAIN_V2_ALLOWED_USER_IDS")
+        self.owner_users = _csv_ints("DISCORD_BRAIN_V2_OWNER_USER_IDS") or _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
         self.respond_to_dms = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_DMS", True)
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_MENTIONS", True)
         self.require_mention_in_guilds = _env_bool("DISCORD_BRAIN_V2_REQUIRE_MENTION_IN_GUILDS", True)
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
         self.add_command(_status_command(self))
+        self.add_command(_context_command(self))
+        self.add_command(_reflect_command(self))
+        self.add_command(_backfill_command(self))
 
     async def on_ready(self) -> None:
         logger.info("Discord Brain v2 bot logged in as %s/%s", self.user.id if self.user else "unknown", self.user)
@@ -96,12 +101,113 @@ def build_brain_v2() -> BrainV2:
 def _status_command(bot: DiscordBrainV2Bot):
     @commands.command(name="status")
     async def status(ctx: commands.Context) -> None:
+        await ctx.reply(_format_status(bot.brain_v2.status()), mention_author=False)
+
+    return status
+
+
+def _context_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="context")
+    async def context(ctx: commands.Context, *, query: str = "") -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        packet = bot.brain_v2.build_context_packet(
+            scope_key=_scope_for_message(ctx.message),
+            actor_id=_actor_id(ctx.author),
+            query=query or _message_text(ctx.message),
+            channel_id=str(ctx.channel.id),
+        )
+        content = packet.as_prompt_text()
+        if len(content) <= 1800:
+            await ctx.reply(f"```xml\n{content}\n```", mention_author=False)
+            return
+        data = io.BytesIO(content.encode("utf-8", errors="replace"))
         await ctx.reply(
-            f"Brain v2 online. model=`{bot.brain_v2.config.model}` grillo=`v2`",
+            "GRILLO v2 context packet",
+            file=discord.File(data, filename="grillo-v2-context.xml"),
             mention_author=False,
         )
 
-    return status
+    return context
+
+
+def _reflect_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="reflect")
+    async def reflect(ctx: commands.Context, limit: int = 12) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        async with ctx.channel.typing():
+            result = await bot.brain_v2.reflect_recent(
+                scope_key=_scope_for_message(ctx.message),
+                actor_id=_actor_id(ctx.author),
+                channel_id=str(ctx.channel.id),
+                limit=max(1, min(50, int(limit))),
+            )
+        await ctx.reply(
+            "GRILLO v2 reflection: "
+            f"episodes=`{result.episodes}` evidence=`{result.evidence}` facts=`{result.facts}` "
+            f"opinions=`{result.opinions}` invalidated=`{result.invalidated_facts}` notes=`{result.notes}`",
+            mention_author=False,
+        )
+
+    return reflect
+
+
+def _backfill_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="backfill")
+    async def backfill(ctx: commands.Context, limit: int = 10_000) -> None:
+        if not _is_owner(bot, ctx):
+            await ctx.reply("owner only", mention_author=False)
+            return
+        grillo_path = Path(
+            os.getenv("DISCORD_BRAIN_V2_BACKFILL_GRILLO_PATH")
+            or os.getenv("DISCORD_BRAIN_DATABASE_PATH")
+            or "discord_brain.sqlite3"
+        )
+        identity_path = Path(
+            os.getenv("DISCORD_BRAIN_V2_BACKFILL_IDENTITY_PATH")
+            or os.getenv("DISCORD_BRAIN_IDENTITY_DATABASE_PATH")
+            or grillo_path.with_suffix(".discord-identity.sqlite3")
+        )
+        async with ctx.channel.typing():
+            results = await asyncio.to_thread(
+                bot.brain_v2.backfill_from_v1,
+                grillo_path=grillo_path,
+                identity_path=identity_path,
+                limit=max(1, min(100_000, int(limit))),
+            )
+        await ctx.reply(_format_backfill_results(results), mention_author=False)
+
+    return backfill
+
+
+def _is_owner(bot: DiscordBrainV2Bot, ctx: commands.Context) -> bool:
+    return getattr(ctx.author, "id", None) in bot.owner_users
+
+
+def _format_status(status: dict[str, Any]) -> str:
+    counts = status.get("counts") if isinstance(status.get("counts"), dict) else {}
+    return (
+        "Brain v2 online. "
+        f"model=`{status.get('model')}` provider=`{status.get('provider')}` grillo=`v2` "
+        f"entities=`{counts.get('entities', 0)}` episodes=`{counts.get('episodes', 0)}` "
+        f"facts=`{counts.get('active_facts', 0)}` opinions=`{counts.get('active_opinion_edges', 0)}`"
+    )
+
+
+def _format_backfill_results(results: dict[str, Any]) -> str:
+    if not results:
+        return "GRILLO v2 backfill: no sources provided."
+    parts = ["GRILLO v2 backfill complete."]
+    for name, result in results.items():
+        parts.append(
+            f"{name}: episodes=`{getattr(result, 'episodes', 0)}` entities=`{getattr(result, 'entities', 0)}` "
+            f"evidence=`{getattr(result, 'evidence', 0)}` facts=`{getattr(result, 'facts', 0)}` "
+            f"skipped=`{getattr(result, 'skipped', 0)}`"
+        )
+    return "\n".join(parts)
 
 
 def _scope_for_message(message: discord.Message) -> str:

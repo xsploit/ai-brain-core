@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .models import GrilloContextPacket, GrilloEpisode, OpinionEdge, TemporalFact, dataclass_dict
+from .models import GrilloContextPacket, GrilloEntity, GrilloEpisode, OpinionEdge, TemporalFact, dataclass_dict
 from .store import SQLiteGrilloV2Store
 
 
@@ -49,10 +49,11 @@ class GrilloContextBuilder:
             channel_id=channel_id,
             limit=episode_limit,
         )
+        actor = self.store.get_entity(actor_id)
         return GrilloContextPacket(
             scope_key=scope_key,
             actor_id=actor_id,
-            current_actor=_actor_context(actor_id, facts),
+            current_actor=_actor_context(actor_id, actor, facts),
             relationship_state=[_opinion_context(edge) for edge in opinions],
             active_facts=[_fact_context(fact) for fact in facts],
             evidence_gaps=_evidence_gap_context(facts),
@@ -73,7 +74,7 @@ def _merge_facts(facts: list[TemporalFact]) -> list[TemporalFact]:
     return merged
 
 
-def _actor_context(actor_id: str | None, facts: list[TemporalFact]) -> dict[str, object]:
+def _actor_context(actor_id: str | None, actor: GrilloEntity | None, facts: list[TemporalFact]) -> dict[str, object]:
     if not actor_id:
         return {}
     aliases = [
@@ -81,9 +82,14 @@ def _actor_context(actor_id: str | None, facts: list[TemporalFact]) -> dict[str,
         for fact in facts
         if fact.subject_id == actor_id and fact.predicate in {"alias", "display_name", "preferred_name"}
     ]
+    if actor is not None:
+        aliases = [actor.name, *actor.aliases, *aliases]
     return {
         "entity_id": actor_id,
+        "entity_type": actor.entity_type if actor is not None else "unknown",
+        "name": actor.name if actor is not None else actor_id,
         "known_aliases": _dedupe(aliases)[:8],
+        "metadata": actor.metadata if actor is not None else {},
     }
 
 

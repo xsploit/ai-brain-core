@@ -1,4 +1,5 @@
 from .context import GrilloContextBuilder
+from .backfill import GrilloV2BackfillResult, backfill_discord_identity, backfill_grillo_v1
 from .gateway import VercelAIGatewayJSONClient
 from .models import (
     Evidence,
@@ -15,6 +16,7 @@ from .store import SQLiteGrilloV2Store
 __all__ = [
     "Evidence",
     "EvidenceGap",
+    "GrilloV2BackfillResult",
     "GrilloContextBuilder",
     "GrilloContextPacket",
     "GrilloEntity",
@@ -25,4 +27,6 @@ __all__ = [
     "SQLiteGrilloV2Store",
     "TemporalFact",
     "VercelAIGatewayJSONClient",
+    "backfill_discord_identity",
+    "backfill_grillo_v1",
 ]

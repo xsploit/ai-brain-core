@@ -8,6 +8,7 @@ from typing import Any
 from .models import (
     Evidence,
     EvidenceGap,
+    GrilloEntity,
     GrilloEpisode,
     OpinionEdge,
     TemporalFact,
@@ -47,6 +48,17 @@ class SQLiteGrilloV2Store:
         with self._lock:
             self._connect().executescript(
                 """
+                CREATE TABLE IF NOT EXISTS grillo_v2_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    entity_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_grillo_v2_entities_type
+                    ON grillo_v2_entities(entity_type, name);
+
                 CREATE TABLE IF NOT EXISTS grillo_v2_episodes (
                     episode_id TEXT PRIMARY KEY,
                     scope_key TEXT NOT NULL,
@@ -122,6 +134,73 @@ class SQLiteGrilloV2Store:
                 );
                 """
             )
+
+    def upsert_entity(self, entity: GrilloEntity) -> GrilloEntity:
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT aliases_json, metadata_json FROM grillo_v2_entities WHERE entity_id = ?",
+                (entity.entity_id,),
+            ).fetchone()
+            aliases = entity.aliases
+            metadata = dict(entity.metadata)
+            if row is not None:
+                aliases = _dedupe([*entity.aliases, *[str(item) for item in from_json_list(row["aliases_json"])]])
+                metadata = {**from_json_dict(row["metadata_json"]), **metadata}
+            self._connect().execute(
+                """
+                INSERT INTO grillo_v2_entities (
+                    entity_id, entity_type, name, aliases_json, metadata_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    entity_type = excluded.entity_type,
+                    name = excluded.name,
+                    aliases_json = excluded.aliases_json,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entity.entity_id,
+                    entity.entity_type,
+                    entity.name,
+                    to_json(aliases),
+                    to_json(metadata),
+                    utc_now(),
+                ),
+            )
+            entity.aliases = aliases
+            entity.metadata = metadata
+        return entity
+
+    def get_entity(self, entity_id: str | None) -> GrilloEntity | None:
+        if not entity_id:
+            return None
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT * FROM grillo_v2_entities WHERE entity_id = ?",
+                (entity_id,),
+            ).fetchone()
+        return _entity_from_row(row) if row is not None else None
+
+    def list_entities(self, *, entity_type: str | None = None, limit: int = 50) -> list[GrilloEntity]:
+        where: list[str] = []
+        params: list[Any] = []
+        if entity_type:
+            where.append("entity_type = ?")
+            params.append(entity_type)
+        params.append(max(1, int(limit)))
+        sql_where = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._lock:
+            rows = self._connect().execute(
+                f"""
+                SELECT * FROM grillo_v2_entities
+                {sql_where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_entity_from_row(row) for row in rows]
 
     def append_episode(self, episode: GrilloEpisode) -> GrilloEpisode:
         with self._lock:
@@ -363,6 +442,24 @@ class SQLiteGrilloV2Store:
             ).fetchone()
         return str(row["value"]) if row else None
 
+    def counts(self) -> dict[str, int]:
+        tables = {
+            "entities": "grillo_v2_entities",
+            "episodes": "grillo_v2_episodes",
+            "evidence": "grillo_v2_evidence",
+            "facts": "grillo_v2_temporal_facts",
+            "active_facts": "grillo_v2_temporal_facts WHERE valid_to IS NULL",
+            "opinion_edges": "grillo_v2_opinion_edges",
+            "active_opinion_edges": "grillo_v2_opinion_edges WHERE valid_to IS NULL",
+        }
+        out: dict[str, int] = {}
+        with self._lock:
+            conn = self._connect()
+            for key, table in tables.items():
+                row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                out[key] = int(row["count"] if row else 0)
+        return out
+
     def _fact_rows(self, where: list[str], params: list[Any], *, limit: int) -> list[sqlite3.Row]:
         params = [*params, max(1, int(limit))]
         with self._lock:
@@ -375,6 +472,16 @@ class SQLiteGrilloV2Store:
                 """,
                 params,
             ).fetchall()
+
+
+def _entity_from_row(row: sqlite3.Row) -> GrilloEntity:
+    return GrilloEntity(
+        entity_id=row["entity_id"],
+        entity_type=row["entity_type"],
+        name=row["name"],
+        aliases=[str(item) for item in from_json_list(row["aliases_json"])],
+        metadata=from_json_dict(row["metadata_json"]),
+    )
 
 
 def _episode_from_row(row: sqlite3.Row) -> GrilloEpisode:

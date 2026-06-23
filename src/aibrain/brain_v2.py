@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from grillo_v2 import GrilloContextPacket, GrilloEpisode, GrilloV2Runtime, SQLiteGrilloV2Store
+from grillo_v2 import GrilloContextPacket, GrilloEntity, GrilloEpisode, GrilloV2Runtime, SQLiteGrilloV2Store
+from grillo_v2.backfill import GrilloV2BackfillResult, backfill_discord_identity, backfill_grillo_v1
 from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONClient
 from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
 
@@ -55,6 +56,24 @@ class BrainV2:
     def append_episode(self, episode: GrilloEpisode) -> GrilloEpisode:
         return self.grillo.append_episode(episode)
 
+    def upsert_actor_entity(
+        self,
+        *,
+        actor_id: str,
+        name: str | None = None,
+        aliases: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> GrilloEntity:
+        return self.store.upsert_entity(
+            GrilloEntity(
+                entity_id=actor_id,
+                entity_type="person",
+                name=name or actor_id,
+                aliases=aliases or [],
+                metadata=metadata or {},
+            )
+        )
+
     async def respond(
         self,
         *,
@@ -65,6 +84,12 @@ class BrainV2:
         channel_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        self.upsert_actor_entity(
+            actor_id=actor_id,
+            name=_actor_name_from_metadata(metadata or {}) or actor_id,
+            aliases=_actor_aliases_from_metadata(metadata or {}),
+            metadata=metadata or {},
+        )
         user_episode = GrilloEpisode.create(
             scope_key=scope_key,
             source=source,
@@ -115,6 +140,55 @@ class BrainV2:
             channel_id=channel_id,
         )
 
+    async def reflect_recent(
+        self,
+        *,
+        scope_key: str,
+        actor_id: str | None = None,
+        channel_id: str | None = None,
+        limit: int = 12,
+    ):
+        return await self.grillo.reflect_recent(
+            scope_key=scope_key,
+            actor_id=actor_id,
+            channel_id=channel_id,
+            limit=limit,
+        )
+
+    def backfill_from_v1(
+        self,
+        *,
+        grillo_path: str | Path | None = None,
+        identity_path: str | Path | None = None,
+        limit: int = 10_000,
+    ) -> dict[str, GrilloV2BackfillResult]:
+        results: dict[str, GrilloV2BackfillResult] = {}
+        if grillo_path is not None:
+            results["grillo_v1"] = backfill_grillo_v1(
+                source_path=grillo_path,
+                target=self.store,
+                persona_id=self.config.persona_id,
+                limit=limit,
+            )
+        if identity_path is not None:
+            results["discord_identity"] = backfill_discord_identity(
+                source_path=identity_path,
+                target=self.store,
+                persona_id=self.config.persona_id,
+                limit=limit,
+            )
+        return results
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "model": self.config.model,
+            "provider": self.config.provider,
+            "base_url": self.base_url,
+            "persona_id": self.config.persona_id,
+            "database_path": str(self.config.database_path),
+            "counts": self.store.counts(),
+        }
+
     async def _complete_reflection(self, request: dict[str, Any]) -> dict[str, Any]:
         return await self.json_client.complete_json(
             instructions=GRILLO_V2_REFLECTION_INSTRUCTIONS,
@@ -158,3 +232,35 @@ def _response_prompt(*, packet: GrilloContextPacket, user_text: str) -> str:
             user_text,
         ]
     )
+
+
+def _actor_name_from_metadata(metadata: dict[str, Any]) -> str | None:
+    for key in ("author_display_name", "author_global_name", "author_username", "name"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _actor_aliases_from_metadata(metadata: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for key in ("author_display_name", "author_global_name", "author_username", "name"):
+        value = metadata.get(key)
+        if value:
+            aliases.append(str(value))
+    author_id = metadata.get("author_id")
+    if author_id:
+        aliases.extend([str(author_id), f"<@{author_id}>"])
+    return _dedupe(aliases)
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
