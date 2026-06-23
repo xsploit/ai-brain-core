@@ -30,6 +30,7 @@ from .discord_bot import (
     _ordered_model_choices as _ordered_model_choices_for_v2,
     _split_discord_text,
     _text_attachment_context as _v1_text_attachment_context,
+    _time_context,
     _tts_spoken_text,
     build_brain,
     build_discord_voice_clip,
@@ -531,10 +532,10 @@ def _summary_command(bot: DiscordBrainV2Bot):
                 prompt="\n".join(messages),
                 store=False,
             )
-        summary_text = (text.strip() or "no summary generated.")[: bot.max_reply_chars]
+        summary_text = text.strip() or "no summary generated."
         source_label = getattr(ctx.channel, "name", None) or str(getattr(ctx.channel, "id", "channel"))
         view = SummaryActionView(bot, ctx.author.id, _scope_for_message(ctx.message), summary_text, source_label)
-        await ctx.reply(summary_text, mention_author=False, view=view)
+        await _reply_text_chunks(ctx, summary_text, limit=bot.max_reply_chars, view=view)
 
     return summary
 
@@ -554,7 +555,7 @@ def _search_command(bot: DiscordBrainV2Bot):
         except Exception as exc:
             await ctx.reply(f"search failed: {exc}", mention_author=False)
             return
-        await ctx.reply(_format_tavily_search_result(result)[: bot.max_reply_chars], mention_author=False)
+        await _reply_text_chunks(ctx, _format_tavily_search_result(result), limit=bot.max_reply_chars)
 
     return search
 
@@ -661,7 +662,7 @@ async def _send_model_info(bot: DiscordBrainV2Bot, ctx: commands.Context, *, mod
     for key in ("provider", "context_window", "max_output_tokens", "input_modalities", "output_modalities"):
         if key in metadata:
             lines.append(f"{key}: `{metadata[key]}`")
-    await ctx.reply("\n".join(lines)[: bot.max_reply_chars], mention_author=False)
+    await _reply_text_chunks(ctx, "\n".join(lines), limit=bot.max_reply_chars)
 
 
 def _jb_command(bot: DiscordBrainV2Bot):
@@ -684,7 +685,7 @@ def _jb_command(bot: DiscordBrainV2Bot):
                 message_id=getattr(ctx.message, "id", "latest"),
                 one_shot_prompt=one_shot_prompt,
             )
-        await ctx.reply((text.strip() or "JB returned no text.")[: bot.max_reply_chars], mention_author=False)
+        await _reply_text_chunks(ctx, text.strip() or "JB returned no text.", limit=bot.max_reply_chars)
 
     @jb.command(name="add")
     async def jb_add(ctx: commands.Context) -> None:
@@ -742,7 +743,7 @@ def _tts_control_group(bot: DiscordBrainV2Bot):
         lines = [f"- `{voice.slug}`: {voice.label}" for voice in voices[: _env_int("DISCORD_BRAIN_TTS_VOICE_LIST_LIMIT", 25)]]
         if len(voices) > len(lines):
             lines.append(f"... {len(voices) - len(lines)} more")
-        await ctx.reply("\n".join(lines)[: bot.max_reply_chars], mention_author=False)
+        await _reply_text_chunks(ctx, "\n".join(lines), limit=bot.max_reply_chars)
 
     @tts_control.command(name="voice")
     async def tts_voice(ctx: commands.Context, *, voice_id: str) -> None:
@@ -1398,7 +1399,24 @@ def _discord_context_for_message(message: discord.Message, recent_messages: list
         "reply_target": metadata.get("reply_target"),
         "recent_messages": recent_messages,
         "discord_metadata": metadata,
+        **_time_context(getattr(message, "created_at", None)),
     }
+
+
+async def _reply_text_chunks(
+    ctx: commands.Context,
+    text: str,
+    *,
+    limit: int,
+    view: discord.ui.View | None = None,
+    mention_author: bool = False,
+) -> None:
+    chunks = _split_discord_text(text, min(limit, 1900))
+    for index, chunk in enumerate(chunks):
+        if index == 0:
+            await ctx.reply(chunk, mention_author=mention_author, view=view)
+        else:
+            await ctx.send(chunk)
 
 
 def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from aibrain.discord_bot_v2 import (
     V2RelationshipGraphView,
     _append_readable_attachment_context,
     _complete_jb_turn,
+    _discord_context_for_message,
     _discord_metadata,
     _format_backfill_results,
     _format_grillo_v2_facts,
@@ -27,6 +29,7 @@ from aibrain.discord_bot_v2 import (
     _recent_message_item,
     _relationship_v2_embed,
     _relationship_v2_snapshot,
+    _reply_text_chunks,
     _scope_for_message,
     build_brain_v2,
 )
@@ -983,12 +986,55 @@ def test_discord_bot_v2_metadata_and_recent_item_include_reply_target():
     assert recent["reply_to_message_id"] == "444"
 
 
+def test_discord_bot_v2_tool_context_includes_local_time():
+    message = SimpleNamespace(
+        id=445,
+        guild=SimpleNamespace(id=222, name="Test Guild"),
+        channel=SimpleNamespace(id=333, name="bot-chat"),
+        author=SimpleNamespace(id=123, name="subsect", display_name="Subby", global_name=None, bot=False),
+        clean_content="what time is it",
+        content="what time is it",
+        reference=None,
+        jump_url="https://discord.example/message",
+        created_at=datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc),
+    )
+
+    context = _discord_context_for_message(message, [])
+
+    assert context["local_now"]
+    assert context["local_date"]
+    assert context["local_time"]
+    assert context["local_timezone"]
+    assert context["discord_metadata"]["guild_name"] == "Test Guild"
+
+
 def test_discord_bot_v2_appends_readable_attachment_context_without_indexing():
     combined = _append_readable_attachment_context("read this", "file.txt:\nhello")
 
     assert combined == "read this\n\n[Readable attachments]\nfile.txt:\nhello"
     assert _append_readable_attachment_context("", "file.txt:\nhello") == "[Readable attachments]\nfile.txt:\nhello"
     assert _append_readable_attachment_context("read this", "") == "read this"
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_command_reply_chunks_long_output():
+    events = []
+
+    class FakeContext:
+        async def reply(self, content, mention_author=False, view=None):
+            events.append(("reply", content, mention_author, view))
+
+        async def send(self, content):
+            events.append(("send", content))
+
+    view = object()
+
+    await _reply_text_chunks(FakeContext(), "alpha beta gamma delta epsilon", limit=20, view=view)
+
+    assert events == [
+        ("reply", "alpha beta gamma", False, view),
+        ("send", "delta epsilon"),
+    ]
 
 
 def test_discord_bot_v2_guild_humans_need_mention_or_reply():
