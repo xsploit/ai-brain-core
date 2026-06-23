@@ -11,6 +11,7 @@ from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     DiscordBrainV2Bot,
     _append_readable_attachment_context,
+    _complete_jb_turn,
     _discord_metadata,
     _format_backfill_results,
     _format_status,
@@ -821,6 +822,57 @@ async def test_brain_v2_can_use_v1_stream_backend_with_tools_and_memory(tmp_path
     assert "Yappy Neuro persona." in call["persona"].instructions
     assert "Use the GRILLO v2 context packet" in call["persona"].instructions
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_jb_turn_uses_separate_no_memory_no_tools_path(tmp_path):
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+            self.config = SimpleNamespace(default_model="deepseek/default")
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            yield BrainEvent("text.delta", {"text": "jb reply"})
+            yield BrainEvent("response.done", {})
+
+    fake_brain = FakeStreamBrain()
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+        response_persona=SimpleNamespace(
+            id="neuro-sama",
+            name="Neuro-sama",
+            instructions="Yappy Neuro persona.",
+            model="deepseek/test",
+            tools=["discord_context"],
+        ),
+        response_tool_names=["discord_context", "tavily_search"],
+        response_memory_policy=SimpleNamespace(top_k=8),
+    )
+    bot = SimpleNamespace(brain_v2=brain)
+
+    response = await _complete_jb_turn(
+        bot,
+        content="test prompt",
+        message_id=12345,
+        one_shot_prompt="JB-only instructions.",
+    )
+
+    assert response == "jb reply"
+    assert len(fake_brain.calls) == 1
+    call = fake_brain.calls[0]
+    assert call["prompt"] == "test prompt"
+    assert call["thread_id"] == "discord:jb:12345"
+    assert call["use_memory"] is False
+    assert call["tool_names"] == []
+    assert call["stateless"] is True
+    assert call["persona"].id == "jb-one-shot"
+    assert call["persona"].tools == []
+    assert "JB-only instructions." in call["persona"].instructions
+    assert "Yappy Neuro persona." not in call["persona"].instructions
+    assert brain.store.counts()["episodes"] == 0
 
 
 def test_discord_bot_v2_loads_persona_prompt_path(tmp_path, monkeypatch):

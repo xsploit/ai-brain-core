@@ -17,7 +17,11 @@ from .brain_v2 import BrainV2, BrainV2Config
 from .discord_bot import (
     DEFAULT_DISCORD_TOOL_NAMES,
     DISCORD_CONTEXT,
+    JBPromptAddView,
+    _build_jb_persona,
     _image_inputs as _v1_image_inputs,
+    _jb_prompt_cache_key,
+    _load_jb_prompt,
     _text_attachment_context as _v1_text_attachment_context,
     build_brain,
     build_persona,
@@ -82,6 +86,7 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_summary_command(self))
         self.add_command(_search_command(self))
         self.add_command(_ping_command(self))
+        self.add_command(_jb_command(self))
         self.add_command(_pause_command(self))
         self.add_command(_resume_command(self))
         self.add_command(_bot_control_group(self))
@@ -260,6 +265,7 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!search <query>` - explicit Tavily web search",
                     "`!remember <text>` - pin a manual GRILLO v2 memory for you",
                     "`!ping @user` - tag someone with a short hello",
+                    "`!jb <message>` - separate one-shot JB path with no memory/tools",
                     "`!pause` / `!resume` - admin/owner normal reply control",
                     "`!bot toggle` - admin/owner bot-to-bot reply control",
                     f"`{prefix} status` - show v2 model and GRILLO counts",
@@ -400,6 +406,42 @@ def _ping_command(bot: DiscordBrainV2Bot):
     return ping
 
 
+def _jb_command(bot: DiscordBrainV2Bot):
+    @commands.group(name="jb", invoke_without_command=True)
+    async def jb(ctx: commands.Context, *, content: str = "") -> None:
+        if ctx.invoked_subcommand is not None:
+            return
+        content = content.strip()
+        if not content:
+            await ctx.reply("usage: `!jb <message>`", mention_author=False)
+            return
+        one_shot_prompt = _load_jb_prompt()
+        if not one_shot_prompt:
+            await ctx.reply("JB prompt file is not configured or could not be read.", mention_author=False)
+            return
+        async with ctx.channel.typing():
+            text = await _complete_jb_turn(
+                bot,
+                content=content,
+                message_id=getattr(ctx.message, "id", "latest"),
+                one_shot_prompt=one_shot_prompt,
+            )
+        await ctx.reply((text.strip() or "JB returned no text.")[: bot.max_reply_chars], mention_author=False)
+
+    @jb.command(name="add")
+    async def jb_add(ctx: commands.Context) -> None:
+        if not await _require_admin_or_owner(bot, ctx, "JB prompt editing"):
+            return
+        view = JBPromptAddView(ctx.author.id)
+        await ctx.reply(
+            "Click the button to paste JB prompt text. Future `!jb` turns will include it.",
+            mention_author=False,
+            view=view,
+        )
+
+    return jb
+
+
 def _pause_command(bot: DiscordBrainV2Bot):
     @commands.command(name="pause")
     async def pause(ctx: commands.Context) -> None:
@@ -442,6 +484,46 @@ def _bot_control_group(bot: DiscordBrainV2Bot):
         await ctx.reply(f"bot-to-bot auto replies are now `{state}`.", mention_author=False)
 
     return bot_control
+
+
+async def _complete_jb_turn(
+    bot: DiscordBrainV2Bot,
+    *,
+    content: str,
+    message_id: Any,
+    one_shot_prompt: str,
+) -> str:
+    fallback_model = getattr(getattr(bot.brain_v2, "response_brain", None), "config", None)
+    fallback_model_id = str(getattr(fallback_model, "default_model", None) or bot.brain_v2.config.model)
+    persona = _build_jb_persona(one_shot_prompt, fallback_model=fallback_model_id)
+    response_brain = getattr(bot.brain_v2, "response_brain", None)
+    if response_brain is None:
+        return (
+            await bot.brain_v2.json_client.complete_text(
+                instructions=persona.instructions,
+                prompt=content,
+                store=False,
+            )
+        ).strip()
+    response_options: dict[str, Any] = {"stateless": True}
+    cache_key = _jb_prompt_cache_key(one_shot_prompt)
+    if cache_key:
+        response_options["prompt_cache_key"] = cache_key
+        response_options["prompt_cache_retention"] = os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h")
+    buffer = ""
+    async for event in response_brain.stream(
+        content,
+        thread_id=f"discord:jb:{message_id}",
+        persona=persona,
+        use_memory=False,
+        tool_names=[],
+        **response_options,
+    ):
+        if event.type == "text.delta":
+            buffer += str(event.data.get("text", ""))
+        elif event.type == "error":
+            raise RuntimeError(event.data.get("message", "JB brain stream failed"))
+    return buffer.strip()
 
 
 def _reflect_command(bot: DiscordBrainV2Bot):
@@ -590,6 +672,7 @@ def _build_command_prefix(command_prefix_text: str):
         "search",
         "remember",
         "ping",
+        "jb",
         "pause",
         "resume",
         "unpause",
