@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import aibrain.discord_bot_v2 as discord_bot_v2_module
 from aibrain.brain_v2 import BrainV2, BrainV2Config
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
@@ -1017,6 +1018,36 @@ def test_discord_bot_v2_pause_blocks_normal_responses():
     )
 
     assert bot._should_respond(message) is False
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_tts_reply_uses_v1_voice_clip_builder(monkeypatch):
+    events = []
+    response_brain = SimpleNamespace()
+
+    async def fake_clip(brain, text, *, voice=None):
+        events.append(("clip", brain, text, voice))
+        return SimpleNamespace(ogg=b"ogg")
+
+    async def fake_send(channel_id, token, clip):
+        events.append(("send", channel_id, token, clip.ogg))
+
+    monkeypatch.setattr(discord_bot_v2_module, "build_discord_voice_clip", fake_clip)
+    monkeypatch.setattr(discord_bot_v2_module, "send_discord_voice_message", fake_send)
+
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.send_tts_replies = True
+    bot.discord_token = "discord-token"
+    bot.tts_voice = "neuro-sama"
+    bot.brain_v2 = SimpleNamespace(response_brain=response_brain)
+    message = SimpleNamespace(channel=SimpleNamespace(id=333))
+
+    await bot._maybe_send_tts_reply(message, "**ok**")
+
+    assert events == [
+        ("clip", response_brain, "ok", "neuro-sama"),
+        ("send", 333, "discord-token", b"ogg"),
+    ]
 
 
 def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):

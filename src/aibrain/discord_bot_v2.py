@@ -22,9 +22,14 @@ from .discord_bot import (
     _image_inputs as _v1_image_inputs,
     _jb_prompt_cache_key,
     _load_jb_prompt,
+    _match_piper_voice,
     _text_attachment_context as _v1_text_attachment_context,
+    _tts_spoken_text,
     build_brain,
+    build_discord_voice_clip,
     build_persona,
+    discover_piper_voices,
+    send_discord_voice_message,
 )
 from .discord_tools import DISCORD_TOOL_CONTEXT, DiscordToolRuntime
 from .env import load_env_file
@@ -37,7 +42,7 @@ logger = logging.getLogger("aibrain.discord_v2")
 
 
 class DiscordBrainV2Bot(commands.Bot):
-    def __init__(self, *, brain: BrainV2):
+    def __init__(self, *, brain: BrainV2, discord_token: str | None = None):
         intents = discord.Intents.default()
         intents.message_content = _env_bool("DISCORD_BRAIN_V2_MESSAGE_CONTENT_INTENT", True)
         intents.guilds = True
@@ -50,6 +55,13 @@ class DiscordBrainV2Bot(commands.Bot):
             intents=intents,
         )
         self.brain_v2 = brain
+        self.discord_token = (
+            discord_token
+            or os.getenv("DISCORD_BRAIN_V2_BOT_TOKEN")
+            or os.getenv("DISCORD_BRAIN_BOT_TOKEN")
+            or os.getenv("DISCORD_BOT_TOKEN")
+            or os.getenv("DISCORD_TOKEN")
+        )
         self.allowed_guilds = _csv_ints("DISCORD_BRAIN_V2_ALLOWED_GUILD_IDS")
         self.allowed_users = _csv_ints("DISCORD_BRAIN_V2_ALLOWED_USER_IDS")
         self.owner_users = _csv_ints("DISCORD_BRAIN_V2_OWNER_USER_IDS") or _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
@@ -60,6 +72,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.respond_to_bots = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_BOTS", _env_bool("DISCORD_BRAIN_RESPOND_TO_BOTS", False))
         self.paused = _env_bool("DISCORD_BRAIN_V2_PAUSED", _env_bool("DISCORD_BRAIN_PAUSED", False))
         self.max_reply_chars = _env_int("DISCORD_BRAIN_V2_MAX_REPLY_CHARS", 1900)
+        self.tts_voice = os.getenv("DISCORD_BRAIN_V2_TTS_VOICE") or os.getenv("DISCORD_BRAIN_TTS_VOICE") or os.getenv("AIBRAIN_TTS_VOICE") or os.getenv("PIPER_VOICE")
+        self.send_tts_replies = _env_bool("DISCORD_BRAIN_V2_TTS_REPLIES", _env_bool("DISCORD_BRAIN_TTS_REPLIES", False))
         self.rolling_context_messages = max(1, _env_int("DISCORD_BRAIN_V2_ROLLING_CONTEXT_MESSAGES", 15))
         self.recent_by_scope: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=max(self.rolling_context_messages * 4, 32))
@@ -87,6 +101,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_search_command(self))
         self.add_command(_ping_command(self))
         self.add_command(_jb_command(self))
+        self.add_command(_say_command(self))
+        self.add_command(_tts_control_group(self))
         self.add_command(_pause_command(self))
         self.add_command(_resume_command(self))
         self.add_command(_bot_control_group(self))
@@ -166,6 +182,7 @@ class DiscordBrainV2Bot(commands.Bot):
             DISCORD_CONTEXT.reset(context_token)
         if response:
             await message.reply(response[: self.max_reply_chars], mention_author=False)
+            await self._maybe_send_tts_reply(message, response)
 
     def _allowed(self, message: discord.Message) -> bool:
         guild = message.guild
@@ -204,6 +221,22 @@ class DiscordBrainV2Bot(commands.Bot):
 
     def _bot_interactions_enabled(self) -> bool:
         return bool(not self.ignore_bots and self.respond_to_bots)
+
+    async def _maybe_send_tts_reply(self, message: discord.Message, text: str) -> None:
+        if not self.send_tts_replies or not self.discord_token or not text.strip():
+            return
+        brain = getattr(self.brain_v2, "response_brain", None)
+        if brain is None:
+            logger.warning("TTS reply skipped because V2 response_brain is not configured")
+            return
+        try:
+            spoken = _tts_spoken_text(text)[: _env_int("DISCORD_BRAIN_TTS_MAX_CHARS", 1200)]
+            if not spoken.strip():
+                return
+            clip = await build_discord_voice_clip(brain, spoken, voice=self.tts_voice)
+            await send_discord_voice_message(message.channel.id, self.discord_token, clip)
+        except Exception:
+            logger.exception("Failed to send Discord Brain v2 TTS reply")
 
     def _record_discord_message(self, message: discord.Message):
         text = _message_text(message)
@@ -266,6 +299,8 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!remember <text>` - pin a manual GRILLO v2 memory for you",
                     "`!ping @user` - tag someone with a short hello",
                     "`!jb <message>` - separate one-shot JB path with no memory/tools",
+                    "`!say <text>` - send a Piper Discord voice clip",
+                    "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
                     "`!pause` / `!resume` - admin/owner normal reply control",
                     "`!bot toggle` - admin/owner bot-to-bot reply control",
                     f"`{prefix} status` - show v2 model and GRILLO counts",
@@ -440,6 +475,87 @@ def _jb_command(bot: DiscordBrainV2Bot):
         )
 
     return jb
+
+
+def _say_command(bot: DiscordBrainV2Bot):
+    @commands.command(name="say")
+    async def say(ctx: commands.Context, *, content: str = "") -> None:
+        await _send_tts_voice_message(bot, ctx, content)
+
+    return say
+
+
+def _tts_control_group(bot: DiscordBrainV2Bot):
+    @commands.group(name="tts", invoke_without_command=True)
+    async def tts_control(ctx: commands.Context) -> None:
+        brain = getattr(bot.brain_v2, "response_brain", None)
+        provider = type(getattr(brain, "tts", None)).__name__ if brain is not None else "(none)"
+        voices = await asyncio.to_thread(discover_piper_voices)
+        current_voice = bot.tts_voice or "(default)"
+        await ctx.reply(
+            "\n".join(
+                [
+                    f"provider: `{provider}`",
+                    f"voice: `{current_voice}`",
+                    f"voice clips on replies: `{bot.send_tts_replies}`",
+                    f"voices discovered: `{len(voices)}`",
+                ]
+            ),
+            mention_author=False,
+        )
+
+    @tts_control.command(name="toggle")
+    async def tts_toggle(ctx: commands.Context) -> None:
+        bot.send_tts_replies = not bot.send_tts_replies
+        state = "enabled" if bot.send_tts_replies else "disabled"
+        await ctx.reply(f"TTS voice clips on normal replies: `{state}`", mention_author=False)
+
+    @tts_control.command(name="voices")
+    async def tts_voices(ctx: commands.Context) -> None:
+        voices = await asyncio.to_thread(discover_piper_voices)
+        if not voices:
+            await ctx.reply("no Piper voices discovered.", mention_author=False)
+            return
+        lines = [f"- `{voice.slug}`: {voice.label}" for voice in voices[: _env_int("DISCORD_BRAIN_TTS_VOICE_LIST_LIMIT", 25)]]
+        if len(voices) > len(lines):
+            lines.append(f"... {len(voices) - len(lines)} more")
+        await ctx.reply("\n".join(lines)[: bot.max_reply_chars], mention_author=False)
+
+    @tts_control.command(name="voice")
+    async def tts_voice(ctx: commands.Context, *, voice_id: str) -> None:
+        voice_id = voice_id.strip()
+        voices = await asyncio.to_thread(discover_piper_voices)
+        matched = _match_piper_voice(voices, voice_id)
+        if matched is None:
+            await ctx.reply(f"unknown Piper voice `{voice_id}`. Use `!tts voices`.", mention_author=False)
+            return
+        bot.tts_voice = matched.slug
+        await ctx.reply(f"Piper voice set to `{matched.slug}` ({matched.label})", mention_author=False)
+
+    return tts_control
+
+
+async def _send_tts_voice_message(bot: DiscordBrainV2Bot, ctx: commands.Context, text: str) -> None:
+    text = text.strip()
+    if not text:
+        await ctx.reply("usage: `!say <text>`", mention_author=False)
+        return
+    if not bot.discord_token:
+        await ctx.reply("Discord bot token is not available for voice clip upload.", mention_author=False)
+        return
+    brain = getattr(bot.brain_v2, "response_brain", None)
+    if brain is None:
+        await ctx.reply("TTS backend is not configured.", mention_author=False)
+        return
+    max_chars = _env_int("DISCORD_BRAIN_TTS_MAX_CHARS", 1200)
+    text = _tts_spoken_text(text)[:max_chars]
+    if not text.strip():
+        await ctx.reply("nothing speakable after TTS cleanup.", mention_author=False)
+        return
+    async with ctx.typing():
+        clip = await build_discord_voice_clip(brain, text, voice=bot.tts_voice)
+        await send_discord_voice_message(ctx.channel.id, bot.discord_token, clip)
+    await ctx.reply("sent voice clip.", mention_author=False)
 
 
 def _pause_command(bot: DiscordBrainV2Bot):
@@ -673,6 +789,8 @@ def _build_command_prefix(command_prefix_text: str):
         "remember",
         "ping",
         "jb",
+        "say",
+        "tts",
         "pause",
         "resume",
         "unpause",
