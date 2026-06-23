@@ -526,7 +526,10 @@ async def test_brain_v2_respond_includes_persona_prompt(tmp_path):
         BrainV2Config(
             database_path=tmp_path / "brain-v2.sqlite3",
             model="deepseek/test",
-            persona_prompt="Keep Neuro's sharp streamer persona intact.",
+            persona_prompt=(
+                "Keep Neuro's sharp streamer persona intact. "
+                "Do not optimize for short one-liners by default."
+            ),
         ),
         json_client=json_client,
     )
@@ -539,6 +542,8 @@ async def test_brain_v2_respond_includes_persona_prompt(tmp_path):
 
     assert response == "persona loaded"
     assert "Keep Neuro's sharp streamer persona intact." in calls[0]["instructions"]
+    assert "Do not optimize for short one-liners by default." in calls[0]["instructions"]
+    assert "Short punchy sentences" not in calls[0]["instructions"]
 
 
 @pytest.mark.asyncio
