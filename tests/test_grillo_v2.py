@@ -1021,6 +1021,13 @@ async def test_brain_v2_respond_includes_metadata_and_rolling_context_without_do
                 "author_id": "999",
                 "author_is_bot": True,
                 "content": "Do you want me to check that?",
+                "created_at": "2026-06-23T12:00:00+00:00",
+                "reply_to": {
+                    "message_id": "m0",
+                    "author": "Karah",
+                    "author_id": "456",
+                    "author_is_bot": False,
+                },
             },
         },
     )
@@ -1044,6 +1051,13 @@ async def test_brain_v2_respond_includes_metadata_and_rolling_context_without_do
                 "author_id": "999",
                 "author_is_bot": True,
                 "content": "Do you want me to check that?",
+                "created_at": "2026-06-23T12:00:00+00:00",
+                "reply_to": {
+                    "message_id": "m0",
+                    "author": "Karah",
+                    "author_id": "456",
+                    "author_is_bot": False,
+                },
             },
         },
         rolling_context=[
@@ -1070,6 +1084,8 @@ async def test_brain_v2_respond_includes_metadata_and_rolling_context_without_do
     assert "# Current Discord Metadata" in calls[0]["input"]
     assert "guild_name: Test Guild" in calls[0]["input"]
     assert "- content: Do you want me to check that?" in calls[0]["input"]
+    assert "The replied-to message was itself replying to Karah (author_id=456)." in calls[0]["input"]
+    assert "Current speaker is Subby (author_id=123)" in calls[0]["input"]
     assert "# Recent Discord Channel Context" in calls[0]["input"]
     assert "Neuro-sama (bot): Do you want me to check that?" in calls[0]["input"]
     assert [episode.source for episode in episodes] == ["discord", "discord:assistant"]
@@ -1398,6 +1414,56 @@ def test_discord_bot_v2_metadata_and_recent_item_include_reply_target():
     assert metadata["reply_target"]["content"] == "Do you want me to check that?"
     assert recent["reply_to_author"] == "Neuro-sama"
     assert recent["reply_to_message_id"] == "444"
+
+
+def test_discord_bot_v2_reply_target_uses_recent_cache_for_bot_reply_addressee():
+    bot_author = SimpleNamespace(id=999, name="neuro", display_name="Neuro-sama", global_name=None, bot=True)
+    user = SimpleNamespace(id=123, name="subsect", display_name="Subby", global_name=None, bot=False)
+    target = SimpleNamespace(
+        id=444,
+        author=bot_author,
+        clean_content="you are IST, GMT+5:30, obviously.",
+        content="you are IST, GMT+5:30, obviously.",
+        created_at=datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc),
+        jump_url="https://discord.example/target",
+        reference=None,
+    )
+    message = SimpleNamespace(
+        id=445,
+        guild=SimpleNamespace(id=222, name="Test Guild"),
+        channel=SimpleNamespace(id=333, name="bot-chat"),
+        author=user,
+        clean_content="PDT",
+        content="PDT",
+        created_at=datetime(2026, 6, 23, 12, 1, tzinfo=timezone.utc),
+        attachments=[],
+        mentions=[],
+        reference=SimpleNamespace(message_id=444, resolved=target),
+        jump_url="https://discord.example/current",
+    )
+    recent_messages = [
+        {
+            "message_id": "444",
+            "author": "Neuro-sama",
+            "author_id": "999",
+            "author_is_bot": True,
+            "content": "you are IST, GMT+5:30, obviously.",
+            "reply_to_message_id": "555",
+            "reply_to_author": "Karah",
+            "reply_to_author_id": "456",
+            "reply_to_author_is_bot": False,
+        }
+    ]
+
+    metadata = _discord_metadata(message, recent_messages=recent_messages)
+
+    assert metadata["reply_target"]["author"] == "Neuro-sama"
+    assert metadata["reply_target"]["reply_to"] == {
+        "message_id": "555",
+        "author": "Karah",
+        "author_id": "456",
+        "author_is_bot": False,
+    }
 
 
 def test_discord_bot_v2_tool_context_includes_local_time():

@@ -729,6 +729,38 @@ def _metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
             value = reply_target.get(key)
             if value not in (None, ""):
                 lines.append(f"- {key}: {value}")
+        lines.extend(_reply_target_prompt_lines(reply_target, metadata=metadata))
+    return lines
+
+
+def _reply_target_prompt_lines(reply_target: dict[str, Any], *, metadata: dict[str, Any]) -> list[str]:
+    content = " ".join(str(reply_target.get("content") or "").split())
+    message_id = reply_target.get("message_id")
+    if not content:
+        if message_id in (None, ""):
+            return []
+        return [f"Discord reply context: this message replies to message_id={message_id}, but the target content was not available."]
+    author = str(reply_target.get("author") or reply_target.get("author_id") or "unknown")
+    marker = " (bot)" if reply_target.get("author_is_bot") else ""
+    created_at = reply_target.get("created_at") or "unknown time"
+    lines = [
+        "Discord reply context: the current user message is a direct reply to this message.",
+        f"- [{created_at}] {author}{marker}: {content[:1000]}",
+    ]
+    source = reply_target.get("reply_to")
+    if isinstance(source, dict):
+        source_author = source.get("author") or source.get("author_id") or "unknown"
+        source_author_id = source.get("author_id")
+        lines.append(f"The replied-to message was itself replying to {source_author} (author_id={source_author_id}).")
+        current_author = metadata.get("author_display_name") or metadata.get("author_global_name") or metadata.get("author_username")
+        current_author_id = metadata.get("author_id")
+        if current_author_id is not None and source_author_id is not None and str(current_author_id) != str(source_author_id):
+            lines.append(
+                f"Current speaker is {current_author} (author_id={current_author_id}), so this is a different participant entering or reacting to that exchange."
+            )
+    lines.append(
+        "Interpret short responses like yes/no/yep/nope/that one as referring to the replied-to message, but do not assume the current speaker is the same person the replied-to message was originally addressing."
+    )
     return lines
 
 

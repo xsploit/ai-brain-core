@@ -360,7 +360,7 @@ class DiscordBrainV2Bot(commands.Bot):
                     user_text=prompt_text,
                     source="discord",
                     channel_id=str(message.channel.id),
-                    metadata=_discord_metadata(message),
+                    metadata=_discord_metadata(message, recent_messages=rolling_context),
                     rolling_context=rolling_context,
                     record_user_episode=recorded_episode is None,
                     reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
@@ -537,7 +537,8 @@ class DiscordBrainV2Bot(commands.Bot):
         if not text:
             return None
         scope_key = _scope_for_message(message)
-        item = _recent_message_item(message)
+        recent_messages = list(self.recent_by_scope.get(scope_key, []))
+        item = _recent_message_item(message, recent_messages=recent_messages)
         self.recent_by_scope[scope_key].append(item)
         if not bool(getattr(message.author, "bot", False)):
             self.heartbeat_last_channel = message.channel
@@ -548,7 +549,7 @@ class DiscordBrainV2Bot(commands.Bot):
             user_text=text,
             source="discord",
             channel_id=str(message.channel.id),
-            metadata=_discord_metadata(message),
+            metadata=_discord_metadata(message, recent_messages=recent_messages),
         )
 
     def _recent_messages(self, message: discord.Message) -> list[dict[str, Any]]:
@@ -2468,7 +2469,7 @@ def _display_name(user: Any) -> str:
     )
 
 
-def _discord_metadata(message: discord.Message) -> dict[str, Any]:
+def _discord_metadata(message: discord.Message, recent_messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     guild = message.guild
     channel = message.channel
     author = message.author
@@ -2485,14 +2486,14 @@ def _discord_metadata(message: discord.Message) -> dict[str, Any]:
         "author_is_bot": bool(getattr(author, "bot", False)),
         "jump_url": getattr(message, "jump_url", None),
     }
-    reply_target = _reply_target_context(message)
+    reply_target = _reply_target_context(message, recent_messages=recent_messages)
     if reply_target is not None:
         metadata["reply_target"] = reply_target
     return metadata
 
 
 def _discord_context_for_message(message: discord.Message, recent_messages: list[dict[str, Any]]) -> dict[str, Any]:
-    metadata = _discord_metadata(message)
+    metadata = _discord_metadata(message, recent_messages=recent_messages)
     return {
         "scope": _scope_for_message(message),
         "guild": metadata.get("guild_name"),
@@ -2530,7 +2531,11 @@ async def _reply_text_chunks(
             await ctx.send(chunk)
 
 
-def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
+def _reply_target_context(
+    message: discord.Message,
+    *,
+    recent_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     reference = getattr(message, "reference", None)
     if reference is None:
         return None
@@ -2544,18 +2549,81 @@ def _reply_target_context(message: discord.Message) -> dict[str, Any] | None:
     if resolved is None:
         return {"message_id": str(message_id)} if message_id is not None else None
     author = getattr(resolved, "author", None)
+    created_at = getattr(resolved, "created_at", None)
+    target = {
+        "message_id": str(getattr(resolved, "id", None) or message_id or ""),
+        "author": _display_name(author) if author is not None else "unknown",
+        "author_id": str(getattr(author, "id", "")) if author is not None else None,
+        "author_is_bot": bool(getattr(author, "bot", False)),
+        "content": _message_text(resolved)[:1000],
+        "created_at": created_at.isoformat() if created_at else None,
+        "jump_url": getattr(resolved, "jump_url", None),
+    }
+    reply_source = _message_reply_source_context(resolved)
+    if reply_source is None:
+        cached = _recent_message_by_id(recent_messages or [], target["message_id"])
+        reply_source = _recent_reply_source_context(cached)
+    if reply_source is not None:
+        target["reply_to"] = reply_source
+    return target
+
+
+def _message_reply_source_context(message: Any) -> dict[str, Any] | None:
+    reference = getattr(message, "reference", None)
+    if reference is None:
+        return None
+    resolved = None
+    for attr in ("resolved", "cached_message"):
+        candidate = getattr(reference, attr, None)
+        if candidate is not None:
+            resolved = candidate
+            break
+    message_id = getattr(reference, "message_id", None)
+    if resolved is None:
+        return {"message_id": str(message_id)} if message_id is not None else None
+    author = getattr(resolved, "author", None)
+    created_at = getattr(resolved, "created_at", None)
     return {
         "message_id": str(getattr(resolved, "id", None) or message_id or ""),
         "author": _display_name(author) if author is not None else "unknown",
         "author_id": str(getattr(author, "id", "")) if author is not None else None,
         "author_is_bot": bool(getattr(author, "bot", False)),
         "content": _message_text(resolved)[:1000],
-        "jump_url": getattr(resolved, "jump_url", None),
+        "created_at": created_at.isoformat() if created_at else None,
     }
 
 
-def _recent_message_item(message: discord.Message) -> dict[str, Any]:
-    reply_target = _reply_target_context(message) or {}
+def _recent_message_by_id(recent_messages: list[dict[str, Any]], message_id: Any) -> dict[str, Any] | None:
+    if message_id is None:
+        return None
+    target = str(message_id)
+    for item in reversed(recent_messages):
+        if str(item.get("message_id")) == target:
+            return item
+    return None
+
+
+def _recent_reply_source_context(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not item:
+        return None
+    reply_to_message_id = item.get("reply_to_message_id")
+    reply_to_author_id = item.get("reply_to_author_id")
+    if reply_to_message_id is None and reply_to_author_id is None:
+        return None
+    return {
+        "message_id": str(reply_to_message_id) if reply_to_message_id is not None else None,
+        "author": item.get("reply_to_author"),
+        "author_id": str(reply_to_author_id) if reply_to_author_id is not None else None,
+        "author_is_bot": bool(item.get("reply_to_author_is_bot", False)),
+    }
+
+
+def _recent_message_item(
+    message: discord.Message,
+    *,
+    recent_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    reply_target = _reply_target_context(message, recent_messages=recent_messages) or {}
     created_at = getattr(message, "created_at", None)
     return {
         "message_id": str(getattr(message, "id", "")),
