@@ -20,7 +20,13 @@ from discord import app_commands
 from discord.ext import commands
 from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
 
-from .brain_v2 import BrainV2, BrainV2Config
+from .brain_v2 import (
+    BrainV2,
+    BrainV2Config,
+    _is_transient_response_stream_error,
+    _response_recovery_prompt,
+    _response_retry_options,
+)
 from .discord_bot import (
     DEFAULT_DISCORD_TOOL_NAMES,
     DEFAULT_HEARTBEAT_TOOL_NAMES,
@@ -2114,9 +2120,55 @@ async def _complete_jb_turn(
     if cache_key:
         response_options["prompt_cache_key"] = cache_key
         response_options["prompt_cache_retention"] = os.getenv("DISCORD_BRAIN_JB_PROMPT_CACHE_RETENTION", "24h")
+    try:
+        buffer = await _collect_jb_response_stream(
+            response_brain,
+            content,
+            message_id=message_id,
+            persona=persona,
+            response_options=response_options,
+        )
+    except Exception as exc:
+        if not _is_transient_response_stream_error(exc):
+            raise
+        buffer = await _collect_jb_response_stream(
+            response_brain,
+            _response_recovery_prompt(
+                content,
+                "Previous JB model stream disconnected before Discord received a complete reply.",
+            ),
+            message_id=message_id,
+            persona=persona,
+            response_options=_response_retry_options(response_options),
+        )
+    if buffer.strip():
+        return buffer.strip()
+    retry_buffer = await _collect_jb_response_stream(
+        response_brain,
+        _response_recovery_prompt(
+            content,
+            "Previous JB model call returned no visible Discord text.",
+        ),
+        message_id=message_id,
+        persona=persona,
+        response_options=_response_retry_options(response_options),
+    )
+    if not retry_buffer.strip():
+        raise RuntimeError("JB model returned an empty response after retry")
+    return retry_buffer.strip()
+
+
+async def _collect_jb_response_stream(
+    response_brain: Any,
+    prompt: str,
+    *,
+    message_id: Any,
+    persona: Any,
+    response_options: dict[str, Any],
+) -> str:
     buffer = ""
     async for event in response_brain.stream(
-        content,
+        prompt,
         thread_id=f"discord:jb:{message_id}",
         persona=persona,
         use_memory=False,
@@ -2127,7 +2179,7 @@ async def _complete_jb_turn(
             buffer += str(event.data.get("text", ""))
         elif event.type == "error":
             raise RuntimeError(event.data.get("message", "JB brain stream failed"))
-    return buffer.strip()
+    return buffer
 
 
 def _reflect_command(bot: DiscordBrainV2Bot):

@@ -1429,6 +1429,98 @@ async def test_discord_bot_v2_jb_turn_uses_separate_no_memory_no_tools_path(tmp_
     assert brain.store.counts()["episodes"] == 0
 
 
+@pytest.mark.asyncio
+async def test_discord_bot_v2_jb_turn_retries_transient_stream_without_cache_or_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "jb-cache-key")
+
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+            self.config = SimpleNamespace(default_model="deepseek/default")
+            self.scripts = [
+                RuntimeError("peer closed connection without sending complete message body (incomplete chunked read)"),
+                [BrainEvent("text.delta", {"text": "recovered jb"})],
+            ]
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            script = self.scripts.pop(0)
+            if isinstance(script, Exception):
+                raise script
+            for event in script:
+                yield event
+
+    fake_brain = FakeStreamBrain()
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+    )
+    bot = SimpleNamespace(brain_v2=brain)
+
+    response = await _complete_jb_turn(
+        bot,
+        content="test prompt",
+        message_id=12345,
+        one_shot_prompt="JB-only instructions.",
+    )
+
+    assert response == "recovered jb"
+    assert len(fake_brain.calls) == 2
+    assert fake_brain.calls[0]["tool_names"] == []
+    assert fake_brain.calls[0]["use_memory"] is False
+    assert fake_brain.calls[0]["prompt_cache_key"] == "jb-cache-key"
+    retry = fake_brain.calls[1]
+    assert retry["tool_names"] == []
+    assert retry["use_memory"] is False
+    assert "prompt_cache_key" not in retry
+    assert "Previous JB model stream disconnected" in retry["prompt"]
+    assert brain.store.counts()["episodes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_jb_turn_retries_empty_response_without_cache_or_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "jb-cache-key")
+
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+            self.config = SimpleNamespace(default_model="deepseek/default")
+            self.scripts = [
+                [BrainEvent("response.done", {})],
+                [BrainEvent("text.delta", {"text": "visible jb"})],
+            ]
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            for event in self.scripts.pop(0):
+                yield event
+
+    fake_brain = FakeStreamBrain()
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+    )
+    bot = SimpleNamespace(brain_v2=brain)
+
+    response = await _complete_jb_turn(
+        bot,
+        content="test prompt",
+        message_id=12345,
+        one_shot_prompt="JB-only instructions.",
+    )
+
+    assert response == "visible jb"
+    assert len(fake_brain.calls) == 2
+    retry = fake_brain.calls[1]
+    assert retry["tool_names"] == []
+    assert retry["use_memory"] is False
+    assert "prompt_cache_key" not in retry
+    assert "Previous JB model call returned no visible Discord text" in retry["prompt"]
+    assert brain.store.counts()["episodes"] == 0
+
+
 def test_discord_bot_v2_loads_persona_prompt_path(tmp_path, monkeypatch):
     prompt_path = tmp_path / "neuro.persona.txt"
     prompt_path.write_text("Neuro persona from disk.", encoding="utf-8")
