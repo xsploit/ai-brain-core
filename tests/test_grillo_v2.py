@@ -26,14 +26,19 @@ from aibrain.discord_bot_v2 import (
     _format_grillo_v2_facts,
     _format_grillo_v2_memory_documents,
     _format_grillo_v2_opinions,
+    _format_grillo_v2_slots,
     _format_status,
     _format_worker_loop_status,
     _format_worker_result,
+    _grillo_control_group,
+    _grillo_v2_slot_documents,
+    _ladybug_control_group,
     _recent_message_item,
     _relationship_v2_embed,
     _relationship_v2_snapshot,
     _reply_text_chunks,
     _scope_for_message,
+    _send_tts_voice_message,
     build_brain_v2,
 )
 from grillo_v2 import (
@@ -1377,6 +1382,154 @@ async def test_discord_bot_v2_tts_reply_uses_v1_voice_clip_builder(monkeypatch):
         ("clip", response_brain, "ok", "neuro-sama"),
         ("send", 333, "discord-token", b"ogg"),
     ]
+
+
+class _AsyncTyping:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeTTSContext:
+    def __init__(self):
+        self.channel = SimpleNamespace(id=333)
+        self.replies = []
+
+    def typing(self):
+        return _AsyncTyping()
+
+    async def reply(self, content=None, **kwargs):
+        self.replies.append((content, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_say_uses_v1_tts_builder_without_success_reply(monkeypatch):
+    events = []
+    response_brain = SimpleNamespace()
+
+    async def fake_clip(brain, text, *, voice=None):
+        events.append(("clip", brain, text, voice))
+        return SimpleNamespace(ogg=b"ogg")
+
+    async def fake_send(channel_id, token, clip):
+        events.append(("send", channel_id, token, clip.ogg))
+
+    monkeypatch.setattr(discord_bot_v2_module, "build_discord_voice_clip", fake_clip)
+    monkeypatch.setattr(discord_bot_v2_module, "send_discord_voice_message", fake_send)
+
+    bot = SimpleNamespace(
+        discord_token="discord-token",
+        tts_voice="neuro-sama",
+        brain_v2=SimpleNamespace(response_brain=response_brain),
+    )
+    ctx = _FakeTTSContext()
+
+    await _send_tts_voice_message(bot, ctx, "**hello**")
+
+    assert ctx.replies == []
+    assert events == [
+        ("clip", response_brain, "hello", "neuro-sama"),
+        ("send", 333, "discord-token", b"ogg"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_say_falls_back_to_brain_v2_for_tts(monkeypatch):
+    events = []
+    brain_v2 = SimpleNamespace()
+
+    async def fake_clip(brain, text, *, voice=None):
+        events.append(("clip", brain, text, voice))
+        return SimpleNamespace(ogg=b"ogg")
+
+    async def fake_send(channel_id, token, clip):
+        events.append(("send", channel_id, token, clip.ogg))
+
+    monkeypatch.setattr(discord_bot_v2_module, "build_discord_voice_clip", fake_clip)
+    monkeypatch.setattr(discord_bot_v2_module, "send_discord_voice_message", fake_send)
+
+    bot = SimpleNamespace(discord_token="discord-token", tts_voice=None, brain_v2=brain_v2)
+    ctx = _FakeTTSContext()
+
+    await _send_tts_voice_message(bot, ctx, "hello")
+
+    assert ctx.replies == []
+    assert events == [
+        ("clip", brain_v2, "hello", None),
+        ("send", 333, "discord-token", b"ogg"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_say_reports_tts_errors(monkeypatch):
+    async def fake_clip(brain, text, *, voice=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(discord_bot_v2_module, "build_discord_voice_clip", fake_clip)
+
+    bot = SimpleNamespace(
+        discord_token="discord-token",
+        tts_voice="neuro-sama",
+        brain_v2=SimpleNamespace(response_brain=SimpleNamespace()),
+    )
+    ctx = _FakeTTSContext()
+
+    await _send_tts_voice_message(bot, ctx, "hello")
+
+    assert ctx.replies == [("TTS voice clip failed: boom", {"mention_author": False})]
+
+
+def test_discord_bot_v2_exposes_v1_memory_command_surface():
+    bot = SimpleNamespace()
+
+    grillo = _grillo_control_group(bot)
+    ladybug = _ladybug_control_group(bot)
+    relationship_group = ladybug.get_command("relationships")
+
+    assert grillo.get_command("tick") is not None
+    assert grillo.get_command("context") is not None
+    assert grillo.get_command("debug") is not None
+    assert grillo.get_command("ctx") is not None
+    assert grillo.get_command("slots") is not None
+    assert relationship_group is not None
+    assert relationship_group.get_command("export") is not None
+
+
+def test_discord_bot_v2_grillo_slots_are_v1_compatible_memory_docs(tmp_path):
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", persona_id="neuro-sama-v2"),
+        json_client=SimpleNamespace(),
+    )
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    brain.store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            subject_id=actor,
+            document_type="relationship_profile",
+            title="Subby relationship profile",
+            body="I trust Subby to notice context bugs.",
+        )
+    )
+    brain.store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            subject_id=actor,
+            document_type="diary",
+            title="Diary",
+            body="This should not be treated as a slot.",
+        )
+    )
+
+    documents = _grillo_v2_slot_documents(SimpleNamespace(brain_v2=brain), scope, actor, limit=12)
+    formatted = _format_grillo_v2_slots(documents)
+
+    assert [document.document_type for document in documents] == ["relationship_profile"]
+    assert "Subby relationship profile" in formatted
+    assert "context bugs" in formatted
+    assert "Diary" not in formatted
 
 
 def test_discord_bot_v2_runtime_model_set_updates_all_backends():
