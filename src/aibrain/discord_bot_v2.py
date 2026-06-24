@@ -326,11 +326,12 @@ class DiscordBrainV2Bot(commands.Bot):
         logger.error("GRILLO v2 worker error", exc_info=(type(error), error, error.__traceback__))
 
     async def on_message(self, message: discord.Message) -> None:
-        if self.user is not None and message.author.id == self.user.id:
+        if self._is_ignored_bot_message(message):
             return
         ctx = await self.get_context(message)
         if ctx.command is not None:
-            await self.invoke(ctx)
+            if self._allowed(message):
+                await self.invoke(ctx)
             return
         if not self._allowed(message):
             return
@@ -382,6 +383,11 @@ class DiscordBrainV2Bot(commands.Bot):
         if self.allowed_users and message.author.id not in self.allowed_users:
             return False
         return True
+
+    def _is_ignored_bot_message(self, message: discord.Message) -> bool:
+        if self.user is not None and message.author.id == self.user.id:
+            return True
+        return bool(getattr(message.author, "bot", False) and self.ignore_bots)
 
     def _should_respond(self, message: discord.Message) -> bool:
         if getattr(self, "paused", False):

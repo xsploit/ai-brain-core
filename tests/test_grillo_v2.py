@@ -1385,6 +1385,62 @@ def test_discord_bot_v2_bots_need_toggle_and_directed_message():
     assert bot._should_respond(message) is False
 
 
+@pytest.mark.asyncio
+async def test_discord_bot_v2_ignored_bot_commands_do_not_invoke():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.ignore_bots = True
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    events = []
+
+    async def fake_get_context(message):
+        events.append("get_context")
+        return SimpleNamespace(command=object())
+
+    async def fake_invoke(ctx):
+        events.append("invoke")
+
+    bot.get_context = fake_get_context
+    bot.invoke = fake_invoke
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=123, bot=True),
+        guild=SimpleNamespace(id=222),
+        content="!status",
+    )
+
+    await bot.on_message(message)
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_commands_are_gated_by_allowed_scope():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.ignore_bots = False
+    bot.allowed_guilds = {999}
+    bot.allowed_users = set()
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    events = []
+
+    async def fake_get_context(message):
+        events.append("get_context")
+        return SimpleNamespace(command=object())
+
+    async def fake_invoke(ctx):
+        events.append("invoke")
+
+    bot.get_context = fake_get_context
+    bot.invoke = fake_invoke
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=123, bot=False),
+        guild=SimpleNamespace(id=222),
+        content="!status",
+    )
+
+    await bot.on_message(message)
+
+    assert events == ["get_context"]
+
+
 def test_discord_bot_v2_direct_prefix_routes_side_feature_commands():
     command_prefix = discord_bot_v2_module._build_command_prefix("!n2")
 
