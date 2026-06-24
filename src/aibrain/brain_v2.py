@@ -37,6 +37,7 @@ class BrainV2Config:
     package_memory_embedding_dimensions: int = 256
     package_memory_sync_limit: int = 500
     package_memory_recall_top_k: int = 5
+    package_memory_sync_after_response: bool = False
 
 
 class BrainV2:
@@ -223,7 +224,8 @@ class BrainV2:
                     metadata=assistant_metadata,
                 )
             )
-        self._schedule_package_sync(scope_key)
+        if self.config.package_memory_sync_after_response:
+            self._schedule_package_sync(scope_key)
         return response_text.strip()
 
     def build_context_packet(

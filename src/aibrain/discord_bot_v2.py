@@ -1005,6 +1005,7 @@ def build_brain_v2() -> BrainV2:
             package_memory_embedding_dimensions=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_EMBEDDING_DIMENSIONS", 256),
             package_memory_sync_limit=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_LIMIT", 500),
             package_memory_recall_top_k=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_RECALL_TOP_K", 5),
+            package_memory_sync_after_response=_env_bool("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_AFTER_RESPONSE", False),
         ),
         response_brain=response_brain,
         response_persona=response_persona,

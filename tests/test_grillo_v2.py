@@ -695,6 +695,7 @@ async def test_brain_v2_respond_does_not_block_on_package_sync(tmp_path):
             database_path=tmp_path / "brain-v2.sqlite3",
             model="deepseek/test",
             package_memory_enabled=True,
+            package_memory_sync_after_response=True,
         ),
         json_client=json_client,
         package_index=package_index,
