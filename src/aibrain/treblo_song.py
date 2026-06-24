@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Any
 from uuid import uuid4
@@ -33,13 +34,16 @@ class TrebloSongConfig:
     max_poll_attempts: int = 180
     request_timeout_seconds: float = 60.0
     prompt_max_chars: int = 800
+    max_download_bytes: int = 64 * 1024 * 1024
+    download_dir: Path = Path("local/treblo_songs")
+    save_downloads: bool = True
     style_scale: float = 3.5
     prompt_strength: float = 1.0
     output_format: str = "ogg"
     enable_streaming: bool = True
     align_lyrics: bool = True
-    length_min_seconds: int = 30
-    length_max_seconds: int = 120
+    length_min_seconds: int | None = None
+    length_max_seconds: int | None = None
     max_attachment_bytes: int = 8 * 1024 * 1024
 
     @classmethod
@@ -54,13 +58,16 @@ class TrebloSongConfig:
             max_poll_attempts=_env_int("DISCORD_BRAIN_V2_TREBLO_MAX_POLL_ATTEMPTS", 180),
             request_timeout_seconds=_env_float("DISCORD_BRAIN_V2_TREBLO_TIMEOUT_SECONDS", 60.0),
             prompt_max_chars=_env_int("DISCORD_BRAIN_V2_TREBLO_PROMPT_MAX_CHARS", 800),
+            max_download_bytes=_env_int("DISCORD_BRAIN_V2_TREBLO_MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024),
+            download_dir=Path(os.getenv("DISCORD_BRAIN_V2_TREBLO_DOWNLOAD_DIR", "local/treblo_songs")),
+            save_downloads=_env_bool("DISCORD_BRAIN_V2_TREBLO_SAVE_DOWNLOADS", True),
             style_scale=_env_float("DISCORD_BRAIN_V2_TREBLO_STYLE_SCALE", 3.5),
             prompt_strength=_env_float("DISCORD_BRAIN_V2_TREBLO_PROMPT_STRENGTH", 1.0),
             output_format=os.getenv("DISCORD_BRAIN_V2_TREBLO_OUTPUT_FORMAT", "ogg").strip() or "ogg",
             enable_streaming=_env_bool("DISCORD_BRAIN_V2_TREBLO_ENABLE_STREAMING", True),
             align_lyrics=_env_bool("DISCORD_BRAIN_V2_TREBLO_ALIGN_LYRICS", True),
-            length_min_seconds=_env_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MIN_SECONDS", 30),
-            length_max_seconds=_env_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MAX_SECONDS", 120),
+            length_min_seconds=_env_optional_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MIN_SECONDS"),
+            length_max_seconds=_env_optional_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MAX_SECONDS"),
             max_attachment_bytes=_env_int("DISCORD_BRAIN_V2_TREBLO_MAX_ATTACHMENT_BYTES", 8 * 1024 * 1024),
         )
 
@@ -74,6 +81,8 @@ class TrebloSongJob:
     mode: str = "prompt_only"
     author_name: str = ""
     lyrics: str | None = None
+    duration_preset: str = "default"
+    length_range: tuple[int, int] | None = None
     task_id: str | None = None
     status: str = "queued"
     generation_status: str | None = None
@@ -89,8 +98,14 @@ class TrebloSongClient:
     def __init__(self, config: TrebloSongConfig):
         self.config = config
 
-    async def generate(self, prompt: str, *, mode: str = "prompt_only") -> tuple[dict[str, Any], str | None]:
-        payload = await self.payload(prompt, mode=mode)
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        mode: str = "prompt_only",
+        length_range: tuple[int, int] | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        payload = await self.payload(prompt, mode=mode, length_range=length_range)
         response = await self._request(
             "POST",
             "/generations/v3",
@@ -105,31 +120,35 @@ class TrebloSongClient:
         return await self._request("GET", f"/generations/{task_id}")
 
     async def download_audio(self, url: str) -> tuple[bytes | None, str | None]:
-        if self.config.max_attachment_bytes <= 0:
+        if self.config.max_download_bytes <= 0:
             return None, None
         async with httpx.AsyncClient(timeout=self.config.request_timeout_seconds, follow_redirects=True) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 content_type = response.headers.get("content-type")
                 length = response.headers.get("content-length")
-                if length and int(length) > self.config.max_attachment_bytes:
+                if length and int(length) > self.config.max_download_bytes:
                     return None, content_type
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
-                    if total > self.config.max_attachment_bytes:
+                    if total > self.config.max_download_bytes:
                         return None, content_type
                     chunks.append(chunk)
         return b"".join(chunks), content_type
 
-    async def payload(self, prompt: str, *, mode: str = "prompt_only") -> dict[str, Any]:
+    async def payload(
+        self,
+        prompt: str,
+        *,
+        mode: str = "prompt_only",
+        length_range: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
         mode = normalize_mode(mode)
         prompt = prompt[: self.config.prompt_max_chars]
         if mode == "auto_lyrics":
             prompt = f"Original vocal song with Treblo-generated lyrics. {prompt}".strip()
-        if mode == "instrumental":
-            prompt = f"Instrumental track with no vocals and no lyrics. {prompt}".strip()
         payload: dict[str, Any] = {
             "prompt": prompt,
             "style_scale": self.config.style_scale,
@@ -137,9 +156,18 @@ class TrebloSongClient:
             "output_format": self.config.output_format,
             "enable_streaming": self.config.enable_streaming,
             "align_lyrics": False if mode == "instrumental" else self.config.align_lyrics,
-            "length_range": [self.config.length_min_seconds, self.config.length_max_seconds],
         }
+        resolved_length_range = length_range or self._default_length_range()
+        if resolved_length_range is not None:
+            payload["length_range"] = list(resolved_length_range)
+        if mode == "instrumental":
+            payload["instrumental"] = True
         return payload
+
+    def _default_length_range(self) -> tuple[int, int] | None:
+        if self.config.length_min_seconds is None or self.config.length_max_seconds is None:
+            return None
+        return _normalize_length_range(self.config.length_min_seconds, self.config.length_max_seconds)
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         if not self.config.api_key:
@@ -179,9 +207,11 @@ class TrebloSongQueue:
         prompt: str,
         author_name: str = "",
         mode: str = "prompt_only",
+        duration_preset: str = "default",
     ) -> TrebloSongJob:
         prompt = " ".join((prompt or "").split())
         mode = normalize_mode(mode)
+        duration_preset, length_range = normalize_duration_preset(duration_preset)
         if not prompt:
             raise TrebloSongError("usage: `/song prompt:<prompt>`")
         if not self.config.api_key:
@@ -204,6 +234,8 @@ class TrebloSongQueue:
                 prompt=prompt,
                 mode=mode,
                 author_name=author_name,
+                duration_preset=duration_preset,
+                length_range=length_range,
             )
             self.jobs[job.job_id] = job
             self.pending.append(job)
@@ -266,7 +298,7 @@ class TrebloSongQueue:
         job.status = "submitting"
         job.updated_at = _utc_now()
         await _send_channel_message(bot, job.channel_id, f"song `{job.job_id}` submitting to Treblo (`{job.mode}`).")
-        generation, lyrics = await self.client.generate(job.prompt, mode=job.mode)
+        generation, lyrics = await self.client.generate(job.prompt, mode=job.mode, length_range=job.length_range)
         job.lyrics = lyrics
         task_id = extract_task_id(generation)
         if not task_id:
@@ -290,7 +322,7 @@ class TrebloSongQueue:
             job.updated_at = _utc_now()
             if status == "GENERATING_STREAMING_READY" and not stream_announced:
                 stream_announced = True
-                await _send_channel_message(bot, job.channel_id, f"song `{job.job_id}` stream ready: {job.stream_url}")
+                await _send_channel_message(bot, job.channel_id, f"song `{job.job_id}` stream ready. waiting for final file.")
             if status == "SUCCESS":
                 await self._finish_success(bot, job)
                 return
@@ -312,16 +344,59 @@ class TrebloSongQueue:
             return
         audio, content_type = await self.client.download_audio(audio_url)
         if audio:
-            extension = "ogg" if "ogg" in (content_type or "").lower() else self.config.output_format
+            extension = _audio_extension(content_type, self.config.output_format)
+            filename = f"treblo-{job.job_id}.{extension}"
+            saved_path = self._save_download(job, audio, filename=filename, content_type=content_type)
+            message = f"song `{job.job_id}` complete."
+            if saved_path is not None:
+                message += f" archived `{saved_path.name}`."
+            if len(audio) > self.config.max_attachment_bytes:
+                await _send_channel_message(
+                    bot,
+                    job.channel_id,
+                    f"{message} audio is too large for Discord upload, but it was downloaded locally.",
+                )
+                return
             await _send_channel_file(
                 bot,
                 job.channel_id,
-                filename=f"treblo-{job.job_id}.{extension}",
+                filename=filename,
                 data=audio,
-                message=f"song `{job.job_id}` complete.",
+                message=message,
             )
             return
-        await _send_channel_message(bot, job.channel_id, f"song `{job.job_id}` complete: {audio_url}")
+        await _send_channel_message(bot, job.channel_id, f"song `{job.job_id}` finished, but the audio was too large to download.")
+
+    def _save_download(
+        self,
+        job: TrebloSongJob,
+        audio: bytes,
+        *,
+        filename: str,
+        content_type: str | None,
+    ) -> Path | None:
+        if not self.config.save_downloads:
+            return None
+        target_dir = self.config.download_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / filename
+        path.write_bytes(audio)
+        metadata = {
+            "job_id": job.job_id,
+            "task_id": job.task_id,
+            "mode": job.mode,
+            "duration_preset": job.duration_preset,
+            "length_range": list(job.length_range) if job.length_range else None,
+            "prompt": job.prompt,
+            "author_name": job.author_name,
+            "user_id": job.user_id,
+            "channel_id": job.channel_id,
+            "content_type": content_type,
+            "created_at": job.created_at,
+            "downloaded_at": _utc_now(),
+        }
+        path.with_suffix(path.suffix + ".json").write_text(json_dumps(metadata), encoding="utf-8")
+        return path
 
 
 class TrebloSongError(RuntimeError):
@@ -359,6 +434,72 @@ def normalize_mode(value: str) -> str:
     if normalized not in {"prompt_only", "auto_lyrics", "instrumental"}:
         raise TrebloSongError("mode must be prompt_only, auto_lyrics, or instrumental.")
     return normalized
+
+
+def normalize_duration_preset(value: str | None) -> tuple[str, tuple[int, int] | None]:
+    normalized = (value or "default").strip().lower().replace("-", "_")
+    aliases = {
+        "": "default",
+        "auto": "default",
+        "normal": "default",
+        "short": "60",
+        "one_minute": "60",
+        "1m": "60",
+        "two_minutes": "120",
+        "2m": "120",
+        "three_minutes": "180",
+        "3m": "180",
+        "four_minutes": "240",
+        "4m": "240",
+        "five_minutes": "300",
+        "5m": "300",
+    }
+    normalized = aliases.get(normalized, normalized)
+    presets = {
+        "default": None,
+        "60": (30, 60),
+        "120": (90, 120),
+        "180": (150, 180),
+        "240": (210, 240),
+        "300": (270, 300),
+    }
+    if normalized not in presets:
+        raise TrebloSongError("duration must be default, 1m, 2m, 3m, 4m, or 5m.")
+    return normalized, presets[normalized]
+
+
+def _normalize_length_range(min_seconds: int, max_seconds: int) -> tuple[int, int]:
+    min_value = max(0, min(270, _nearest_thirty(min_seconds)))
+    max_value = max(30, min(300, _nearest_thirty(max_seconds)))
+    if min_value > max_value:
+        min_value = max(0, max_value - 30)
+    return min_value, max_value
+
+
+def _nearest_thirty(value: int) -> int:
+    return int(round(int(value) / 30) * 30)
+
+
+def _audio_extension(content_type: str | None, fallback: str) -> str:
+    lowered = (content_type or "").lower()
+    if "mpeg" in lowered or "mp3" in lowered:
+        return "mp3"
+    if "wav" in lowered:
+        return "wav"
+    if "flac" in lowered:
+        return "flac"
+    if "mp4" in lowered or "m4a" in lowered or "aac" in lowered:
+        return "m4a"
+    if "ogg" in lowered or "opus" in lowered:
+        return "ogg"
+    cleaned = "".join(ch for ch in (fallback or "ogg").lower() if ch.isalnum())
+    return cleaned or "ogg"
+
+
+def json_dumps(value: Any) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True)
 
 
 def extract_task_id(value: Any) -> str | None:
@@ -455,6 +596,16 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _env_float(name: str, default: float) -> float:

@@ -1023,18 +1023,28 @@ def _song_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
     @app_commands.describe(
         prompt="Prompt-only song direction to send to Treblo.",
         mode="Generation mode: prompt only, auto lyrics, or instrumental.",
+        duration="Target song length hint.",
     )
     @app_commands.choices(
         mode=[
             app_commands.Choice(name="Prompt only", value="prompt_only"),
             app_commands.Choice(name="Auto lyrics", value="auto_lyrics"),
             app_commands.Choice(name="Instrumental", value="instrumental"),
-        ]
+        ],
+        duration=[
+            app_commands.Choice(name="Default", value="default"),
+            app_commands.Choice(name="1 minute", value="1m"),
+            app_commands.Choice(name="2 minutes", value="2m"),
+            app_commands.Choice(name="3 minutes", value="3m"),
+            app_commands.Choice(name="4 minutes", value="4m"),
+            app_commands.Choice(name="5 minutes", value="5m"),
+        ],
     )
     async def song(
         interaction: discord.Interaction,
         prompt: str,
         mode: app_commands.Choice[str] | None = None,
+        duration: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.channel_id is None:
             await interaction.response.send_message("song generation needs a channel context.", ephemeral=True)
@@ -1046,6 +1056,7 @@ def _song_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
                 prompt=prompt,
                 author_name=_display_name(interaction.user),
                 mode=mode.value if mode is not None else "prompt_only",
+                duration_preset=duration.value if duration is not None else "default",
             )
         except TrebloSongRateLimited as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
@@ -1056,7 +1067,7 @@ def _song_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
         position = bot.treblo_song_queue.queue_position(job.job_id)
         position_text = f"position `{position}`" if position is not None else "starting now"
         await interaction.response.send_message(
-            f"queued song `{job.job_id}` ({job.mode}); {position_text}.",
+            f"queued song `{job.job_id}` ({job.mode}, {job.duration_preset}); {position_text}.",
             ephemeral=False,
         )
 
@@ -1092,7 +1103,7 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!jb <message>` - separate one-shot JB path with no memory/tools",
                     "`!say <text>` - send a Piper Discord voice clip",
                     "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
-                    "`/song prompt:<text> mode:<mode>` - queue prompt-only, auto-lyrics, or instrumental Treblo song generation",
+                    "`/song prompt:<text> mode:<mode> duration:<length>` - queue prompt-only, auto-lyrics, or instrumental Treblo song generation",
                     "`/song_queue` - show the Treblo song queue",
                     "`!pause` / `!resume` - admin/owner normal reply control",
                     "`!bot toggle` - admin/owner bot-to-bot reply control",
@@ -2144,6 +2155,7 @@ def _song_job_label(job: Any) -> str:
         f"{getattr(job, 'job_id', 'unknown')} "
         f"{getattr(job, 'status', 'queued')} "
         f"{getattr(job, 'mode', 'prompt_only')} "
+        f"{getattr(job, 'duration_preset', 'default')} "
         f"{_compact(getattr(job, 'prompt', ''), 90)}"
     )
 
