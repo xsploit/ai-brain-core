@@ -1105,6 +1105,7 @@ class DiscordBrainV2Bot(commands.Bot):
 
 def build_brain_v2() -> BrainV2:
     use_v1_response_path = _env_bool("DISCORD_BRAIN_V2_USE_V1_RESPONSE_PATH", True)
+    package_memory_enabled = _env_bool("DISCORD_BRAIN_V2_PACKAGE_MEMORY_ENABLED", False)
     response_brain = build_brain() if use_v1_response_path else None
     response_persona = build_persona() if use_v1_response_path else None
     return BrainV2(
@@ -1118,7 +1119,7 @@ def build_brain_v2() -> BrainV2:
                 value_name="DISCORD_BRAIN_V2_PERSONA_PROMPT",
                 path_name="DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH",
             ),
-            package_memory_enabled=_env_bool("DISCORD_BRAIN_V2_PACKAGE_MEMORY_ENABLED", False),
+            package_memory_enabled=package_memory_enabled,
             package_memory_path=Path(os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_PATH", "")) if os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_PATH") else None,
             package_memory_graph_backend=os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_GRAPH_BACKEND", "auto"),
             package_memory_vector_backend=os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_VECTOR_BACKEND", "auto"),
@@ -1129,7 +1130,10 @@ def build_brain_v2() -> BrainV2:
             package_memory_embedding_dimensions=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_EMBEDDING_DIMENSIONS", 256),
             package_memory_sync_limit=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_LIMIT", 500),
             package_memory_recall_top_k=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_RECALL_TOP_K", 5),
-            package_memory_sync_after_response=_env_bool("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_AFTER_RESPONSE", False),
+            package_memory_sync_after_response=_env_bool(
+                "DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_AFTER_RESPONSE",
+                package_memory_enabled,
+            ),
         ),
         response_brain=response_brain,
         response_persona=response_persona,

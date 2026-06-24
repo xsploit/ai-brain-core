@@ -1530,12 +1530,41 @@ def test_discord_bot_v2_loads_persona_prompt_path(tmp_path, monkeypatch):
     prompt_path = tmp_path / "neuro.persona.txt"
     prompt_path.write_text("Neuro persona from disk.", encoding="utf-8")
     monkeypatch.setenv("DISCORD_BRAIN_V2_DATABASE_PATH", str(tmp_path / "brain.sqlite3"))
+    monkeypatch.setenv("DISCORD_BRAIN_V2_USE_V1_RESPONSE_PATH", "false")
     monkeypatch.setenv("DISCORD_BRAIN_V2_PERSONA_PROMPT_PATH", str(prompt_path))
     monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-key")
 
     brain = build_brain_v2()
 
     assert brain.config.persona_prompt == "Neuro persona from disk."
+
+
+def test_discord_bot_v2_package_memory_defaults_sync_on_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_V2_DATABASE_PATH", str(tmp_path / "brain.sqlite3"))
+    monkeypatch.setenv("DISCORD_BRAIN_V2_USE_V1_RESPONSE_PATH", "false")
+    monkeypatch.setenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_ENABLED", "true")
+    monkeypatch.delenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_AFTER_RESPONSE", raising=False)
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-key")
+
+    brain = build_brain_v2()
+
+    assert brain.config.package_memory_enabled is True
+    assert brain.config.package_memory_sync_after_response is True
+    assert brain.package_index is not None
+
+
+def test_discord_bot_v2_package_memory_sync_can_be_explicitly_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_V2_DATABASE_PATH", str(tmp_path / "brain.sqlite3"))
+    monkeypatch.setenv("DISCORD_BRAIN_V2_USE_V1_RESPONSE_PATH", "false")
+    monkeypatch.setenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_AFTER_RESPONSE", "false")
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-key")
+
+    brain = build_brain_v2()
+
+    assert brain.config.package_memory_enabled is True
+    assert brain.config.package_memory_sync_after_response is False
+    assert brain.package_index is not None
 
 
 def test_discord_bot_v2_helpers_make_server_scope_and_metadata():
