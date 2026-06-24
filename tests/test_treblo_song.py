@@ -81,4 +81,10 @@ async def test_treblo_queue_rate_limits_non_owner():
         await queue.submit(user_id=123, channel_id=1, prompt="second")
 
     owner_job = await queue.submit(user_id=999, channel_id=1, prompt="owner bypass")
+    owner_job_2 = await queue.submit(user_id=999, channel_id=1, prompt="owner bypass again")
+    snapshot = queue.snapshot()
+
     assert owner_job.prompt == "owner bypass"
+    assert owner_job_2.prompt == "owner bypass again"
+    assert 999 in snapshot["owner_user_ids"]
+    assert 999 not in queue.last_submit_at

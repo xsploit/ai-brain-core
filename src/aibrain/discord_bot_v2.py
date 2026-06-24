@@ -148,8 +148,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.allowed_users = _csv_ints("DISCORD_BRAIN_V2_ALLOWED_USER_IDS")
         self.owner_users = (
             _csv_ints("DISCORD_BRAIN_V2_OWNER_USER_IDS")
-            or _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
-            or set(DEFAULT_OWNER_USER_IDS)
+            | _csv_ints("DISCORD_BRAIN_OWNER_USER_IDS")
+            | set(DEFAULT_OWNER_USER_IDS)
         )
         self.respond_to_dms = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_DMS", True)
         self.respond_to_mentions = _env_bool("DISCORD_BRAIN_V2_RESPOND_TO_MENTIONS", True)
@@ -1065,7 +1065,10 @@ def _song_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
 def _song_queue_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
     @app_commands.command(name="song_queue", description="Show the Treblo song generation queue.")
     async def song_queue(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(_format_song_queue(bot.treblo_song_queue.snapshot()), ephemeral=True)
+        await interaction.response.send_message(
+            _format_song_queue(bot.treblo_song_queue.snapshot(), requester_id=interaction.user.id),
+            ephemeral=True,
+        )
 
     return song_queue
 
@@ -2112,15 +2115,17 @@ def _format_status(status: dict[str, Any]) -> str:
     )
 
 
-def _format_song_queue(snapshot: dict[str, Any]) -> str:
+def _format_song_queue(snapshot: dict[str, Any], *, requester_id: int | None = None) -> str:
     active = snapshot.get("active")
     pending = snapshot.get("pending") or []
     recent = snapshot.get("recent") or []
+    owner_ids = set(snapshot.get("owner_user_ids") or [])
+    cooldown = "owner exempt" if requester_id in owner_ids else f"{int(float(snapshot.get('cooldown_seconds') or 0))}s"
     lines = [
         "Treblo song queue",
         f"active: `{_song_job_label(active) if active is not None else 'none'}`",
         f"pending: `{len(pending)}/{snapshot.get('max_queue_size')}`",
-        f"cooldown: `{int(float(snapshot.get('cooldown_seconds') or 0))}s`",
+        f"cooldown: `{cooldown}`",
     ]
     if pending:
         lines.append("next:")

@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import os
 import time
 from typing import Any
@@ -16,6 +17,7 @@ from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONCli
 
 TREBLO_BASE_URL = "https://api.treblo.com/v1"
 TREBLO_STREAM_BASE_URL = "https://api-stream.treblo.com"
+logger = logging.getLogger("aibrain.treblo_song")
 
 
 def _utc_now() -> str:
@@ -247,7 +249,8 @@ class TrebloSongQueue:
             )
             self.jobs[job.job_id] = job
             self.pending.append(job)
-            self.last_submit_at[user_id] = now
+            if user_id not in self.owner_user_ids:
+                self.last_submit_at[user_id] = now
             self._event.set()
             return job
 
@@ -266,6 +269,7 @@ class TrebloSongQueue:
             "recent": recent,
             "max_queue_size": self.config.max_queue_size,
             "cooldown_seconds": self.config.user_cooldown_seconds,
+            "owner_user_ids": sorted(self.owner_user_ids),
         }
 
     async def run(self, bot: Any) -> None:
@@ -279,6 +283,7 @@ class TrebloSongQueue:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                logger.exception("Treblo song job %s failed", job.job_id)
                 job.status = "failed"
                 job.error = str(exc)
                 job.updated_at = _utc_now()

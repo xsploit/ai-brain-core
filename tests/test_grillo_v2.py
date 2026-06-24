@@ -1565,6 +1565,20 @@ def test_discord_bot_v2_exposes_v1_memory_command_surface():
     assert relationship_group.get_command("export") is not None
 
 
+def test_discord_bot_v2_owner_ids_include_v1_default_with_env_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_V2_OWNER_USER_IDS", "111")
+    monkeypatch.setenv("DISCORD_BRAIN_OWNER_USER_IDS", "222")
+    bot = DiscordBrainV2Bot(
+        brain=BrainV2(
+            BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3"),
+            json_client=SimpleNamespace(),
+        )
+    )
+
+    assert bot.owner_users == {111, 222, 120418341775998976}
+    assert bot.treblo_song_queue.owner_user_ids == bot.owner_users
+
+
 def test_discord_bot_v2_grillo_slots_are_v1_compatible_memory_docs(tmp_path):
     brain = BrainV2(
         BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", persona_id="neuro-sama-v2"),
