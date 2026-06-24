@@ -12,8 +12,6 @@ from uuid import uuid4
 
 import httpx
 
-from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONClient
-
 
 TREBLO_BASE_URL = "https://api.treblo.com/v1"
 TREBLO_STREAM_BASE_URL = "https://api-stream.treblo.com"
@@ -43,8 +41,6 @@ class TrebloSongConfig:
     length_min_seconds: int = 30
     length_max_seconds: int = 120
     max_attachment_bytes: int = 8 * 1024 * 1024
-    ai_gateway_api_key: str | None = None
-    ai_gateway_model: str = "deepseek/deepseek-v4-pro"
 
     @classmethod
     def from_env(cls) -> "TrebloSongConfig":
@@ -66,8 +62,6 @@ class TrebloSongConfig:
             length_min_seconds=_env_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MIN_SECONDS", 30),
             length_max_seconds=_env_int("DISCORD_BRAIN_V2_TREBLO_LENGTH_MAX_SECONDS", 120),
             max_attachment_bytes=_env_int("DISCORD_BRAIN_V2_TREBLO_MAX_ATTACHMENT_BYTES", 8 * 1024 * 1024),
-            ai_gateway_api_key=os.getenv("AI_GATEWAY_API_KEY") or os.getenv("VERCEL_OIDC_TOKEN"),
-            ai_gateway_model=os.getenv("AI_GATEWAY_MODEL", "deepseek/deepseek-v4-pro"),
         )
 
 
@@ -94,11 +88,6 @@ class TrebloSongJob:
 class TrebloSongClient:
     def __init__(self, config: TrebloSongConfig):
         self.config = config
-        self.lyric_client = VercelAIGatewayJSONClient(
-            model=config.ai_gateway_model,
-            api_key=config.ai_gateway_api_key,
-            base_url=VERCEL_AI_GATEWAY_BASE_URL,
-        ) if config.ai_gateway_api_key else None
 
     async def generate(self, prompt: str, *, mode: str = "prompt_only") -> tuple[dict[str, Any], str | None]:
         payload = await self.payload(prompt, mode=mode)
@@ -137,7 +126,8 @@ class TrebloSongClient:
     async def payload(self, prompt: str, *, mode: str = "prompt_only") -> dict[str, Any]:
         mode = normalize_mode(mode)
         prompt = prompt[: self.config.prompt_max_chars]
-        lyrics = await self.generate_lyrics(prompt) if mode == "auto_lyrics" else None
+        if mode == "auto_lyrics":
+            prompt = f"Original vocal song with Treblo-generated lyrics. {prompt}".strip()
         if mode == "instrumental":
             prompt = f"Instrumental track with no vocals and no lyrics. {prompt}".strip()
         payload: dict[str, Any] = {
@@ -149,37 +139,7 @@ class TrebloSongClient:
             "align_lyrics": False if mode == "instrumental" else self.config.align_lyrics,
             "length_range": [self.config.length_min_seconds, self.config.length_max_seconds],
         }
-        if lyrics:
-            payload["lyrics"] = lyrics
         return payload
-
-    async def generate_lyrics(self, prompt: str) -> str:
-        if self.lyric_client is None:
-            raise TrebloSongError("AI_GATEWAY_API_KEY is required for auto_lyrics mode.")
-        response = await self.lyric_client.complete_json(
-            instructions=(
-                "Write compact, singable original song lyrics for Treblo. "
-                "Return only JSON. Keep lines short and chorus-forward. Do not include tags."
-            ),
-            payload={"brief": prompt, "requirements": ["original lyrics", "compact lines", "strong chorus"]},
-            schema={
-                "name": "treblo_auto_lyrics",
-                "strict": False,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "lyrics": {"type": "string"},
-                    },
-                    "required": ["lyrics"],
-                    "additionalProperties": True,
-                },
-            },
-        )
-        lyrics = str(response.get("lyrics") or "").strip()
-        if not lyrics:
-            raise TrebloSongError("AI Gateway did not return usable lyrics.")
-        return lyrics
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         if not self.config.api_key:
@@ -226,8 +186,6 @@ class TrebloSongQueue:
             raise TrebloSongError("usage: `/song prompt:<prompt>`")
         if not self.config.api_key:
             raise TrebloSongError("TREBLO_API_KEY is not configured.")
-        if mode == "auto_lyrics" and not self.config.ai_gateway_api_key:
-            raise TrebloSongError("AI_GATEWAY_API_KEY is required for auto_lyrics mode.")
         if len(prompt) > self.config.prompt_max_chars:
             prompt = prompt[: self.config.prompt_max_chars].rstrip()
         async with self._lock:

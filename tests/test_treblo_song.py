@@ -17,7 +17,7 @@ from aibrain.treblo_song import (
 
 @pytest.mark.asyncio
 async def test_treblo_prompt_only_payload_is_prompt_without_tags_or_lyrics():
-    client = TrebloSongClient(TrebloSongConfig(api_key="test", ai_gateway_api_key=None))
+    client = TrebloSongClient(TrebloSongConfig(api_key="test"))
 
     payload = await client.payload("raw melodic hardcore with a huge chorus", mode="prompt_only")
 
@@ -32,7 +32,7 @@ async def test_treblo_prompt_only_payload_is_prompt_without_tags_or_lyrics():
 
 @pytest.mark.asyncio
 async def test_treblo_instrumental_payload_uses_prompt_modifier_not_fake_api_field():
-    client = TrebloSongClient(TrebloSongConfig(api_key="test", ai_gateway_api_key=None))
+    client = TrebloSongClient(TrebloSongConfig(api_key="test"))
 
     payload = await client.payload("glassy synthwave at midnight", mode="instrumental")
 
@@ -44,19 +44,15 @@ async def test_treblo_instrumental_payload_uses_prompt_modifier_not_fake_api_fie
 
 
 @pytest.mark.asyncio
-async def test_treblo_auto_lyrics_payload_uses_gateway_lyrics(monkeypatch):
-    client = TrebloSongClient(TrebloSongConfig(api_key="test", ai_gateway_api_key="gateway"))
-
-    async def fake_generate_lyrics(prompt: str) -> str:
-        return "[Chorus]\nI can hear the static bloom"
-
-    monkeypatch.setattr(client, "generate_lyrics", fake_generate_lyrics)
+async def test_treblo_auto_lyrics_payload_uses_treblo_native_prompt_without_gateway():
+    client = TrebloSongClient(TrebloSongConfig(api_key="test"))
 
     payload = await client.payload("noisy pop chorus", mode="auto_lyrics")
 
-    assert payload["prompt"] == "noisy pop chorus"
-    assert payload["lyrics"] == "[Chorus]\nI can hear the static bloom"
+    assert payload["prompt"] == "Original vocal song with Treblo-generated lyrics. noisy pop chorus"
+    assert payload["align_lyrics"] is True
     assert "tags" not in payload
+    assert "lyrics" not in payload
 
 
 def test_treblo_extractors_match_ui_response_shapes():
