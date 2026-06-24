@@ -35,6 +35,7 @@ _SAFE_OBSERVATION_PATTERNS = [
 _POLICY_DOCUMENT_TYPES = {
     "instruction",
     "instructions",
+    "manual_memory",
     "policy",
     "procedural_note",
     "rule",

@@ -20,6 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
+from grillo_v2.safety import is_unsafe_memory_payload
 
 from .brain_v2 import (
     BrainV2,
@@ -657,10 +658,13 @@ class DiscordBrainV2Bot(commands.Bot):
         return bool(not self.ignore_bots and self.respond_to_bots)
 
     async def _remember_text(self, scope: str, author_id: int, content: str, *, source: str):
+        subject_id = f"discord_user:{author_id}"
+        if is_unsafe_memory_payload(text=content, document_type="manual_memory", subject_id=subject_id):
+            raise ValueError("manual memory rejected: behavior instructions are not durable memory")
         document = GrilloMemoryDocument.create(
             scope_key=scope,
             document_type="manual_memory",
-            subject_id=f"discord_user:{author_id}",
+            subject_id=subject_id,
             title=f"Manual memory from {source}",
             body=content,
             importance=0.85,
@@ -1556,10 +1560,17 @@ def _remember_command(bot: DiscordBrainV2Bot):
         if not content:
             await ctx.reply("usage: `!remember <text>`", mention_author=False)
             return
+        subject_id = _actor_id(ctx.author)
+        if is_unsafe_memory_payload(text=content, document_type="manual_memory", subject_id=subject_id):
+            await ctx.reply(
+                "not remembered: that looks like a behavior/policy instruction, not durable memory",
+                mention_author=False,
+            )
+            return
         document = GrilloMemoryDocument.create(
             scope_key=_scope_for_message(ctx.message),
             document_type="manual_memory",
-            subject_id=_actor_id(ctx.author),
+            subject_id=subject_id,
             title=f"Manual memory from {_display_name(ctx.author)}",
             body=content,
             importance=0.9,
