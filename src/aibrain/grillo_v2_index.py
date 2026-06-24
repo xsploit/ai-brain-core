@@ -15,6 +15,7 @@ from grillo_v2 import (
     TemporalFact as GrilloTemporalFact,
 )
 from grillo_v2.models import dataclass_dict
+from grillo_v2.safety import is_unsafe_memory_payload
 
 from .embeddings import EmbeddingProvider, HashEmbeddingProvider
 from .memory_stack.contracts import GraphQuery, RecallHit, RecallItem, TemporalFact
@@ -491,9 +492,11 @@ class GrilloV2PackageIndex:
                 close()
 
     async def sync_scope(self, store: SQLiteGrilloV2Store, scope_key: str) -> None:
-        active_facts = store.list_active_facts(scope_key, limit=self.sync_limit)
-        all_facts = store.list_temporal_facts(scope_key, include_expired=True, limit=self.sync_limit)
-        documents = store.list_memory_documents(scope_key, limit=self.sync_limit)
+        active_facts = _filter_safe_facts(store.list_active_facts(scope_key, limit=self.sync_limit))
+        all_facts = _filter_safe_facts(
+            store.list_temporal_facts(scope_key, include_expired=True, limit=self.sync_limit)
+        )
+        documents = _filter_safe_documents(store.list_memory_documents(scope_key, limit=self.sync_limit))
         active_opinions = store.list_opinion_edges(scope_key, limit=self.sync_limit)
         all_opinions = store.list_opinion_edges(scope_key, include_expired=True, limit=self.sync_limit)
         if self.structured_graph is not None:
@@ -714,6 +717,30 @@ def _dedupe_graph_hits(hits: list[TemporalFact]) -> list[TemporalFact]:
         seen.add(hit.id)
         out.append(hit)
     return out
+
+
+def _filter_safe_facts(facts: list[GrilloTemporalFact]) -> list[GrilloTemporalFact]:
+    return [
+        fact
+        for fact in facts
+        if not is_unsafe_memory_payload(
+            text=" ".join([fact.predicate, fact.object_value, fact.claim]),
+            subject_id=fact.subject_id,
+            predicate=fact.predicate,
+        )
+    ]
+
+
+def _filter_safe_documents(documents: list[GrilloMemoryDocument]) -> list[GrilloMemoryDocument]:
+    return [
+        document
+        for document in documents
+        if not is_unsafe_memory_payload(
+            text=" ".join([document.title, document.body]),
+            document_type=document.document_type,
+            subject_id=document.subject_id or "",
+        )
+    ]
 
 
 def _json(value: Any) -> str:

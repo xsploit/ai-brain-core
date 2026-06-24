@@ -13,6 +13,7 @@ from grillo_v2 import GrilloContextPacket, GrilloEntity, GrilloEpisode, GrilloV2
 from grillo_v2.backfill import GrilloV2BackfillResult, backfill_discord_identity, backfill_grillo_v1
 from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONClient
 from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
+from grillo_v2.safety import is_unsafe_memory_payload
 
 from .config import Persona
 from .embeddings import default_embedding_provider
@@ -548,6 +549,8 @@ def _augment_packet_with_package_recall(packet: GrilloContextPacket, recall: Gri
         if isinstance(item, dict)
     }
     for fact in recall.graph_facts:
+        if _package_fact_is_unsafe(fact):
+            continue
         metadata = fact.metadata or {}
         kind = str(metadata.get("grillo_v2_kind") or "temporal_fact")
         if kind == "opinion_edge":
@@ -588,6 +591,8 @@ def _augment_packet_with_package_recall(packet: GrilloContextPacket, recall: Gri
         )
         existing_fact_ids.add(fact.id)
     for hit in recall.vector_hits:
+        if _package_hit_is_unsafe(hit):
+            continue
         source_id = str(hit.source_fact_id or hit.id)
         if source_id in existing_memory_source_ids:
             continue
@@ -610,6 +615,39 @@ def _augment_packet_with_package_recall(packet: GrilloContextPacket, recall: Gri
         )
         existing_memory_source_ids.add(source_id)
     packet.retrieval_notes.extend(recall.notes)
+
+
+def _package_fact_is_unsafe(fact: Any) -> bool:
+    metadata = getattr(fact, "metadata", None) or {}
+    kind = str(metadata.get("grillo_v2_kind") or "temporal_fact")
+    if kind == "opinion_edge":
+        return False
+    return is_unsafe_memory_payload(
+        text=" ".join(
+            [
+                str(getattr(fact, "predicate", "") or ""),
+                str(getattr(fact, "object", "") or ""),
+                str(metadata.get("claim") or getattr(fact, "content", "") or ""),
+            ]
+        ),
+        subject_id=str(getattr(fact, "subject", "") or ""),
+        predicate=str(getattr(fact, "predicate", "") or ""),
+    )
+
+
+def _package_hit_is_unsafe(hit: Any) -> bool:
+    metadata = getattr(hit, "metadata", None) or {}
+    return is_unsafe_memory_payload(
+        text=" ".join(
+            [
+                str(metadata.get("title") or ""),
+                str(getattr(hit, "text", "") or ""),
+            ]
+        ),
+        document_type=str(metadata.get("document_type") or metadata.get("grillo_v2_kind") or ""),
+        subject_id=str(metadata.get("subject_id") or metadata.get("target_id") or ""),
+        predicate=str(metadata.get("predicate") or ""),
+    )
 
 
 GRILLO_V2_REFLECTION_INSTRUCTIONS = "\n".join(
