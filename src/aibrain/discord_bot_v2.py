@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from grillo_v2 import GrilloMemoryDocument, GrilloV2Worker, GrilloV2WorkerConfig
 
@@ -64,6 +65,7 @@ from .env import load_env_file
 from .model_catalog import ModelChoice, list_model_choices
 from .policy import MemoryPolicy
 from .tavily_tools import TavilyConfigError, tavily_search
+from .treblo_song import TrebloSongError, TrebloSongQueue, TrebloSongRateLimited
 
 
 DEFAULT_DISCORD_V2_PREFIX = "!n2"
@@ -164,6 +166,9 @@ class DiscordBrainV2Bot(commands.Bot):
             _discord_shitlist_path(self.brain_v2.config.database_path),
             owner_user_ids=self.owner_users,
         )
+        self.treblo_song_queue = TrebloSongQueue(owner_user_ids=self.owner_users)
+        self.treblo_song_task: asyncio.Task | None = None
+        self.treblo_slash_synced = False
         self.codex_bridge = CodexBridgeQueue.from_env()
         self.rolling_context_messages = max(1, _env_int("DISCORD_BRAIN_V2_ROLLING_CONTEXT_MESSAGES", 15))
         self.recent_by_scope: dict[str, deque[dict[str, Any]]] = defaultdict(
@@ -251,6 +256,8 @@ class DiscordBrainV2Bot(commands.Bot):
         self.add_command(_reflect_command(self))
         self.add_command(_worker_command(self))
         self.add_command(_backfill_command(self))
+        self.tree.add_command(_song_slash_command(self))
+        self.tree.add_command(_song_queue_slash_command(self))
 
     async def setup_hook(self) -> None:
         if self.worker_enabled and self.worker_task is None:
@@ -258,11 +265,17 @@ class DiscordBrainV2Bot(commands.Bot):
                 self.worker.run_forever(),
                 name="discord-brain-v2-grillo-worker",
             )
+        if self.treblo_song_task is None:
+            self.treblo_song_task = asyncio.create_task(
+                self.treblo_song_queue.run(self),
+                name="discord-brain-v2-treblo-song-queue",
+            )
         self._ensure_heartbeat_task()
 
     async def on_ready(self) -> None:
         logger.info("Discord Brain v2 bot logged in as %s/%s", self.user.id if self.user else "unknown", self.user)
         self._ensure_heartbeat_task()
+        await self._sync_treblo_slash_commands()
 
     async def close(self) -> None:
         if self.heartbeat_task is not None:
@@ -275,7 +288,28 @@ class DiscordBrainV2Bot(commands.Bot):
             with suppress(asyncio.CancelledError):
                 await self.worker_task
             self.worker_task = None
+        await self.treblo_song_queue.close()
+        if self.treblo_song_task is not None:
+            self.treblo_song_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.treblo_song_task
+            self.treblo_song_task = None
         await super().close()
+
+    async def _sync_treblo_slash_commands(self) -> None:
+        if self.treblo_slash_synced or not _env_bool("DISCORD_BRAIN_V2_TREBLO_SYNC_SLASH", True):
+            return
+        self.treblo_slash_synced = True
+        guild_ids = set(self.allowed_guilds) or {guild.id for guild in self.guilds}
+        if not guild_ids:
+            synced = await self.tree.sync()
+            logger.info("Synced %s global app commands", len(synced))
+            return
+        for guild_id in sorted(guild_ids):
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info("Synced %s app commands to guild %s", len(synced), guild_id)
 
     async def _on_worker_tick(self, result) -> None:
         logger.info(
@@ -983,6 +1017,59 @@ def build_brain_v2() -> BrainV2:
     )
 
 
+def _song_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
+    @app_commands.command(name="song", description="Queue a Treblo song generation from a prompt.")
+    @app_commands.describe(
+        prompt="Prompt-only song direction to send to Treblo.",
+        mode="Generation mode: prompt only, auto lyrics, or instrumental.",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="Prompt only", value="prompt_only"),
+            app_commands.Choice(name="Auto lyrics", value="auto_lyrics"),
+            app_commands.Choice(name="Instrumental", value="instrumental"),
+        ]
+    )
+    async def song(
+        interaction: discord.Interaction,
+        prompt: str,
+        mode: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if interaction.channel_id is None:
+            await interaction.response.send_message("song generation needs a channel context.", ephemeral=True)
+            return
+        try:
+            job = await bot.treblo_song_queue.submit(
+                user_id=interaction.user.id,
+                channel_id=interaction.channel_id,
+                prompt=prompt,
+                author_name=_display_name(interaction.user),
+                mode=mode.value if mode is not None else "prompt_only",
+            )
+        except TrebloSongRateLimited as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        except TrebloSongError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        position = bot.treblo_song_queue.queue_position(job.job_id)
+        position_text = f"position `{position}`" if position is not None else "starting now"
+        await interaction.response.send_message(
+            f"queued song `{job.job_id}` ({job.mode}); {position_text}.",
+            ephemeral=False,
+        )
+
+    return song
+
+
+def _song_queue_slash_command(bot: DiscordBrainV2Bot) -> app_commands.Command:
+    @app_commands.command(name="song_queue", description="Show the Treblo song generation queue.")
+    async def song_queue(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(_format_song_queue(bot.treblo_song_queue.snapshot()), ephemeral=True)
+
+    return song_queue
+
+
 def _help_command(bot: DiscordBrainV2Bot):
     @commands.command(name="help")
     async def help_command(ctx: commands.Context) -> None:
@@ -1001,6 +1088,8 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!jb <message>` - separate one-shot JB path with no memory/tools",
                     "`!say <text>` - send a Piper Discord voice clip",
                     "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
+                    "`/song prompt:<text> mode:<mode>` - queue prompt-only, auto-lyrics, or instrumental Treblo song generation",
+                    "`/song_queue` - show the Treblo song queue",
                     "`!pause` / `!resume` - admin/owner normal reply control",
                     "`!bot toggle` - admin/owner bot-to-bot reply control",
                     "`!shitlist status/add/remove` - owner-only persistent shitlist controls",
@@ -2020,6 +2109,36 @@ def _format_status(status: dict[str, Any]) -> str:
         f"entities=`{counts.get('entities', 0)}` episodes=`{counts.get('episodes', 0)}` "
         f"facts=`{counts.get('active_facts', 0)}` opinions=`{counts.get('active_opinion_edges', 0)}` "
         f"memory_docs=`{counts.get('memory_docs', 0)}` response_backend=`{status.get('response_backend')}`"
+    )
+
+
+def _format_song_queue(snapshot: dict[str, Any]) -> str:
+    active = snapshot.get("active")
+    pending = snapshot.get("pending") or []
+    recent = snapshot.get("recent") or []
+    lines = [
+        "Treblo song queue",
+        f"active: `{_song_job_label(active) if active is not None else 'none'}`",
+        f"pending: `{len(pending)}/{snapshot.get('max_queue_size')}`",
+        f"cooldown: `{int(float(snapshot.get('cooldown_seconds') or 0))}s`",
+    ]
+    if pending:
+        lines.append("next:")
+        for job in pending[:5]:
+            lines.append(f"- {_song_job_label(job)}")
+    if recent:
+        lines.append("recent:")
+        for job in recent[:5]:
+            lines.append(f"- {_song_job_label(job)}")
+    return "\n".join(lines)[:1900]
+
+
+def _song_job_label(job: Any) -> str:
+    return (
+        f"{getattr(job, 'job_id', 'unknown')} "
+        f"{getattr(job, 'status', 'queued')} "
+        f"{getattr(job, 'mode', 'prompt_only')} "
+        f"{_compact(getattr(job, 'prompt', ''), 90)}"
     )
 
 
