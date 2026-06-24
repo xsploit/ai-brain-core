@@ -54,6 +54,7 @@ class GrilloContextBuilder:
             target_id=actor_id,
             limit=opinion_limit,
         ) if actor_id else []
+        opinions = _merge_opinions(opinions)[:opinion_limit]
         episodes = self.store.list_recent_episodes(
             scope_key,
             actor_id=actor_id,
@@ -67,7 +68,8 @@ class GrilloContextBuilder:
                 query=query,
                 limit=12,
             )
-        )[:6]
+        )
+        memory_documents = _merge_memory_documents(memory_documents)[:6]
         actor = self.store.get_entity(actor_id)
         return GrilloContextPacket(
             scope_key=scope_key,
@@ -92,10 +94,35 @@ def _merge_facts(facts: list[TemporalFact]) -> list[TemporalFact]:
     seen: set[str] = set()
     merged: list[TemporalFact] = []
     for fact in sorted(facts, key=lambda item: (item.confidence, item.updated_at), reverse=True):
-        if fact.fact_id in seen:
+        key = _fact_key(fact)
+        if key in seen:
             continue
-        seen.add(fact.fact_id)
+        seen.add(key)
         merged.append(fact)
+    return merged
+
+
+def _merge_opinions(opinions: list[OpinionEdge]) -> list[OpinionEdge]:
+    seen: set[str] = set()
+    merged: list[OpinionEdge] = []
+    for opinion in sorted(opinions, key=lambda item: (abs(float(item.score)), item.updated_at), reverse=True):
+        key = _opinion_key(opinion)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(opinion)
+    return merged
+
+
+def _merge_memory_documents(documents: list[GrilloMemoryDocument]) -> list[GrilloMemoryDocument]:
+    seen: set[str] = set()
+    merged: list[GrilloMemoryDocument] = []
+    for document in sorted(documents, key=lambda item: (item.importance, item.updated_at), reverse=True):
+        key = _memory_document_key(document)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(document)
     return merged
 
 
@@ -238,3 +265,43 @@ def _dedupe(items: list[str]) -> list[str]:
         seen.add(key)
         result.append(item)
     return result
+
+
+def _fact_key(fact: TemporalFact) -> str:
+    return "|".join(
+        [
+            "fact",
+            _norm(fact.scope_key),
+            _norm(fact.subject_id),
+            _norm(fact.predicate),
+            _norm(fact.object_value),
+        ]
+    )
+
+
+def _opinion_key(edge: OpinionEdge) -> str:
+    return "|".join(
+        [
+            "opinion",
+            _norm(edge.scope_key),
+            _norm(edge.source_id),
+            _norm(edge.target_id),
+            _norm(edge.relation),
+        ]
+    )
+
+
+def _memory_document_key(document: GrilloMemoryDocument) -> str:
+    return "|".join(
+        [
+            "memory",
+            _norm(document.scope_key),
+            _norm(document.document_type),
+            _norm(document.subject_id or ""),
+            _norm(document.title),
+        ]
+    )
+
+
+def _norm(value: object) -> str:
+    return " ".join(str(value or "").strip().casefold().split())

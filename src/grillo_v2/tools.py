@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -160,6 +161,14 @@ def _upsert_fact(
     )
     if args.get("fact_id"):
         fact.fact_id = str(args["fact_id"])
+    else:
+        fact.fact_id = _stable_id(
+            "fact",
+            scope_key,
+            fact.subject_id,
+            fact.predicate,
+            fact.object_value,
+        )
     if not fact.subject_id or not fact.predicate or not fact.claim:
         return GrilloMemoryToolResult(ignored=1, notes=["upsert_fact_missing_required_fields"])
     if is_unsafe_memory_payload(
@@ -197,6 +206,14 @@ def _upsert_opinion_edge(
     )
     if args.get("edge_id"):
         edge.edge_id = str(args["edge_id"])
+    else:
+        edge.edge_id = _stable_id(
+            "opinion",
+            scope_key,
+            edge.source_id,
+            edge.target_id,
+            edge.relation,
+        )
     if not edge.source_id or not edge.target_id or not edge.relation:
         return GrilloMemoryToolResult(ignored=1, notes=["upsert_opinion_edge_missing_required_fields"])
     store.upsert_opinion_edge(edge)
@@ -216,6 +233,14 @@ def _upsert_memory_document(*, store: SQLiteGrilloV2Store, scope_key: str, args:
     )
     if args.get("memory_id"):
         document.memory_id = str(args["memory_id"])
+    else:
+        document.memory_id = _stable_id(
+            "memory",
+            scope_key,
+            document.document_type,
+            document.subject_id or "",
+            document.title,
+        )
     if not document.document_type or not document.title or not document.body:
         return GrilloMemoryToolResult(ignored=1, notes=["upsert_memory_document_missing_required_fields"])
     if is_unsafe_memory_payload(
@@ -318,6 +343,16 @@ def _compact_text(text: str, limit: int) -> str:
 
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _stable_id(prefix: str, *parts: object) -> str:
+    normalized = "\n".join(_normalize_id_part(part) for part in parts)
+    digest = hashlib.blake2b(normalized.encode("utf-8"), digest_size=12).hexdigest()
+    return f"{prefix}_{digest}"
+
+
+def _normalize_id_part(value: object) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
 
 
 def _dict(value: Any) -> dict[str, Any]:

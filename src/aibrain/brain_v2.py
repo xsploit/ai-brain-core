@@ -543,78 +543,87 @@ class BrainV2:
 def _augment_packet_with_package_recall(packet: GrilloContextPacket, recall: GrilloV2PackageRecall) -> None:
     existing_fact_ids = {str(item.get("id")) for item in packet.active_facts if isinstance(item, dict)}
     existing_opinion_ids = {str(item.get("id")) for item in packet.relationship_state if isinstance(item, dict)}
+    existing_fact_keys = {_packet_fact_key(item) for item in packet.active_facts if isinstance(item, dict)}
+    existing_opinion_keys = {
+        _packet_opinion_key(item) for item in packet.relationship_state if isinstance(item, dict)
+    }
     existing_memory_source_ids = {
         str(item.get("metadata", {}).get("source_id") or item.get("id"))
         for item in packet.memory_blocks
         if isinstance(item, dict)
     }
+    existing_memory_keys = {_packet_memory_key(item) for item in packet.memory_blocks if isinstance(item, dict)}
     for fact in recall.graph_facts:
         if _package_fact_is_unsafe(fact):
             continue
         metadata = fact.metadata or {}
         kind = str(metadata.get("grillo_v2_kind") or "temporal_fact")
         if kind == "opinion_edge":
-            if fact.id in existing_opinion_ids:
-                continue
-            packet.relationship_state.append(
-                {
-                    "id": fact.id,
-                    "source": metadata.get("source_id") or fact.subject,
-                    "target": metadata.get("target_id") or fact.object,
-                    "relation": metadata.get("relation") or fact.predicate.removeprefix("opinion:"),
-                    "score": metadata.get("score", fact.confidence),
-                    "rationale": metadata.get("rationale") or fact.content,
-                    "evidence_ids": metadata.get("evidence_ids") or [],
-                    "valid_from": fact.valid_from,
-                    "valid_to": fact.valid_until,
-                    "retrieval_source": "package_graph",
-                }
-            )
-            existing_opinion_ids.add(fact.id)
-            continue
-        if fact.id in existing_fact_ids:
-            continue
-        packet.active_facts.append(
-            {
+            opinion_item = {
                 "id": fact.id,
-                "subject": fact.subject,
-                "predicate": fact.predicate,
-                "object": fact.object,
-                "claim": metadata.get("claim") or fact.content,
-                "confidence": round(float(fact.confidence), 4),
+                "source": metadata.get("source_id") or fact.subject,
+                "target": metadata.get("target_id") or fact.object,
+                "relation": metadata.get("relation") or fact.predicate.removeprefix("opinion:"),
+                "score": metadata.get("score", fact.confidence),
+                "rationale": metadata.get("rationale") or fact.content,
+                "evidence_ids": metadata.get("evidence_ids") or [],
                 "valid_from": fact.valid_from,
                 "valid_to": fact.valid_until,
-                "evidence_ids": metadata.get("evidence_ids") or ([fact.source_event_id] if fact.source_event_id else []),
-                "contradicts": metadata.get("contradicts") or [],
                 "retrieval_source": "package_graph",
             }
-        )
+            opinion_key = _packet_opinion_key(opinion_item)
+            if fact.id in existing_opinion_ids or opinion_key in existing_opinion_keys:
+                continue
+            packet.relationship_state.append(opinion_item)
+            existing_opinion_ids.add(fact.id)
+            existing_opinion_keys.add(opinion_key)
+            continue
+        fact_item = {
+            "id": fact.id,
+            "subject": fact.subject,
+            "predicate": fact.predicate,
+            "object": fact.object,
+            "claim": metadata.get("claim") or fact.content,
+            "confidence": round(float(fact.confidence), 4),
+            "valid_from": fact.valid_from,
+            "valid_to": fact.valid_until,
+            "evidence_ids": metadata.get("evidence_ids") or ([fact.source_event_id] if fact.source_event_id else []),
+            "contradicts": metadata.get("contradicts") or [],
+            "retrieval_source": "package_graph",
+        }
+        fact_key = _packet_fact_key(fact_item)
+        if fact.id in existing_fact_ids or fact_key in existing_fact_keys:
+            continue
+        packet.active_facts.append(fact_item)
         existing_fact_ids.add(fact.id)
+        existing_fact_keys.add(fact_key)
     for hit in recall.vector_hits:
         if _package_hit_is_unsafe(hit):
             continue
         source_id = str(hit.source_fact_id or hit.id)
-        if source_id in existing_memory_source_ids:
-            continue
         metadata = dict(hit.metadata or {})
         body = hit.text.strip()
         if len(body) > 1200:
             body = body[:1197].rstrip() + "..."
-        packet.memory_blocks.append(
-            {
-                "id": hit.id,
-                "type": f"package_recall:{metadata.get('grillo_v2_kind', 'memory')}",
-                "subject": metadata.get("subject_id") or metadata.get("target_id"),
-                "title": metadata.get("title") or metadata.get("predicate") or metadata.get("relation") or hit.id,
-                "body": body,
-                "importance": round(float(hit.importance), 4),
-                "evidence_ids": [hit.source_event_id] if hit.source_event_id else [],
-                "updated_at": hit.created_at,
-                "metadata": {**metadata, "source_id": source_id, "score": round(float(hit.score), 4)},
-            }
-        )
+        memory_item = {
+            "id": hit.id,
+            "type": f"package_recall:{metadata.get('grillo_v2_kind', 'memory')}",
+            "subject": metadata.get("subject_id") or metadata.get("target_id"),
+            "title": metadata.get("title") or metadata.get("predicate") or metadata.get("relation") or hit.id,
+            "body": body,
+            "importance": round(float(hit.importance), 4),
+            "evidence_ids": [hit.source_event_id] if hit.source_event_id else [],
+            "updated_at": hit.created_at,
+            "metadata": {**metadata, "source_id": source_id, "score": round(float(hit.score), 4)},
+        }
+        memory_key = _packet_memory_key(memory_item)
+        if source_id in existing_memory_source_ids or memory_key in existing_memory_keys:
+            continue
+        packet.memory_blocks.append(memory_item)
         existing_memory_source_ids.add(source_id)
+        existing_memory_keys.add(memory_key)
     packet.retrieval_notes.extend(recall.notes)
+    _refresh_packet_count_notes(packet)
 
 
 def _package_fact_is_unsafe(fact: Any) -> bool:
@@ -633,6 +642,65 @@ def _package_fact_is_unsafe(fact: Any) -> bool:
         subject_id=str(getattr(fact, "subject", "") or ""),
         predicate=str(getattr(fact, "predicate", "") or ""),
     )
+
+
+def _packet_fact_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            "fact",
+            _norm_packet(item.get("subject")),
+            _norm_packet(item.get("predicate")),
+            _norm_packet(item.get("object")),
+        ]
+    )
+
+
+def _packet_opinion_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            "opinion",
+            _norm_packet(item.get("source")),
+            _norm_packet(item.get("target")),
+            _norm_packet(item.get("relation")),
+        ]
+    )
+
+
+def _packet_memory_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            "memory",
+            _norm_packet(item.get("type")),
+            _norm_packet(item.get("subject")),
+            _norm_packet(item.get("title")),
+        ]
+    )
+
+
+def _norm_packet(value: object) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _refresh_packet_count_notes(packet: GrilloContextPacket) -> None:
+    preserved = [
+        note
+        for note in packet.retrieval_notes
+        if not note.startswith(
+            (
+                "active_facts=",
+                "relationship_state=",
+                "memory_blocks=",
+                "recent_episodes=",
+            )
+        )
+    ]
+    packet.retrieval_notes = [
+        f"active_facts={len(packet.active_facts)}",
+        f"relationship_state={len(packet.relationship_state)}",
+        f"memory_blocks={len(packet.memory_blocks)}",
+        f"recent_episodes={len(packet.recent_episode_summary)}",
+        *preserved,
+    ]
 
 
 def _package_hit_is_unsafe(hit: Any) -> bool:

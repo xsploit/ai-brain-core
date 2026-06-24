@@ -74,6 +74,10 @@ class SQLiteVectorRecallStore:
     async def add(self, item: RecallItem) -> str:
         if item.created_at is None:
             item.created_at = utc_now()
+        existing_embedding = await asyncio.to_thread(self._existing_embedding_for_same_text, item)
+        if existing_embedding is not None:
+            await self.add_with_embedding(item, existing_embedding)
+            return item.id
         embedding = await self.embedding_provider.embed(item.text)
         await self.add_with_embedding(item, embedding)
         return item.id
@@ -118,6 +122,20 @@ class SQLiteVectorRecallStore:
                     item.created_at,
                 ),
             )
+
+    def _existing_embedding_for_same_text(self, item: RecallItem) -> list[float] | None:
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT text, embedding_json FROM brain_recall_items WHERE id = ?",
+                (item.id,),
+            ).fetchone()
+        if row is None or row["text"] != item.text:
+            return None
+        try:
+            embedding = json.loads(row["embedding_json"])
+        except json.JSONDecodeError:
+            return None
+        return embedding if isinstance(embedding, list) else None
 
     async def search(
         self,

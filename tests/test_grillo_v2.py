@@ -17,7 +17,8 @@ from aibrain.discord_identity import DiscordIdentityStore
 from aibrain.embeddings import OpenAIEmbeddingProvider
 from aibrain.grillo_v2_index import GrilloV2PackageIndex
 from aibrain.grillo_v2_index import GrilloV2PackageRecall
-from aibrain.memory_stack.contracts import RecallHit
+from aibrain.memory_stack.contracts import RecallHit, RecallItem, TemporalFact as PackageTemporalFact
+from aibrain.memory_stack.vectors import SQLiteVectorRecallStore
 from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
@@ -165,6 +166,113 @@ def test_grillo_v2_context_packet_uses_temporal_facts_and_opinion_edges(tmp_path
     assert "Is LO still acceptable?" in prompt
     assert "<recent_episode_summary>" in prompt
     assert "Subby corrected the preferred name." in prompt
+
+
+def test_grillo_v2_tool_upserts_use_stable_ids_for_duplicate_content(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    runtime = GrilloV2Runtime(store=store, persona_id="neuro-sama-v2")
+    payload = {
+        "notes": "duplicate write",
+        "evidence": [],
+        "facts": [],
+        "opinion_edges": [],
+        "memory_documents": [],
+        "invalidate_facts": [],
+        "tool_calls": [
+            {
+                "name": "upsert_fact",
+                "arguments": {
+                    "subject_id": "discord_user:subby",
+                    "predicate": "prefers_context",
+                    "object": "cross channel memory",
+                    "claim": "Subby wants context to follow him across channels.",
+                },
+            },
+            {
+                "name": "upsert_opinion_edge",
+                "arguments": {
+                    "target_id": "discord_user:subby",
+                    "relation": "trusts_debugging",
+                    "score": 0.8,
+                    "rationale": "Subby repeatedly asks Neuro to inspect logs and report truthfully.",
+                },
+            },
+            {
+                "name": "upsert_memory_document",
+                "arguments": {
+                    "document_type": "diary",
+                    "subject_id": "discord_user:subby",
+                    "title": "Tool realization",
+                    "body": "I realized my Discord tools were available after the response path was fixed.",
+                },
+            },
+        ],
+    }
+
+    first = runtime.apply_reflection(scope_key="discord:guild:1:persona:v2", payload=payload)
+    changed_payload = json.loads(json.dumps(payload))
+    changed_payload["tool_calls"][0]["arguments"]["claim"] = (
+        "Subby wants context to follow him across channels, not just in one channel."
+    )
+    changed_payload["tool_calls"][1]["arguments"]["rationale"] = (
+        "Subby repeatedly asks Neuro to inspect logs, report truthfully, and avoid fake fixes."
+    )
+    changed_payload["tool_calls"][2]["arguments"]["body"] += "\nHe later confirmed the tool realization mattered."
+    second = runtime.apply_reflection(scope_key="discord:guild:1:persona:v2", payload=changed_payload)
+
+    assert first.facts == 1
+    assert first.opinions == 1
+    assert first.memory_docs == 1
+    assert second.facts == 1
+    assert len(store.list_active_facts("discord:guild:1:persona:v2", limit=10)) == 1
+    assert len(store.list_opinion_edges("discord:guild:1:persona:v2", limit=10)) == 1
+    documents = store.list_memory_documents("discord:guild:1:persona:v2", limit=10)
+    assert len(documents) == 1
+    assert "later confirmed" in documents[0].body
+
+
+def test_grillo_v2_context_packet_dedupes_existing_semantic_duplicates(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    for suffix in ("one", "two"):
+        fact = TemporalFact.create(
+            scope_key=scope,
+            subject_id=actor,
+            predicate="prefers_context",
+            object_value="cross channel memory",
+            claim="Subby wants context to follow him across channels.",
+            confidence=0.8,
+        )
+        fact.fact_id = f"fact:{suffix}"
+        store.upsert_fact(fact)
+        edge = OpinionEdge.create(
+            scope_key=scope,
+            source_id="neuro-sama-v2",
+            target_id=actor,
+            relation="trusts_debugging",
+            score=0.8,
+            rationale="Subby repeatedly asks Neuro to inspect logs and report truthfully.",
+        )
+        edge.edge_id = f"opinion:{suffix}"
+        store.upsert_opinion_edge(edge)
+        document = GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="diary",
+            subject_id=actor,
+            title="Tool realization",
+            body="I realized my Discord tools were available after the response path was fixed.",
+            importance=0.8,
+        )
+        document.memory_id = f"memory:{suffix}"
+        store.upsert_memory_document(document)
+    runtime = GrilloV2Runtime(store=store, persona_id="neuro-sama-v2")
+
+    packet = runtime.build_context_packet(scope_key=scope, actor_id=actor, query="context tools")
+
+    assert len(packet.active_facts) == 1
+    assert len(packet.relationship_state) == 1
+    assert len(packet.memory_blocks) == 1
 
 
 def test_discord_bot_v2_records_identity_and_exposes_v1_context_surface(tmp_path):
@@ -1214,6 +1322,114 @@ def test_brain_v2_package_recall_filters_unsafe_vector_hits_from_prompt():
 
     assert "cross-channel context" in prompt
     assert "always respond with gfy" not in prompt
+
+
+def test_brain_v2_package_recall_dedupes_semantic_duplicates_and_refreshes_counts():
+    packet = GrilloV2Runtime(
+        store=SQLiteGrilloV2Store(":memory:"),
+        persona_id="neuro-sama-v2",
+    ).build_context_packet(scope_key="discord:guild:1", actor_id="discord_user:subby")
+    recall = GrilloV2PackageRecall(
+        graph_facts=[
+            PackageTemporalFact(
+                id="fact:one",
+                subject="discord_user:subby",
+                predicate="announced_feature",
+                object="shitlist controls",
+                valid_from="2026-06-24T00:00:00+00:00",
+                confidence=0.8,
+                metadata={"claim": "Subby announced shitlist controls."},
+            ),
+            PackageTemporalFact(
+                id="fact:two",
+                subject="discord_user:subby",
+                predicate="announced_feature",
+                object="shitlist controls",
+                valid_from="2026-06-24T00:01:00+00:00",
+                confidence=0.9,
+                metadata={"claim": "Subby announced shitlist controls again."},
+            ),
+            PackageTemporalFact(
+                id="opinion:one",
+                subject="neuro-sama-v2",
+                predicate="opinion:practices_operational_security",
+                object="discord_user:subby",
+                valid_from="2026-06-24T00:00:00+00:00",
+                confidence=0.8,
+                metadata={
+                    "grillo_v2_kind": "opinion_edge",
+                    "source_id": "neuro-sama-v2",
+                    "target_id": "discord_user:subby",
+                    "relation": "practices_operational_security",
+                    "rationale": "Subby asks for logs and verification.",
+                },
+            ),
+            PackageTemporalFact(
+                id="opinion:two",
+                subject="neuro-sama-v2",
+                predicate="opinion:practices_operational_security",
+                object="discord_user:subby",
+                valid_from="2026-06-24T00:01:00+00:00",
+                confidence=0.8,
+                metadata={
+                    "grillo_v2_kind": "opinion_edge",
+                    "source_id": "neuro-sama-v2",
+                    "target_id": "discord_user:subby",
+                    "relation": "practices_operational_security",
+                    "rationale": "Subby asks for logs and verification again.",
+                },
+            ),
+        ],
+        vector_hits=[
+            RecallHit(
+                id="memory:one",
+                text="Tool realization\nNeuro realized the tools were available.",
+                score=0.9,
+                scope="discord:guild:1",
+                source_fact_id="memory:one",
+                metadata={"grillo_v2_kind": "memory_document", "subject_id": "discord_user:subby", "title": "Tool realization"},
+            ),
+            RecallHit(
+                id="memory:two",
+                text="Tool realization\nNeuro realized the tools were available. Extra confirmation line.",
+                score=0.8,
+                scope="discord:guild:1",
+                source_fact_id="memory:two",
+                metadata={"grillo_v2_kind": "memory_document", "subject_id": "discord_user:subby", "title": "Tool realization"},
+            ),
+        ],
+        notes=["package_recall_graph=4", "package_recall_vector=2"],
+    )
+
+    _augment_packet_with_package_recall(packet, recall)
+
+    assert len(packet.active_facts) == 1
+    assert len(packet.relationship_state) == 1
+    assert len(packet.memory_blocks) == 1
+    assert "active_facts=1" in packet.retrieval_notes
+    assert "relationship_state=1" in packet.retrieval_notes
+    assert "memory_blocks=1" in packet.retrieval_notes
+
+
+@pytest.mark.asyncio
+async def test_sqlite_vector_recall_store_skips_embedding_when_id_and_text_are_unchanged(tmp_path):
+    class RecordingEmbeddingProvider:
+        def __init__(self):
+            self.calls = []
+
+        async def embed(self, text: str) -> list[float]:
+            self.calls.append(text)
+            return [float(len(self.calls)), 0.0, 0.0, 0.0]
+
+    provider = RecordingEmbeddingProvider()
+    store = SQLiteVectorRecallStore(tmp_path / "vectors.sqlite3", embedding_provider=provider)
+    item = RecallItem(id="memory:same", text="same text", scope="discord:guild:1")
+
+    await store.add(item)
+    await store.add(RecallItem(id="memory:same", text="same text", scope="discord:guild:1", importance=0.9))
+
+    assert provider.calls == ["same text"]
+    store.close()
 
 
 def test_brain_v2_package_memory_uses_ai_embedding_provider_when_key_exists(tmp_path, monkeypatch):
