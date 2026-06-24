@@ -2147,6 +2147,55 @@ def test_discord_bot_v2_owner_ids_include_v1_default_with_env_overrides(monkeypa
     assert bot.treblo_song_queue.owner_user_ids == bot.owner_users
 
 
+def test_discord_bot_v2_members_intent_defaults_to_v1_enabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISCORD_BRAIN_V2_MEMBERS_INTENT", raising=False)
+    bot = DiscordBrainV2Bot(
+        brain=BrainV2(
+            BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3"),
+            json_client=SimpleNamespace(),
+        )
+    )
+
+    assert bot.intents.members is True
+
+
+def test_discord_bot_v2_heartbeat_runtime_message_uses_bot_identity_not_owner():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.owner_users = {120418341775998976}
+    bot.brain_v2 = SimpleNamespace(config=SimpleNamespace(persona_name="Neuro-sama"))
+    bot._connection = SimpleNamespace(
+        user=SimpleNamespace(
+            id=999,
+            name="neuro",
+            display_name="Neuro-sama",
+            global_name=None,
+            mention="<@999>",
+            bot=True,
+        )
+    )
+    guild = SimpleNamespace(
+        id=222,
+        me=SimpleNamespace(
+            id=999,
+            name="neuro",
+            display_name="Neuro-sama",
+            global_name=None,
+            mention="<@999>",
+            bot=True,
+            guild_permissions=SimpleNamespace(administrator=False, send_messages=True),
+            top_role=SimpleNamespace(position=9),
+        ),
+    )
+    channel = SimpleNamespace(id=333, guild=guild)
+
+    message = bot._heartbeat_runtime_message(channel)
+
+    assert message.author.id == 999
+    assert message.author.id not in bot.owner_users
+    assert message.author.guild_permissions.administrator is False
+    assert message.guild is guild
+
+
 def test_discord_bot_v2_grillo_slots_are_v1_compatible_memory_docs(tmp_path):
     brain = BrainV2(
         BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", persona_id="neuro-sama-v2"),
@@ -2555,8 +2604,10 @@ def test_discord_bot_v2_main_accepts_v1_env_file_and_token(monkeypatch, tmp_path
 
     monkeypatch.setattr(discord_bot_v2_module, "build_brain_v2", lambda: object())
     monkeypatch.setattr(discord_bot_v2_module, "DiscordBrainV2Bot", FakeBot)
+    monkeypatch.setattr(discord_bot_v2_module, "_apply_discord_tts_env_defaults", lambda: calls.setdefault("tts_defaults", True))
 
     discord_bot_v2_module.main()
 
     assert calls["token"] == "v1-token"
     assert "brain" in calls
+    assert calls["tts_defaults"] is True

@@ -36,6 +36,7 @@ from .discord_bot import (
     LETTA_HEARTBEAT_EVENT_TEXT,
     ModelSelectView,
     SummaryActionView,
+    _apply_discord_tts_env_defaults,
     _build_jb_persona,
     _codex_bridge_result_matches,
     _compact,
@@ -137,7 +138,7 @@ class DiscordBrainV2Bot(commands.Bot):
         intents.message_content = _env_bool("DISCORD_BRAIN_V2_MESSAGE_CONTENT_INTENT", True)
         intents.guilds = True
         intents.messages = True
-        intents.members = _env_bool("DISCORD_BRAIN_V2_MEMBERS_INTENT", False)
+        intents.members = _env_bool("DISCORD_BRAIN_V2_MEMBERS_INTENT", True)
         self.command_prefix_text = os.getenv("DISCORD_BRAIN_V2_COMMAND_PREFIX", DEFAULT_DISCORD_V2_PREFIX).strip() or DEFAULT_DISCORD_V2_PREFIX
         super().__init__(
             command_prefix=_build_command_prefix(self.command_prefix_text),
@@ -895,17 +896,22 @@ class DiscordBrainV2Bot(commands.Bot):
 
     def _heartbeat_runtime_message(self, channel: Any | None) -> Any:
         now = datetime.now(timezone.utc)
-        owner_id = sorted(self.owner_users)[0] if self.owner_users else getattr(getattr(self, "user", None), "id", 0)
         persona_name = self.brain_v2.config.persona_name
         guild = getattr(channel, "guild", None) if channel is not None else None
+        bot_user = getattr(self, "user", None)
+        bot_member = getattr(guild, "me", None) if guild is not None else None
+        actor_source = bot_member or bot_user
+        bot_id = getattr(actor_source, "id", getattr(bot_user, "id", 0))
+        guild_permissions = getattr(actor_source, "guild_permissions", None) or SimpleNamespace(administrator=False)
         author = SimpleNamespace(
-            id=owner_id,
-            name=persona_name,
-            display_name=persona_name,
-            global_name=persona_name,
-            mention=f"<@{owner_id}>",
+            id=bot_id,
+            name=getattr(actor_source, "name", persona_name),
+            display_name=getattr(actor_source, "display_name", persona_name),
+            global_name=getattr(actor_source, "global_name", persona_name),
+            mention=getattr(actor_source, "mention", f"<@{bot_id}>"),
             bot=True,
-            guild_permissions=SimpleNamespace(administrator=True),
+            guild_permissions=guild_permissions,
+            top_role=getattr(actor_source, "top_role", None),
         )
         return SimpleNamespace(
             id=None,
@@ -2848,7 +2854,8 @@ def _env_text(*, value_name: str, path_name: str) -> str:
 
 
 def main() -> None:
-    load_env_file(Path(os.getenv("DISCORD_BRAIN_V2_ENV_FILE") or os.getenv("DISCORD_BRAIN_ENV_FILE") or ".env"))
+    load_env_file(Path(os.getenv("DISCORD_BRAIN_V2_ENV_FILE") or os.getenv("DISCORD_BRAIN_ENV_FILE") or os.getenv("AIBRAIN_ENV_FILE") or ".env"))
+    _apply_discord_tts_env_defaults()
     logging.basicConfig(
         level=os.getenv("DISCORD_BRAIN_V2_LOG_LEVEL", os.getenv("DISCORD_BRAIN_LOG_LEVEL", "INFO")).upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
