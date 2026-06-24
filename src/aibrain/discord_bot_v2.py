@@ -924,6 +924,8 @@ class DiscordBrainV2Bot(commands.Bot):
     def _heartbeat_context(self, message: Any) -> dict[str, Any]:
         channel = getattr(message, "channel", None)
         if channel is not None:
+            with suppress(Exception):
+                return self._context_for_message(message)
             return _discord_context_for_message(message, list(self.recent_by_scope.get(_scope_for_channel(channel), []))[-8:])
         now = getattr(message, "created_at", None) or datetime.now(timezone.utc)
         scope = "discord:v2:heartbeat:channel-less"
@@ -2622,8 +2624,12 @@ def _discord_metadata(message: discord.Message, recent_messages: list[dict[str, 
 
 def _discord_context_for_message(message: discord.Message, recent_messages: list[dict[str, Any]]) -> dict[str, Any]:
     metadata = _discord_metadata(message, recent_messages=recent_messages)
+    scope = _scope_for_message(message)
     return {
-        "scope": _scope_for_message(message),
+        "scope": scope,
+        "channel_scope": scope,
+        "grillo_scope": scope,
+        "thread_id": scope,
         "guild": metadata.get("guild_name"),
         "guild_id": metadata.get("guild_id"),
         "channel": metadata.get("channel_name"),

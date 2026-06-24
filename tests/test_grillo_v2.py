@@ -217,6 +217,9 @@ def test_discord_bot_v2_records_identity_and_exposes_v1_context_surface(tmp_path
     context = bot._context_for_message(message_two)
 
     assert len(record_calls) == 2
+    assert context["channel_scope"] == "discord:guild:1:persona:v2"
+    assert context["grillo_scope"] == "discord:guild:1:persona:v2"
+    assert context["thread_id"] == "discord:guild:1:persona:v2"
     assert context["guild"] == "Test Guild"
     assert context["channel"] == "bot-chat"
     assert context["author"] == "Subby"
@@ -228,6 +231,8 @@ def test_discord_bot_v2_records_identity_and_exposes_v1_context_surface(tmp_path
     assert "Discord server identity memory:" in identity_context
     assert any("current speaker identity: user_id=123" in line for line in identity_context)
     assert any("matched_alias='karah'" in line and "user_id=456" in line for line in identity_context)
+    heartbeat_context = bot._heartbeat_context(message_two)
+    assert heartbeat_context["discord_metadata"]["identity_context"] == identity_context
 
 
 @pytest.mark.asyncio
