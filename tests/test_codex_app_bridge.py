@@ -75,6 +75,30 @@ def test_app_bridge_submits_authorized_owner_request(tmp_path: Path) -> None:
     assert outbox_payload["details"]["turn"]["turnId"] == "turn-123"
 
 
+def test_app_bridge_accepts_v2_owner_env(monkeypatch, tmp_path: Path) -> None:
+    FakeCodexClient.calls = []
+    monkeypatch.setenv("DISCORD_BRAIN_V2_OWNER_USER_IDS", "555")
+    monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
+    queue = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")
+    queue.enqueue(
+        requester_id=555,
+        requester_name="v2-owner",
+        prompt="Use the V2 owner gate.",
+        authority_mode="manual_owner",
+    )
+    worker = CodexBridgeAppServerWorker(
+        queue,
+        cwd=tmp_path,
+        thread_id="thread-123",
+        client_factory=FakeCodexClient,
+    )
+
+    result = worker.process_once()
+
+    assert result.status == "submitted_to_codex_app_server_pending_final"
+    assert FakeCodexClient.calls
+
+
 def test_app_bridge_rejects_non_owner_request_without_calling_codex(tmp_path: Path) -> None:
     FakeCodexClient.calls = []
     queue = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")

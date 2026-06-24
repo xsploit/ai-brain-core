@@ -411,12 +411,23 @@ def _validate_request(request: dict[str, Any]) -> str | None:
     authority = request.get("authority")
     if not isinstance(authority, dict) or authority.get("authorized") is not True:
         return "Bridge request is missing authorized authority metadata."
-    if str(request.get("requester_id")) != OWNER_USER_ID:
+    if str(request.get("requester_id")) not in _owner_user_ids():
         return "Bridge request requester is not the configured bot owner."
     delivery = request.get("delivery")
     if isinstance(delivery, dict) and delivery.get("mode") == "harness_brain":
         return "Harness delivery is not handled by the app-server bridge worker."
     return None
+
+
+def _owner_user_ids() -> set[str]:
+    values: set[str] = {OWNER_USER_ID}
+    for name in ("DISCORD_BRAIN_V2_OWNER_USER_IDS", "DISCORD_BRAIN_OWNER_USER_IDS"):
+        raw = os.getenv(name, "")
+        for chunk in raw.replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                values.add(chunk)
+    return values
 
 
 def _request_origin(request: dict[str, Any]) -> dict[str, Any]:

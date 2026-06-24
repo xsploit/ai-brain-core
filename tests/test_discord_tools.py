@@ -318,8 +318,19 @@ def test_capabilities_reports_owner_gate(monkeypatch):
         assert "discord_create_text_channel" in result["owner_only_tools"]
 
 
+def test_v2_owner_env_counts_for_agentic_tool_owner_gate(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_V2_OWNER_USER_IDS", "1")
+    monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
+    with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
+        result = asyncio.run(discord_get_capabilities())
+
+        assert result["actor"]["id"] == ctx.actor.id
+        assert result["actor"]["is_owner"] is True
+
+
 def test_allowed_user_is_not_implicitly_owner(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "1")
+    monkeypatch.delenv("DISCORD_BRAIN_V2_OWNER_USER_IDS", raising=False)
     monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
     with _tool_context(actor_perms=_Perms(administrator=True)) as ctx:
         result = asyncio.run(discord_get_capabilities())
