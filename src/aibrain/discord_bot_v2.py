@@ -371,7 +371,8 @@ class DiscordBrainV2Bot(commands.Bot):
             DISCORD_TOOL_CONTEXT.reset(tool_token)
             DISCORD_CONTEXT.reset(context_token)
         if response:
-            await self._send_final_reply(message, response)
+            sent_message = await self._send_final_reply(message, response)
+            self._record_recent_assistant(message, response, sent_message=sent_message)
             await self._maybe_send_tts_reply(message, response)
 
     def _allowed(self, message: discord.Message) -> bool:
@@ -493,6 +494,38 @@ class DiscordBrainV2Bot(commands.Bot):
                 await message.channel.send(chunk)
         return first_sent
 
+    def _record_recent_assistant(
+        self,
+        message: discord.Message,
+        text: str,
+        *,
+        sent_message: discord.Message | None = None,
+    ) -> None:
+        if not text.strip():
+            return
+        scope_key = _scope_for_message(message)
+        recent = self.recent_by_scope.get(scope_key)
+        if recent is None:
+            recent = deque(maxlen=max(getattr(self, "rolling_context_messages", 15) * 4, 32))
+            self.recent_by_scope[scope_key] = recent
+        author = getattr(self, "user", None)
+        created_at = getattr(sent_message, "created_at", None) or datetime.now(timezone.utc)
+        persona_name = getattr(getattr(self.brain_v2, "config", None), "persona_name", "Neuro-sama")
+        recent.append(
+            {
+                "author": _display_name(author) if author is not None else persona_name,
+                "author_id": getattr(author, "id", None),
+                "author_is_bot": True,
+                "message_id": getattr(sent_message, "id", None),
+                "content": text[:1000],
+                "created_at": created_at.isoformat() if created_at else None,
+                "reply_to_message_id": getattr(message, "id", None),
+                "reply_to_author": _display_name(message.author),
+                "reply_to_author_id": getattr(message.author, "id", None),
+                "reply_to_author_is_bot": bool(getattr(message.author, "bot", False)),
+            }
+        )
+
     def _record_discord_message(self, message: discord.Message):
         text = _message_text(message)
         if not text:
@@ -516,7 +549,9 @@ class DiscordBrainV2Bot(commands.Bot):
         return list(self.recent_by_scope.get(_scope_for_message(message), []))[-self.rolling_context_messages :]
 
     async def _reply_with_shitlist(self, message: discord.Message, entry: DiscordShitlistEntry) -> None:
-        await self._send_final_reply(message, format_shitlist_reply(entry))
+        final_text = format_shitlist_reply(entry)
+        sent_message = await self._send_final_reply(message, final_text)
+        self._record_recent_assistant(message, final_text, sent_message=sent_message)
 
     async def _queue_codex_bridge_request(self, ctx: commands.Context, *, route: str, prompt: str) -> None:
         if not await _require_owner(bot=self, ctx=ctx, action="Codex bridge"):
@@ -603,6 +638,7 @@ class DiscordBrainV2Bot(commands.Bot):
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="discord-brain-v2-heartbeat")
 
     async def _heartbeat_loop(self) -> None:
+        await self.wait_until_ready()
         while self.heartbeat_enabled and not self.is_closed():
             delay = self._next_heartbeat_delay_seconds()
             logger.info("Discord Brain v2 heartbeat scheduled in %.0f seconds", delay)
@@ -610,6 +646,7 @@ class DiscordBrainV2Bot(commands.Bot):
             if not self.heartbeat_enabled or getattr(self, "paused", False):
                 continue
             if random.random() > self.heartbeat_chance:
+                logger.debug("Discord Brain v2 heartbeat skipped by probability %.3f", self.heartbeat_chance)
                 continue
             channel = await self._heartbeat_channel()
             if channel is None and not self._heartbeat_can_run_without_channel():

@@ -1433,6 +1433,99 @@ def test_discord_bot_v2_record_message_tracks_last_active_human_channel():
     assert bot.heartbeat_last_channel_id == 333
 
 
+@pytest.mark.asyncio
+async def test_discord_bot_v2_on_message_records_assistant_reply_in_recent(monkeypatch):
+    class FakeTyping:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeBrainV2:
+        def __init__(self):
+            self.config = SimpleNamespace(persona_name="Neuro-sama")
+            self.respond_kwargs = None
+
+        def record_message(self, **kwargs):
+            return SimpleNamespace(episode_id="ep-user")
+
+        async def respond(self, **kwargs):
+            self.respond_kwargs = kwargs
+            return "right, I remember what I just said"
+
+    async def fake_text_attachment_context(message):
+        return ""
+
+    monkeypatch.setattr(discord_bot_v2_module, "_v1_text_attachment_context", fake_text_attachment_context)
+    monkeypatch.setattr(discord_bot_v2_module, "_v1_image_inputs", lambda message: [])
+
+    bot_user = SimpleNamespace(id=999, name="neuro", display_name="Neuro-sama", global_name=None, bot=True)
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot._connection = SimpleNamespace(user=bot_user)
+    bot.recent_by_scope = defaultdict(lambda: deque(maxlen=32))
+    bot.heartbeat_last_channel = None
+    bot.heartbeat_last_channel_id = None
+    bot.allowed_guilds = set()
+    bot.allowed_users = set()
+    bot.paused = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.ignore_bots = True
+    bot.respond_to_bots = False
+    bot.max_reply_chars = 1900
+    bot.rolling_context_messages = 15
+    bot.send_tts_replies = False
+    bot.discord_token = "discord-token"
+    bot.tts_voice = None
+    bot.brain_v2 = FakeBrainV2()
+    bot.shitlist_store = SimpleNamespace(get=lambda user_id: None)
+    bot._codex_bridge_updates_for_message = lambda message: []
+
+    async def fake_get_context(message):
+        return SimpleNamespace(command=None)
+
+    bot.get_context = fake_get_context
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    channel = SimpleNamespace(id=333, name="bot-chat")
+    channel.guild = guild
+    channel.typing = lambda: FakeTyping()
+    channel.send = lambda content: None
+    author = SimpleNamespace(id=123, bot=False, name="subsect", display_name="Subby", global_name=None)
+    sent_at = datetime.now(timezone.utc)
+
+    async def fake_reply(content, mention_author=False):
+        return SimpleNamespace(id=777, content=content, created_at=sent_at)
+
+    message = SimpleNamespace(
+        id=111,
+        author=author,
+        guild=guild,
+        channel=channel,
+        mentions=[bot_user],
+        reference=None,
+        clean_content="@Neuro-sama remember this",
+        content="@Neuro-sama remember this",
+        created_at=datetime.now(timezone.utc),
+        jump_url="https://discord.test/111",
+        attachments=[],
+        reply=fake_reply,
+    )
+
+    await bot.on_message(message)
+
+    recent = list(bot.recent_by_scope[_scope_for_message(message)])
+    assert [item["content"] for item in recent] == [
+        "@Neuro-sama remember this",
+        "right, I remember what I just said",
+    ]
+    assert recent[-1]["author"] == "Neuro-sama"
+    assert recent[-1]["author_is_bot"] is True
+    assert recent[-1]["message_id"] == 777
+    assert recent[-1]["reply_to_author"] == "Subby"
+    assert recent[-1]["reply_to_message_id"] == 111
+
+
 def test_discord_bot_v2_codex_bridge_results_inject_into_relevant_context(tmp_path, monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_V2_CODEX_CONTEXT_ENABLED", "true")
     queue = discord_bot_v2_module.CodexBridgeQueue(tmp_path / "bridge", enabled=True)
