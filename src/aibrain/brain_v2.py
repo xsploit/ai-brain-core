@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +16,9 @@ from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
 from .config import Persona
 from .embeddings import default_embedding_provider
 from .grillo_v2_index import GrilloV2PackageIndex, GrilloV2PackageRecall
+
+
+logger = logging.getLogger("aibrain.brain_v2")
 
 
 @dataclass(slots=True)
@@ -65,6 +70,7 @@ class BrainV2:
         self.response_persona = response_persona
         self.response_tool_names = list(response_tool_names) if response_tool_names is not None else None
         self.response_memory_policy = response_memory_policy
+        self._package_sync_tasks: dict[str, asyncio.Task[None]] = {}
         self.grillo = GrilloV2Runtime(
             store=self.store,
             completion=self._complete_reflection,
@@ -161,8 +167,6 @@ class BrainV2:
                 aliases=_actor_aliases_from_metadata(metadata or {}),
                 metadata=metadata or {},
             )
-        if self.package_index is not None:
-            await self.package_index.sync_scope(self.store, scope_key)
         packet = self.build_context_packet(
             scope_key=scope_key,
             actor_id=actor_id,
@@ -219,6 +223,7 @@ class BrainV2:
                     metadata=assistant_metadata,
                 )
             )
+        self._schedule_package_sync(scope_key)
         return response_text.strip()
 
     def build_context_packet(
@@ -303,9 +308,34 @@ class BrainV2:
         }
 
     def close(self) -> None:
+        for task in list(self._package_sync_tasks.values()):
+            task.cancel()
+        self._package_sync_tasks.clear()
         self.store.close()
         if self.package_index is not None:
             self.package_index.close()
+
+    def _schedule_package_sync(self, scope_key: str) -> None:
+        if self.package_index is None:
+            return
+        existing = self._package_sync_tasks.get(scope_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._run_package_sync(scope_key), name=f"brain-v2-package-sync:{scope_key}")
+        self._package_sync_tasks[scope_key] = task
+
+    async def _run_package_sync(self, scope_key: str) -> None:
+        try:
+            if self.package_index is not None:
+                await self.package_index.sync_scope(self.store, scope_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("BrainV2 package memory sync failed for scope %s", scope_key)
+        finally:
+            current = self._package_sync_tasks.get(scope_key)
+            if current is asyncio.current_task():
+                self._package_sync_tasks.pop(scope_key, None)
 
     def _build_package_index(self) -> GrilloV2PackageIndex | None:
         if not self.config.package_memory_enabled:

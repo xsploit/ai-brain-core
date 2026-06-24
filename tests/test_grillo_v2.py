@@ -661,6 +661,64 @@ async def test_brain_v2_respond_compiles_grillo_context_and_stores_assistant_epi
 
 
 @pytest.mark.asyncio
+async def test_brain_v2_respond_does_not_block_on_package_sync(tmp_path):
+    class FakeResponses:
+        async def create(self, **kwargs):
+            return SimpleNamespace(output_text="fast reply")
+
+    class BlockingPackageIndex:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = False
+
+        async def sync_scope(self, store, scope_key):
+            self.started.set()
+            await self.release.wait()
+
+        async def recall(self, **kwargs):
+            return SimpleNamespace(graph_facts=[], vector_hits=[], notes=[])
+
+        def status(self):
+            return {"fake": True}
+
+        def close(self):
+            self.closed = True
+
+    package_index = BlockingPackageIndex()
+    json_client = VercelAIGatewayJSONClient(
+        client=SimpleNamespace(responses=FakeResponses()),
+        model="deepseek/test",
+    )
+    brain = BrainV2(
+        BrainV2Config(
+            database_path=tmp_path / "brain-v2.sqlite3",
+            model="deepseek/test",
+            package_memory_enabled=True,
+        ),
+        json_client=json_client,
+        package_index=package_index,
+    )
+
+    response = await asyncio.wait_for(
+        brain.respond(
+            scope_key="discord:guild:1",
+            actor_id="discord_user:subby",
+            user_text="hello",
+            source="discord",
+            channel_id="bot-chat",
+        ),
+        timeout=0.25,
+    )
+
+    assert response == "fast reply"
+    await asyncio.wait_for(package_index.started.wait(), timeout=0.25)
+    package_index.release.set()
+    await asyncio.sleep(0)
+    brain.close()
+
+
+@pytest.mark.asyncio
 async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
     if importlib.util.find_spec("ladybug") is None or importlib.util.find_spec("turbovec") is None:
         pytest.skip("ladybug/turbovec extras not installed")
