@@ -16,7 +16,7 @@ from grillo_v2 import (
 )
 from grillo_v2.models import dataclass_dict
 
-from .embeddings import HashEmbeddingProvider
+from .embeddings import EmbeddingProvider, HashEmbeddingProvider
 from .memory_stack.contracts import GraphQuery, RecallHit, RecallItem, TemporalFact
 from .memory_stack.stack import _create_graph_store, _create_vector_store
 
@@ -424,12 +424,14 @@ class GrilloV2PackageIndex:
         *,
         graph_store: Any,
         vector_store: Any | None,
+        embedding_provider: EmbeddingProvider,
         persona_id: str,
         sync_limit: int = 500,
         recall_top_k: int = 5,
     ):
         self.graph_store = graph_store
         self.vector_store = vector_store
+        self.embedding_provider = embedding_provider
         self.persona_id = persona_id
         self.sync_limit = max(1, int(sync_limit))
         self.recall_top_k = max(1, int(recall_top_k))
@@ -445,11 +447,12 @@ class GrilloV2PackageIndex:
         graph_backend: str = "auto",
         vector_backend: str = "auto",
         embedding_dimensions: int = 256,
+        embedding_provider: EmbeddingProvider | None = None,
         sync_limit: int = 500,
         recall_top_k: int = 5,
     ) -> "GrilloV2PackageIndex":
         base = Path(path)
-        provider = HashEmbeddingProvider(dimensions=embedding_dimensions)
+        provider = embedding_provider or HashEmbeddingProvider(dimensions=embedding_dimensions)
         graph_store = _create_graph_store(base, backend=graph_backend)
         vector_store = _create_vector_store(
             base,
@@ -460,6 +463,7 @@ class GrilloV2PackageIndex:
         return cls(
             graph_store=graph_store,
             vector_store=vector_store,
+            embedding_provider=provider,
             persona_id=persona_id,
             sync_limit=sync_limit,
             recall_top_k=recall_top_k,
@@ -469,6 +473,7 @@ class GrilloV2PackageIndex:
         return {
             "graph_backend": type(self.graph_store).__name__,
             "vector_backend": type(self.vector_store).__name__ if self.vector_store is not None else None,
+            "embedding_provider": type(self.embedding_provider).__name__,
             "structured_graph": type(self.structured_graph).__name__ if self.structured_graph is not None else None,
             "structured_graph_last_counts": self.structured_graph.last_counts if self.structured_graph is not None else None,
             "synced_items": len(self._synced),

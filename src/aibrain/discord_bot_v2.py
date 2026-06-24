@@ -964,6 +964,10 @@ def build_brain_v2() -> BrainV2:
             package_memory_path=Path(os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_PATH", "")) if os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_PATH") else None,
             package_memory_graph_backend=os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_GRAPH_BACKEND", "auto"),
             package_memory_vector_backend=os.getenv("DISCORD_BRAIN_V2_PACKAGE_MEMORY_VECTOR_BACKEND", "auto"),
+            package_memory_embedding_model=os.getenv(
+                "DISCORD_BRAIN_V2_PACKAGE_MEMORY_EMBEDDING_MODEL",
+                os.getenv("AIBRAIN_EMBEDDING_MODEL", "openai/text-embedding-3-small"),
+            ),
             package_memory_embedding_dimensions=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_EMBEDDING_DIMENSIONS", 256),
             package_memory_sync_limit=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_SYNC_LIMIT", 500),
             package_memory_recall_top_k=_env_int("DISCORD_BRAIN_V2_PACKAGE_MEMORY_RECALL_TOP_K", 5),

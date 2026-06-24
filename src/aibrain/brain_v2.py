@@ -12,6 +12,7 @@ from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONCli
 from grillo_v2.runtime import GRILLO_V2_REFLECTION_SCHEMA
 
 from .config import Persona
+from .embeddings import default_embedding_provider
 from .grillo_v2_index import GrilloV2PackageIndex, GrilloV2PackageRecall
 
 
@@ -27,6 +28,7 @@ class BrainV2Config:
     package_memory_path: Path | None = None
     package_memory_graph_backend: str = "auto"
     package_memory_vector_backend: str = "auto"
+    package_memory_embedding_model: str = "openai/text-embedding-3-small"
     package_memory_embedding_dimensions: int = 256
     package_memory_sync_limit: int = 500
     package_memory_recall_top_k: int = 5
@@ -53,12 +55,12 @@ class BrainV2:
     ):
         self.config = config or BrainV2Config()
         self.store = store or SQLiteGrilloV2Store(self.config.database_path)
-        self.package_index = package_index or self._build_package_index()
         self.json_client = json_client or VercelAIGatewayJSONClient(
             model=self.config.model,
             api_key=os.getenv("AI_GATEWAY_API_KEY"),
             base_url=self.base_url,
         )
+        self.package_index = package_index or self._build_package_index()
         self.response_brain = response_brain
         self.response_persona = response_persona
         self.response_tool_names = list(response_tool_names) if response_tool_names is not None else None
@@ -314,6 +316,11 @@ class BrainV2:
             graph_backend=self.config.package_memory_graph_backend,
             vector_backend=self.config.package_memory_vector_backend,
             embedding_dimensions=self.config.package_memory_embedding_dimensions,
+            embedding_provider=default_embedding_provider(
+                lambda: self.json_client.client,
+                self.config.package_memory_embedding_model,
+                self.config.package_memory_embedding_dimensions,
+            ),
             sync_limit=self.config.package_memory_sync_limit,
             recall_top_k=self.config.package_memory_recall_top_k,
         )

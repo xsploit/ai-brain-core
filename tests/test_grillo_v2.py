@@ -12,6 +12,7 @@ import pytest
 
 import aibrain.discord_bot_v2 as discord_bot_v2_module
 from aibrain.brain_v2 import BrainV2, BrainV2Config
+from aibrain.embeddings import OpenAIEmbeddingProvider
 from aibrain.grillo_v2_index import GrilloV2PackageIndex
 from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
@@ -765,6 +766,73 @@ async def test_grillo_v2_package_index_syncs_ladybug_and_turbovec(tmp_path):
         }
     ]
     index.close()
+
+
+@pytest.mark.asyncio
+async def test_grillo_v2_package_index_uses_injected_embedding_provider(tmp_path):
+    class RecordingEmbeddingProvider:
+        def __init__(self):
+            self.calls = []
+
+        async def embed(self, text: str) -> list[float]:
+            self.calls.append(text)
+            return [1.0, 0.0, 0.0, 0.0]
+
+    provider = RecordingEmbeddingProvider()
+    scope = "discord:guild:1:persona:v2"
+    actor = "discord_user:subby"
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    store.upsert_memory_document(
+        GrilloMemoryDocument.create(
+            scope_key=scope,
+            document_type="diary",
+            subject_id=actor,
+            title="Cross-channel context",
+            body="Subby wants memory to follow him across channels.",
+            importance=0.9,
+        )
+    )
+    index = GrilloV2PackageIndex.from_path(
+        tmp_path / "package-memory.sqlite3",
+        persona_id="neuro-sama-v2",
+        graph_backend="sqlite",
+        vector_backend="sqlite",
+        embedding_dimensions=4,
+        embedding_provider=provider,
+    )
+
+    await index.sync_scope(store, scope)
+    recall = await index.recall(scope_key=scope, actor_id=actor, query="cross channel", top_k=3)
+    status = index.status()
+
+    assert status["embedding_provider"] == "RecordingEmbeddingProvider"
+    assert any("Cross-channel context" in call for call in provider.calls)
+    assert provider.calls[-1] == "cross channel"
+    assert any(hit.metadata["grillo_v2_kind"] == "memory_document" for hit in recall.vector_hits)
+    index.close()
+
+
+def test_brain_v2_package_memory_uses_ai_embedding_provider_when_key_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-key")
+    fake_client = SimpleNamespace(responses=SimpleNamespace(), embeddings=SimpleNamespace())
+    json_client = VercelAIGatewayJSONClient(client=fake_client, model="deepseek/test")
+
+    brain = BrainV2(
+        BrainV2Config(
+            database_path=tmp_path / "brain-v2.sqlite3",
+            package_memory_enabled=True,
+            package_memory_path=tmp_path / "package-memory.sqlite3",
+            package_memory_graph_backend="sqlite",
+            package_memory_vector_backend="sqlite",
+            package_memory_embedding_model="openai/text-embedding-3-small",
+            package_memory_embedding_dimensions=4,
+        ),
+        json_client=json_client,
+    )
+
+    assert isinstance(brain.package_index.embedding_provider, OpenAIEmbeddingProvider)
+    assert brain.status()["package_memory"]["embedding_provider"] == "OpenAIEmbeddingProvider"
+    brain.close()
 
 
 @pytest.mark.asyncio
