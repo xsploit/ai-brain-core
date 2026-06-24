@@ -2533,3 +2533,30 @@ def test_brain_v2_backfill_and_status_formatting(tmp_path):
             ),
         )
     )
+
+
+def test_discord_bot_v2_main_accepts_v1_env_file_and_token(monkeypatch, tmp_path):
+    env_file = tmp_path / "discord-v1.env"
+    env_file.write_text("DISCORD_BRAIN_BOT_TOKEN=v1-token\n", encoding="utf-8")
+    monkeypatch.setenv("DISCORD_BRAIN_ENV_FILE", str(env_file))
+    monkeypatch.delenv("DISCORD_BRAIN_V2_ENV_FILE", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_V2_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+    calls: dict[str, object] = {}
+
+    class FakeBot:
+        def __init__(self, *, brain):
+            calls["brain"] = brain
+
+        async def start(self, token):
+            calls["token"] = token
+
+    monkeypatch.setattr(discord_bot_v2_module, "build_brain_v2", lambda: object())
+    monkeypatch.setattr(discord_bot_v2_module, "DiscordBrainV2Bot", FakeBot)
+
+    discord_bot_v2_module.main()
+
+    assert calls["token"] == "v1-token"
+    assert "brain" in calls

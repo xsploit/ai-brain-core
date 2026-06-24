@@ -2848,14 +2848,19 @@ def _env_text(*, value_name: str, path_name: str) -> str:
 
 
 def main() -> None:
-    load_env_file(Path(os.getenv("DISCORD_BRAIN_V2_ENV_FILE", ".env")))
+    load_env_file(Path(os.getenv("DISCORD_BRAIN_V2_ENV_FILE") or os.getenv("DISCORD_BRAIN_ENV_FILE") or ".env"))
     logging.basicConfig(
-        level=os.getenv("DISCORD_BRAIN_V2_LOG_LEVEL", "INFO").upper(),
+        level=os.getenv("DISCORD_BRAIN_V2_LOG_LEVEL", os.getenv("DISCORD_BRAIN_LOG_LEVEL", "INFO")).upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    token = os.getenv("DISCORD_BRAIN_V2_BOT_TOKEN")
+    token = (
+        os.getenv("DISCORD_BRAIN_V2_BOT_TOKEN")
+        or os.getenv("DISCORD_BRAIN_BOT_TOKEN")
+        or os.getenv("DISCORD_BOT_TOKEN")
+        or os.getenv("DISCORD_TOKEN")
+    )
     if not token:
-        raise RuntimeError("DISCORD_BRAIN_V2_BOT_TOKEN is required for the v2 Discord bot")
+        raise RuntimeError("DISCORD_BRAIN_V2_BOT_TOKEN or DISCORD_BRAIN_BOT_TOKEN is required for the v2 Discord bot")
     bot = DiscordBrainV2Bot(brain=build_brain_v2())
     asyncio.run(bot.start(token))
 
