@@ -124,7 +124,7 @@ class GrilloV2Runtime:
                 "episodes": [_episode_payload(episode) for episode in episodes],
             }
         )
-        result = self.apply_reflection(scope_key=scope_key, payload=payload)
+        result = self.apply_reflection(scope_key=scope_key, payload=payload, episodes=episodes)
         result.episodes = len(episodes)
         return result
 
@@ -166,7 +166,7 @@ class GrilloV2Runtime:
                 "episodes": [_episode_payload(episode) for episode in episodes],
             }
         )
-        result = self.apply_reflection(scope_key=scope_key, payload=payload)
+        result = self.apply_reflection(scope_key=scope_key, payload=payload, episodes=episodes)
         result.episodes = len(episodes)
         last = episodes[-1]
         self.store.set_cursor(
@@ -208,13 +208,20 @@ class GrilloV2Runtime:
     def worker_cursor_key(self, scope_key: str) -> str:
         return f"grillo_v2_worker:{self.persona_id}:{scope_key}"
 
-    def apply_reflection(self, *, scope_key: str, payload: dict[str, Any]) -> ReflectionResult:
+    def apply_reflection(
+        self,
+        *,
+        scope_key: str,
+        payload: dict[str, Any],
+        episodes: list[GrilloEpisode] | None = None,
+    ) -> ReflectionResult:
         result = ReflectionResult(notes=str(payload.get("notes") or ""))
         tool_result = apply_memory_tool_calls(
             store=self.store,
             scope_key=scope_key,
             persona_id=self.persona_id,
             tool_calls=[*legacy_payload_tool_calls(payload), *_list(payload.get("tool_calls"))],
+            episodes=episodes or [],
         )
         result.tool_calls = tool_result.tool_calls
         result.evidence = tool_result.evidence

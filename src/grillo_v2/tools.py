@@ -36,8 +36,10 @@ def apply_memory_tool_calls(
     scope_key: str,
     persona_id: str,
     tool_calls: list[Any],
+    episodes: list[Any] | None = None,
 ) -> GrilloMemoryToolResult:
     result = GrilloMemoryToolResult()
+    episodes = episodes or []
     for call in tool_calls:
         name = _tool_name(call)
         args = _tool_args(call)
@@ -50,6 +52,7 @@ def apply_memory_tool_calls(
             persona_id=persona_id,
             name=name,
             args=args,
+            episodes=episodes,
         )
         result.tool_calls += 1
         result.evidence += applied.evidence
@@ -81,10 +84,11 @@ def _apply_memory_tool(
     persona_id: str,
     name: str,
     args: dict[str, Any],
+    episodes: list[Any],
 ) -> GrilloMemoryToolResult:
     normalized = name.strip().casefold()
     if normalized == "record_evidence":
-        return _record_evidence(store=store, scope_key=scope_key, args=args)
+        return _record_evidence(store=store, scope_key=scope_key, args=args, episodes=episodes)
     if normalized == "upsert_fact":
         return _upsert_fact(store=store, scope_key=scope_key, persona_id=persona_id, args=args)
     if normalized in {"upsert_opinion", "upsert_opinion_edge"}:
@@ -96,11 +100,23 @@ def _apply_memory_tool(
     return GrilloMemoryToolResult(ignored=1, notes=[f"unknown_tool:{name}"])
 
 
-def _record_evidence(*, store: SQLiteGrilloV2Store, scope_key: str, args: dict[str, Any]) -> GrilloMemoryToolResult:
+def _record_evidence(
+    *,
+    store: SQLiteGrilloV2Store,
+    scope_key: str,
+    args: dict[str, Any],
+    episodes: list[Any],
+) -> GrilloMemoryToolResult:
+    quote = _first_text(args, "quote", "text", "content", "claim", "summary")
+    episode_id = _first_text(args, "episode_id", "source_episode_id", "turn_id", "source_turn_id")
+    if not episode_id and quote:
+        episode_id = _episode_id_for_quote(episodes, quote)
+    if episode_id and not quote:
+        quote = _episode_quote(episodes, episode_id)
     evidence = Evidence.create(
         scope_key=scope_key,
-        episode_id=str(args.get("episode_id") or ""),
-        quote=str(args.get("quote") or ""),
+        episode_id=episode_id,
+        quote=quote,
         extractor=str(args.get("extractor") or "grillo_v2"),
         confidence=_float(args.get("confidence"), 0.5),
         metadata=_dict(args.get("metadata")),
@@ -164,13 +180,18 @@ def _upsert_opinion_edge(
     persona_id: str,
     args: dict[str, Any],
 ) -> GrilloMemoryToolResult:
+    target_id = _first_text(args, "target_id", "target", "entity_id", "subject_id", "participant_id")
+    relation = _first_text(args, "relation", "predicate", "opinion", "type")
+    rationale = _first_text(args, "rationale", "reason", "summary", "claim", "content")
+    if target_id and not relation and rationale:
+        relation = "relationship"
     edge = OpinionEdge.create(
         scope_key=scope_key,
         source_id=str(args.get("source_id") or persona_id),
-        target_id=str(args.get("target_id") or ""),
-        relation=str(args.get("relation") or ""),
+        target_id=target_id,
+        relation=relation,
         score=_float(args.get("score"), 0.0),
-        rationale=str(args.get("rationale") or ""),
+        rationale=rationale,
         evidence_ids=[str(value) for value in _list(args.get("evidence_ids"))],
         metadata=_dict(args.get("metadata")),
     )
@@ -208,7 +229,10 @@ def _upsert_memory_document(*, store: SQLiteGrilloV2Store, scope_key: str, args:
 
 
 def _invalidate_fact(*, store: SQLiteGrilloV2Store, args: dict[str, Any]) -> GrilloMemoryToolResult:
-    fact_id = str(args.get("fact_id") or "")
+    fact_id = _first_text(args, "fact_id", "id", "target_fact_id", "source_fact_id")
+    if not fact_id:
+        fact_ids = _list(args.get("fact_ids"))
+        fact_id = str(fact_ids[0]) if fact_ids else ""
     if not fact_id:
         return GrilloMemoryToolResult(ignored=1, notes=["invalidate_fact_missing_fact_id"])
     store.invalidate_fact(
@@ -250,6 +274,46 @@ def _args_dict(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _first_text(args: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = args.get(key)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else ""
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _episode_id_for_quote(episodes: list[Any], quote: str) -> str:
+    needle = _compact_text(quote, 700)
+    if not needle:
+        return ""
+    folded = needle.casefold()
+    for episode in episodes:
+        content = str(getattr(episode, "content", "") or "")
+        if folded in content.casefold():
+            return str(getattr(episode, "episode_id", "") or "")
+    return ""
+
+
+def _episode_quote(episodes: list[Any], episode_id: str) -> str:
+    target = str(episode_id or "").strip()
+    if not target:
+        return ""
+    for episode in episodes:
+        if str(getattr(episode, "episode_id", "") or "") == target:
+            return _compact_text(str(getattr(episode, "content", "") or ""), 700)
+    return ""
+
+
+def _compact_text(text: str, limit: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: max(0, limit - 3)].rstrip()}..."
 
 
 def _list(value: Any) -> list[Any]:

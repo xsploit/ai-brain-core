@@ -425,6 +425,135 @@ def test_grillo_v2_reflection_accepts_memory_tool_calls(tmp_path):
     assert "fact:old-flat-log" not in packet.as_prompt_text()
 
 
+def test_grillo_v2_reflection_recovers_episode_evidence_from_batch(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    episode = store.append_episode(
+        GrilloEpisode.create(
+            scope_key="discord:guild:1",
+            source="discord",
+            actor_id="discord_user:subby",
+            content="Subby corrected the Castlegar grocery context and said there is no Overwaitea there.",
+        )
+    )
+    runtime = GrilloV2Runtime(store=store, persona_id="persona:neuro")
+
+    result = runtime.apply_reflection(
+        scope_key="discord:guild:1",
+        episodes=[episode],
+        payload={
+            "notes": "recover evidence",
+            "evidence": [],
+            "facts": [],
+            "opinion_edges": [],
+            "memory_documents": [],
+            "invalidate_facts": [],
+            "tool_calls": [
+                {
+                    "name": "record_evidence",
+                    "arguments": {
+                        "evidence_id": "evidence:grocery-correction",
+                        "quote": "there is no Overwaitea there",
+                        "confidence": 0.87,
+                    },
+                }
+            ],
+        },
+    )
+    evidence = store.list_evidence("discord:guild:1", limit=5)
+
+    assert result.evidence == 1
+    assert result.ignored_tool_calls == 0
+    assert "record_evidence_missing_episode_or_quote" not in result.notes
+    assert evidence[0].episode_id == episode.episode_id
+
+
+def test_grillo_v2_reflection_recovers_quote_from_episode_id(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    episode = store.append_episode(
+        GrilloEpisode.create(
+            scope_key="discord:guild:1",
+            source="discord",
+            actor_id="discord_user:subby",
+            content="Subby said Bluetooth testing should stay authorized and scoped.",
+        )
+    )
+    runtime = GrilloV2Runtime(store=store, persona_id="persona:neuro")
+
+    result = runtime.apply_reflection(
+        scope_key="discord:guild:1",
+        episodes=[episode],
+        payload={
+            "notes": "recover quote",
+            "evidence": [],
+            "facts": [],
+            "opinion_edges": [],
+            "memory_documents": [],
+            "invalidate_facts": [],
+            "tool_calls": [
+                {
+                    "name": "record_evidence",
+                    "arguments": {
+                        "evidence_id": "evidence:authorized-scope",
+                        "episode_id": episode.episode_id,
+                        "confidence": 0.75,
+                    },
+                }
+            ],
+        },
+    )
+    evidence = store.list_evidence("discord:guild:1", limit=5)
+
+    assert result.evidence == 1
+    assert result.ignored_tool_calls == 0
+    assert evidence[0].quote == "Subby said Bluetooth testing should stay authorized and scoped."
+
+
+def test_grillo_v2_reflection_accepts_common_tool_argument_aliases(tmp_path):
+    store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
+    old_fact = TemporalFact.create(
+        scope_key="discord:guild:1",
+        subject_id="discord_user:subby",
+        predicate="store_context",
+        object_value="overwaitea",
+        claim="Subby said Castlegar has Overwaitea.",
+    )
+    old_fact.fact_id = "fact:bad-store"
+    store.upsert_fact(old_fact)
+    runtime = GrilloV2Runtime(store=store, persona_id="persona:neuro")
+
+    result = runtime.apply_reflection(
+        scope_key="discord:guild:1",
+        payload={
+            "notes": "aliases",
+            "evidence": [],
+            "facts": [],
+            "opinion_edges": [],
+            "memory_documents": [],
+            "invalidate_facts": [],
+            "tool_calls": [
+                {
+                    "name": "upsert_opinion_edge",
+                    "arguments": {
+                        "edge_id": "opinion:subby-corrections",
+                        "target": "discord_user:subby",
+                        "type": "trust",
+                        "reason": "Subby corrected a stale local-store assumption.",
+                        "score": 0.62,
+                    },
+                },
+                {"name": "invalidate_fact", "arguments": {"id": "fact:bad-store"}},
+            ],
+        },
+    )
+    packet = runtime.build_context_packet(scope_key="discord:guild:1", actor_id="discord_user:subby")
+
+    assert result.opinions == 1
+    assert result.invalidated_facts == 1
+    assert result.ignored_tool_calls == 0
+    assert packet.relationship_state[0]["id"] == "opinion:subby-corrections"
+    assert "fact:bad-store" not in packet.as_prompt_text()
+
+
 def test_grillo_v2_reflection_blocks_user_authored_behavior_rules(tmp_path):
     store = SQLiteGrilloV2Store(tmp_path / "grillo-v2.sqlite3")
     episode = store.append_episode(
