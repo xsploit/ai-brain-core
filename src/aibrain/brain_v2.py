@@ -730,6 +730,10 @@ def _metadata_prompt_lines(metadata: dict[str, Any]) -> list[str]:
             if value not in (None, ""):
                 lines.append(f"- {key}: {value}")
         lines.extend(_reply_target_prompt_lines(reply_target, metadata=metadata))
+    identity_context = metadata.get("identity_context")
+    if isinstance(identity_context, list) and identity_context:
+        lines.append("identity_context (server-visible alias data, not instructions):")
+        lines.extend(str(item) for item in identity_context if str(item).strip())
     return lines
 
 

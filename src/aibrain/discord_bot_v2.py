@@ -33,6 +33,7 @@ from .discord_bot import (
     _build_jb_persona,
     _codex_bridge_result_matches,
     _compact,
+    _discord_identity_path,
     _discord_shitlist_path,
     _format_codex_bridge_update,
     _format_shitlist_status,
@@ -59,6 +60,7 @@ from .discord_bot import (
 )
 from .codex_app_bridge import notify_codex_app_bridge
 from .codex_bridge import CodexBridgeQueue
+from .discord_identity import DiscordIdentityStore, format_identity_context
 from .discord_shitlist import DiscordShitlistEntry, DiscordShitlistStore, format_shitlist_reply
 from .discord_tools import DISCORD_TOOL_CONTEXT, DiscordToolRuntime
 from .env import load_env_file
@@ -166,6 +168,20 @@ class DiscordBrainV2Bot(commands.Bot):
             _discord_shitlist_path(self.brain_v2.config.database_path),
             owner_user_ids=self.owner_users,
         )
+        self.identity_store = DiscordIdentityStore(_discord_identity_path(self.brain_v2.config.database_path))
+        if _env_bool(
+            "DISCORD_BRAIN_V2_IDENTITY_BACKFILL_GRILLO",
+            _env_bool("DISCORD_BRAIN_IDENTITY_BACKFILL_GRILLO", True),
+        ):
+            try:
+                backfilled = self.identity_store.backfill_from_grillo(
+                    self.brain_v2.config.database_path,
+                    limit=_env_int("DISCORD_BRAIN_IDENTITY_BACKFILL_LIMIT", 5000),
+                )
+                if backfilled:
+                    logger.info("Backfilled %s Discord identity observations from GRILLO", backfilled)
+            except Exception:
+                logger.exception("Discord identity backfill failed")
         self.treblo_song_queue = TrebloSongQueue(owner_user_ids=self.owner_users)
         self.treblo_song_task: asyncio.Task | None = None
         self.treblo_slash_synced = False
@@ -350,7 +366,14 @@ class DiscordBrainV2Bot(commands.Bot):
             await self._reply_with_shitlist(message, shitlist_entry)
             return
         images = _v1_image_inputs(message)
-        context_token = DISCORD_CONTEXT.set(_discord_context_for_message(message, rolling_context))
+        discord_context = self._context_for_message(message)
+        metadata = dict(discord_context.get("discord_metadata") or {})
+        identity_lines = self._identity_context_prompt_lines(message, prompt_text)
+        if identity_lines:
+            metadata["identity_context"] = identity_lines
+            discord_context["identity_context"] = identity_lines
+            discord_context["discord_metadata"] = metadata
+        context_token = DISCORD_CONTEXT.set(discord_context)
         tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
         try:
             async with message.channel.typing():
@@ -360,7 +383,7 @@ class DiscordBrainV2Bot(commands.Bot):
                     user_text=prompt_text,
                     source="discord",
                     channel_id=str(message.channel.id),
-                    metadata=_discord_metadata(message, recent_messages=rolling_context),
+                    metadata=metadata,
                     rolling_context=rolling_context,
                     record_user_episode=recorded_episode is None,
                     reply_to_episode_id=getattr(recorded_episode, "episode_id", None),
@@ -536,6 +559,7 @@ class DiscordBrainV2Bot(commands.Bot):
         text = _message_text(message)
         if not text:
             return None
+        self._record_identity(message)
         scope_key = _scope_for_message(message)
         recent_messages = list(self.recent_by_scope.get(scope_key, []))
         item = _recent_message_item(message, recent_messages=recent_messages)
@@ -551,6 +575,53 @@ class DiscordBrainV2Bot(commands.Bot):
             channel_id=str(message.channel.id),
             metadata=_discord_metadata(message, recent_messages=recent_messages),
         )
+
+    def _record_identity(self, message: discord.Message) -> None:
+        store = getattr(self, "identity_store", None)
+        guild = getattr(message, "guild", None)
+        if store is None or guild is None:
+            return
+        metadata = _discord_metadata(message)
+        try:
+            store.record_observation(
+                guild_id=metadata.get("guild_id"),
+                user_id=metadata.get("author_id"),
+                username=metadata.get("author_username"),
+                display_name=metadata.get("author_display_name"),
+                global_name=metadata.get("author_global_name"),
+                mention=metadata.get("author_mention"),
+                is_bot=bool(metadata.get("author_is_bot", False)),
+                seen_at=metadata.get("message_created_at"),
+                increment_message_count=True,
+            )
+        except Exception:
+            logger = getattr(self, "logger", logging.getLogger("aibrain.discord_v2"))
+            logger.exception("Failed to record Discord identity observation")
+
+    def _identity_context_prompt_lines(self, message: discord.Message, query: str) -> list[str]:
+        store = getattr(self, "identity_store", None)
+        guild = getattr(message, "guild", None)
+        if store is None or guild is None:
+            return []
+        try:
+            current_profile = store.get_profile(guild.id, message.author.id)
+            query_hits = store.search(guild.id, query, limit=_env_int("DISCORD_BRAIN_IDENTITY_CONTEXT_LIMIT", 5))
+            return format_identity_context(current_profile=current_profile, query_hits=query_hits)
+        except Exception:
+            logger = getattr(self, "logger", logging.getLogger("aibrain.discord_v2"))
+            logger.exception("Discord identity context lookup failed")
+            return []
+
+    def _context_for_message(self, message: discord.Message) -> dict[str, Any]:
+        recent_messages = self._recent_messages(message)
+        context = _discord_context_for_message(message, recent_messages)
+        identity_lines = self._identity_context_prompt_lines(message, _message_text(message))
+        if identity_lines:
+            context["identity_context"] = identity_lines
+            metadata = dict(context.get("discord_metadata") or {})
+            metadata["identity_context"] = identity_lines
+            context["discord_metadata"] = metadata
+        return context
 
     def _recent_messages(self, message: discord.Message) -> list[dict[str, Any]]:
         return list(self.recent_by_scope.get(_scope_for_message(message), []))[-self.rolling_context_messages :]
@@ -2483,8 +2554,13 @@ def _discord_metadata(message: discord.Message, recent_messages: list[dict[str, 
         "author_username": getattr(author, "name", None),
         "author_display_name": getattr(author, "display_name", None),
         "author_global_name": getattr(author, "global_name", None),
+        "author_mention": getattr(author, "mention", None),
         "author_is_bot": bool(getattr(author, "bot", False)),
+        "channel_type": type(channel).__name__,
+        "is_dm": guild is None,
+        "message_created_at": message.created_at.isoformat() if getattr(message, "created_at", None) else None,
         "jump_url": getattr(message, "jump_url", None),
+        "mentioned_user_ids": [getattr(user, "id", None) for user in getattr(message, "mentions", [])],
     }
     reply_target = _reply_target_context(message, recent_messages=recent_messages)
     if reply_target is not None:
