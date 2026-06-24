@@ -375,11 +375,6 @@ class DiscordBrainV2Bot(commands.Bot):
         images = _v1_image_inputs(message)
         discord_context = self._context_for_message(message)
         metadata = dict(discord_context.get("discord_metadata") or {})
-        identity_lines = self._identity_context_prompt_lines(message, prompt_text)
-        if identity_lines:
-            metadata["identity_context"] = identity_lines
-            discord_context["identity_context"] = identity_lines
-            discord_context["discord_metadata"] = metadata
         context_token = DISCORD_CONTEXT.set(discord_context)
         tool_token = DISCORD_TOOL_CONTEXT.set(DiscordToolRuntime(bot=self, message=message))
         try:
@@ -563,10 +558,10 @@ class DiscordBrainV2Bot(commands.Bot):
         )
 
     def _record_discord_message(self, message: discord.Message):
+        self._record_identity(message)
         text = _message_text(message)
         if not text:
             return None
-        self._record_identity(message)
         scope_key = _scope_for_message(message)
         recent_messages = list(self.recent_by_scope.get(scope_key, []))
         item = _recent_message_item(message, recent_messages=recent_messages)

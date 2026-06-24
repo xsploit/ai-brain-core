@@ -314,16 +314,34 @@ class DiscordIdentityStore:
         try:
             conn = sqlite3.connect(source_path)
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT scope_key, participant_key, author_name, metadata_json, created_at
-                FROM grillo_turns
-                WHERE role = 'user'
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
+            table_names = {
+                str(row["name"])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if "grillo_turns" in table_names:
+                rows = conn.execute(
+                    """
+                    SELECT scope_key, participant_key, author_name, metadata_json, created_at
+                    FROM grillo_turns
+                    WHERE role = 'user'
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            elif "grillo_v2_episodes" in table_names:
+                rows = conn.execute(
+                    """
+                    SELECT scope_key, actor_id AS participant_key, NULL AS author_name, metadata_json, occurred_at AS created_at
+                    FROM grillo_v2_episodes
+                    WHERE source = 'discord'
+                    ORDER BY occurred_at DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+            else:
+                rows = []
         except sqlite3.Error:
             return 0
         finally:
@@ -333,7 +351,12 @@ class DiscordIdentityStore:
             metadata = _json_dict(row["metadata_json"])
             parsed = GUILD_USER_SCOPE_RE.match(str(row["scope_key"] or ""))
             guild_id = metadata.get("guild_id") or (parsed.group("guild_id") if parsed else None)
-            user_id = metadata.get("author_id") or row["participant_key"] or (parsed.group("user_id") if parsed else None)
+            user_id = (
+                metadata.get("author_id")
+                or _discord_user_id_from_actor(row["participant_key"])
+                or row["participant_key"]
+                or (parsed.group("user_id") if parsed else None)
+            )
             if guild_id is None or user_id is None:
                 continue
             profile = self.record_observation(
@@ -396,6 +419,13 @@ def normalize_identity_alias(value: str | None) -> str:
     return cleaned
 
 
+def _discord_user_id_from_actor(value: Any) -> str | None:
+    raw = _optional_str(value)
+    if raw and raw.startswith("discord_user:"):
+        return raw.split(":", 1)[1] or None
+    return None
+
+
 def _identity_aliases(
     *,
     user_id: str,
@@ -428,10 +458,6 @@ def _alias_match_score(query_norm: str, alias_norm: str) -> int:
         return 900
     if padded_alias in padded_query:
         return 700
-    if len(alias_norm) >= 3 and alias_norm in query_norm:
-        return 500
-    if len(query_norm) >= 3 and query_norm in alias_norm:
-        return 300
     return 0
 
 

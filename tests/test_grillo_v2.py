@@ -1849,6 +1849,32 @@ def test_discord_bot_v2_record_message_tracks_last_active_human_channel():
     assert bot.heartbeat_last_channel_id == 333
 
 
+def test_discord_bot_v2_records_identity_for_attachment_only_message(tmp_path):
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.recent_by_scope = defaultdict(lambda: deque(maxlen=32))
+    bot.identity_store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+    bot.brain_v2 = SimpleNamespace(record_message=lambda **kwargs: SimpleNamespace(episode_id="ep1"))
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    channel = SimpleNamespace(id=333, name="bot-chat", guild=guild)
+    message = SimpleNamespace(
+        id=111,
+        author=SimpleNamespace(id=123, bot=False, name="subsect", display_name="Subby", global_name=None, mention="<@123>"),
+        guild=guild,
+        channel=channel,
+        clean_content="",
+        content="",
+        created_at=datetime.now(timezone.utc),
+        jump_url="https://discord.test/111",
+        reference=None,
+    )
+
+    assert bot._record_discord_message(message) is None
+
+    profile = bot.identity_store.get_profile(222, 123)
+    assert profile is not None
+    assert profile.display_name == "Subby"
+
+
 @pytest.mark.asyncio
 async def test_discord_bot_v2_on_message_records_assistant_reply_in_recent(monkeypatch):
     class FakeTyping:
@@ -2534,6 +2560,37 @@ def test_grillo_v2_backfills_v1_turns_candidates_and_identity(tmp_path):
     assert "Subby prefers temporal memory." in prompt
     assert "Npc" in prompt
     assert "SUBSECT" in prompt
+
+
+def test_discord_identity_store_backfills_from_grillo_v2_episodes(tmp_path):
+    db_path = tmp_path / "brain-v2.sqlite3"
+    brain = BrainV2(
+        BrainV2Config(database_path=db_path),
+        json_client=SimpleNamespace(),
+    )
+    brain.record_message(
+        scope_key="discord:guild:222:persona:v2",
+        actor_id="discord_user:123",
+        user_text="Subby is testing V2 identity backfill.",
+        source="discord",
+        channel_id="333",
+        metadata={
+            "guild_id": "222",
+            "author_id": "123",
+            "author_username": "subsect",
+            "author_display_name": "Subby",
+            "author_mention": "<@123>",
+            "author_is_bot": False,
+        },
+    )
+    store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+
+    assert store.backfill_from_grillo(db_path) == 1
+    profile = store.get_profile(222, 123)
+    assert profile is not None
+    assert profile.username == "subsect"
+    assert profile.display_name == "Subby"
+    assert profile.message_count == 0
 
 
 def test_brain_v2_backfill_and_status_formatting(tmp_path):

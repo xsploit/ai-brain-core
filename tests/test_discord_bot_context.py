@@ -561,6 +561,22 @@ def test_discord_identity_store_backfills_aliases_from_grillo_turns(tmp_path):
     assert hits[0].profile.message_count == 0
 
 
+def test_discord_identity_search_does_not_match_substrings(tmp_path):
+    store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+    store.record_observation(
+        guild_id=222,
+        user_id=123,
+        username="ann",
+        display_name="Ann",
+        global_name=None,
+        mention="<@123>",
+        is_bot=False,
+        seen_at="2026-06-19T16:10:00+00:00",
+    )
+
+    assert store.search(222, "planning the next feature") == []
+
+
 def test_discord_prompt_includes_reply_target_context(monkeypatch):
     monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
     channel = _FakeChannel()
