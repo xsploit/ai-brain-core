@@ -1137,6 +1137,121 @@ async def test_brain_v2_can_use_v1_stream_backend_with_tools_and_memory(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_brain_v2_transient_stream_drop_retries_once_without_tools_or_cache(tmp_path):
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+            self.scripts = [
+                RuntimeError("peer closed connection without sending complete message body (incomplete chunked read)"),
+                [BrainEvent("text.delta", {"text": "recovered"})],
+            ]
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            script = self.scripts.pop(0)
+            if isinstance(script, BaseException):
+                raise script
+            for event in script:
+                yield event
+
+    fake_brain = FakeStreamBrain()
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+        response_persona=SimpleNamespace(
+            id="neuro-sama",
+            name="Neuro-sama",
+            instructions="Yappy Neuro persona.",
+            model="deepseek/test",
+            tools=["discord_context"],
+        ),
+        response_tool_names=["discord_context", "tavily_search"],
+        response_memory_policy=SimpleNamespace(top_k=8),
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1:persona:v2",
+        actor_id="discord_user:subby",
+        user_text="search this",
+        response_options={"prompt_cache_key": "scope:v2", "prompt_cache_retention": "10m"},
+    )
+
+    assert response == "recovered"
+    assert len(fake_brain.calls) == 2
+    assert fake_brain.calls[0]["tool_names"] == ["discord_context", "tavily_search"]
+    retry = fake_brain.calls[1]
+    assert retry["tool_names"] == []
+    assert retry["memory_event_text"] == ""
+    assert "prompt_cache_key" not in retry
+    assert "prompt_cache_retention" not in retry
+    assert "Previous model stream disconnected" in retry["prompt"]
+    assert "Do not call tools" in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_empty_stream_retries_once_without_tools_or_cache(tmp_path):
+    class FakeStreamBrain:
+        def __init__(self):
+            self.calls = []
+            self.scripts = [
+                [BrainEvent("response.done", {})],
+                [BrainEvent("text.delta", {"text": "visible reply"})],
+            ]
+
+        async def stream(self, prompt, **kwargs):
+            self.calls.append({"prompt": prompt, **kwargs})
+            for event in self.scripts.pop(0):
+                yield event
+
+    fake_brain = FakeStreamBrain()
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=fake_brain,
+        response_tool_names=["discord_context"],
+        response_memory_policy=SimpleNamespace(top_k=8),
+    )
+
+    response = await brain.respond(
+        scope_key="discord:guild:1:persona:v2",
+        actor_id="discord_user:subby",
+        user_text="don't blank",
+        response_options={"prompt_cache_key": "scope:v2", "prompt_cache_retention": "10m"},
+    )
+
+    assert response == "visible reply"
+    assert len(fake_brain.calls) == 2
+    retry = fake_brain.calls[1]
+    assert retry["tool_names"] == []
+    assert retry["memory_event_text"] == ""
+    assert "prompt_cache_key" not in retry
+    assert "prompt_cache_retention" not in retry
+    assert "Previous model call returned no visible Discord text." in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_brain_v2_empty_stream_after_retry_reports_failure(tmp_path):
+    class FakeStreamBrain:
+        async def stream(self, prompt, **kwargs):
+            yield BrainEvent("response.done", {})
+
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/test"),
+        json_client=SimpleNamespace(),
+        response_brain=FakeStreamBrain(),
+        response_tool_names=["discord_context"],
+    )
+
+    with pytest.raises(RuntimeError, match="model returned an empty response after retry"):
+        await brain.respond(
+            scope_key="discord:guild:1:persona:v2",
+            actor_id="discord_user:subby",
+            user_text="don't blank",
+        )
+
+
+@pytest.mark.asyncio
 async def test_discord_bot_v2_send_final_reply_splits_long_messages():
     events = []
 

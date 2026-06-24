@@ -8,6 +8,7 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
 
+import httpx
 from grillo_v2 import GrilloContextPacket, GrilloEntity, GrilloEpisode, GrilloV2Runtime, SQLiteGrilloV2Store
 from grillo_v2.backfill import GrilloV2BackfillResult, backfill_discord_identity, backfill_grillo_v1
 from grillo_v2.gateway import VERCEL_AI_GATEWAY_BASE_URL, VercelAIGatewayJSONClient
@@ -19,6 +20,38 @@ from .grillo_v2_index import GrilloV2PackageIndex, GrilloV2PackageRecall
 
 
 logger = logging.getLogger("aibrain.brain_v2")
+
+
+def _response_retry_options(response_options: dict[str, Any]) -> dict[str, Any]:
+    retry_options = dict(response_options)
+    retry_options.pop("prompt_cache_key", None)
+    retry_options.pop("prompt_cache_retention", None)
+    retry_options["memory_event_text"] = ""
+    return retry_options
+
+
+def _response_recovery_prompt(prompt: str, note: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        f"[System recovery note: {note} "
+        "Reply now in plain Discord text only. Do not call tools.]"
+    )
+
+
+def _is_transient_response_stream_error(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout)):
+        return True
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "incomplete chunked read",
+            "peer closed connection without sending complete message body",
+            "server disconnected without sending a response",
+            "connection reset by peer",
+            "connection closed",
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -371,12 +404,87 @@ class BrainV2:
         use_memory: Any | None,
         response_options: dict[str, Any],
     ) -> str:
-        buffer = ""
         stream_options = dict(response_options)
         memory_text = user_text.strip() or "discord message"
         stream_options.setdefault("memory_query_text", memory_text)
         stream_options.setdefault("memory_event_text", user_text)
         stream_options.setdefault("history_text", memory_text)
+        try:
+            response = await self._collect_response_brain_stream(
+                prompt=prompt,
+                instructions=instructions,
+                scope_key=scope_key,
+                actor_id=actor_id,
+                images=images,
+                files=files,
+                tool_names=tool_names,
+                use_memory=use_memory,
+                stream_options=stream_options,
+                error_message="brain stream failed",
+            )
+        except Exception as exc:
+            if not _is_transient_response_stream_error(exc):
+                raise
+            logger.warning(
+                "Brain V2 response stream disconnected for scope %s; retrying once without tools/cache: %s",
+                scope_key,
+                exc,
+            )
+            response = await self._collect_response_brain_stream(
+                prompt=_response_recovery_prompt(
+                    prompt,
+                    "Previous model stream disconnected before Discord received a complete reply.",
+                ),
+                instructions=instructions,
+                scope_key=scope_key,
+                actor_id=actor_id,
+                images=images,
+                files=files,
+                tool_names=[],
+                use_memory=use_memory,
+                stream_options=_response_retry_options(stream_options),
+                error_message="brain retry stream failed",
+            )
+        if response.strip():
+            return response.strip()
+        logger.warning(
+            "Brain V2 model returned empty text for scope %s; retrying once without tools/cache",
+            scope_key,
+        )
+        retry_response = await self._collect_response_brain_stream(
+            prompt=_response_recovery_prompt(
+                prompt,
+                "Previous model call returned no visible Discord text.",
+            ),
+            instructions=instructions,
+            scope_key=scope_key,
+            actor_id=actor_id,
+            images=images,
+            files=files,
+            tool_names=[],
+            use_memory=use_memory,
+            stream_options=_response_retry_options(stream_options),
+            error_message="brain retry stream failed",
+        )
+        if not retry_response.strip():
+            raise RuntimeError("model returned an empty response after retry")
+        return retry_response.strip()
+
+    async def _collect_response_brain_stream(
+        self,
+        *,
+        prompt: str,
+        instructions: str,
+        scope_key: str,
+        actor_id: str,
+        images: list[Any],
+        files: list[Any],
+        tool_names: Sequence[str] | None,
+        use_memory: Any | None,
+        stream_options: dict[str, Any],
+        error_message: str,
+    ) -> str:
+        buffer = ""
         async for event in self.response_brain.stream(
             prompt,
             thread_id=_response_thread_id(scope_key, actor_id),
@@ -390,8 +498,8 @@ class BrainV2:
             if event.type == "text.delta":
                 buffer += str(event.data.get("text", ""))
             elif event.type == "error":
-                raise RuntimeError(event.data.get("message", "brain stream failed"))
-        return buffer.strip()
+                raise RuntimeError(event.data.get("message", error_message))
+        return buffer
 
     def _response_stream_persona(self, instructions: str, tool_names: Sequence[str] | None) -> Persona:
         base = self.response_persona
