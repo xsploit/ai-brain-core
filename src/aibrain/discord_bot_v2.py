@@ -98,6 +98,16 @@ DEFAULT_VISION_MODEL_CANDIDATES = (
 logger = logging.getLogger("aibrain.discord_v2")
 
 
+def _is_unknown_message_reference_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        getattr(exc, "status", None) == 400
+        and getattr(exc, "code", None) == 50035
+        and "message_reference" in text
+        and "unknown message" in text
+    )
+
+
 class V2RelationshipGraphView(discord.ui.View):
     def __init__(self, bot: Any, owner_id: int, scope: str, actor_id: str):
         super().__init__(timeout=_env_int("DISCORD_BRAIN_V2_RELATIONSHIP_VIEW_TIMEOUT_SECONDS", 300))
@@ -783,10 +793,19 @@ class DiscordBrainV2Bot(commands.Bot):
         first_sent = None
         for index, chunk in enumerate(chunks):
             if index == 0:
-                first_sent = await message.reply(chunk, mention_author=False)
+                try:
+                    first_sent = await message.reply(chunk, mention_author=False)
+                except discord.HTTPException as exc:
+                    if not _is_unknown_message_reference_error(exc):
+                        raise
+                    logger.warning(
+                        "Reply target disappeared before final response send; falling back to channel send"
+                    )
+                    first_sent = await message.channel.send(chunk)
             else:
                 await message.channel.send(chunk)
         return first_sent
+
 
     def _record_recent_assistant(
         self,

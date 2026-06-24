@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import aibrain.discord_bot as discord_bot_module
+import discord
 from aibrain.discord_bot import (
     DEFAULT_IGNORE_BOTS,
     DEFAULT_HEARTBEAT_TOOL_NAMES,
@@ -50,6 +51,7 @@ from aibrain.discord_bot import (
 )
 from aibrain.codex_bridge import CodexBridgeQueue
 from aibrain.discord_identity import DiscordIdentityStore
+from aibrain.discord_bot_v2 import DiscordBrainV2Bot
 from aibrain.model_catalog import ModelChoice, is_chat_model_id
 from aibrain.tts import TTSAudio, TTSConfig
 
@@ -104,6 +106,16 @@ class _FakeAttachment:
 
     async def read(self, *, use_cached=True):
         return self._data
+
+
+def _unknown_message_reference_error() -> discord.HTTPException:
+    response = SimpleNamespace(status=400, reason="Bad Request")
+    data = {
+        "code": 50035,
+        "message": "Invalid Form Body",
+        "errors": {"message_reference": {"_errors": [{"message": "Unknown message"}]}},
+    }
+    return discord.HTTPException(response, data)
 
 
 class _FakeVoiceAttachment:
@@ -345,6 +357,39 @@ def _fake_message(created_at: datetime):
         _fake_reply=reply,
         _events=events,
     )
+
+
+def test_send_final_reply_falls_back_when_reply_reference_disappears():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    async def vanished_reply(content, *, mention_author=False):
+        raise _unknown_message_reference_error()
+
+    message.reply = vanished_reply
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.max_reply_chars = 1900
+    bot.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+
+    sent = asyncio.run(bot._send_final_reply(message, "still visible"))
+
+    assert sent is None
+    assert message.channel.sent == ["still visible"]
+
+
+def test_v2_send_final_reply_falls_back_when_reply_reference_disappears():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    async def vanished_reply(content, *, mention_author=False):
+        raise _unknown_message_reference_error()
+
+    message.reply = vanished_reply
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.max_reply_chars = 1900
+
+    sent = asyncio.run(bot._send_final_reply(message, "still visible"))
+
+    assert sent is None
+    assert message.channel.sent == ["still visible"]
 
 
 def test_time_context_defaults_to_los_angeles(monkeypatch):
