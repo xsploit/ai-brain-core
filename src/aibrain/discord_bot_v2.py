@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import random
 import re
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,7 +35,6 @@ from .discord_bot import (
     DISCORD_CONTEXT,
     JBPromptAddView,
     LETTA_HEARTBEAT_EVENT_TEXT,
-    ModelSelectView,
     SummaryActionView,
     _apply_discord_tts_env_defaults,
     _build_jb_persona,
@@ -55,6 +55,7 @@ from .discord_bot import (
     _read_codex_bridge_result,
     _recent_messages_prompt_lines,
     _split_discord_text,
+    _truncate_select_text,
     _target_user_id,
     _text_attachment_context as _v1_text_attachment_context,
     _time_context,
@@ -78,6 +79,21 @@ from .treblo_song import TrebloSongError, TrebloSongQueue, TrebloSongRateLimited
 
 
 DEFAULT_DISCORD_V2_PREFIX = "!n2"
+DEFAULT_DISCORD_V2_VISION_MODEL = "google/gemini-3.1-flash-lite"
+V2_MODEL_SELECT_PAGE_SIZE = 25
+DEFAULT_VISION_MODEL_CANDIDATES = (
+    DEFAULT_DISCORD_V2_VISION_MODEL,
+    "google/gemini-3.1-flash-lite-preview",
+    "google/gemini-3-flash",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3.5-flash",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4",
+    "openai/gpt-5.1-mini",
+    "openai/gpt-5-mini",
+    "google/gemini-2.5-flash",
+    "anthropic/claude-sonnet-4.6",
+)
 logger = logging.getLogger("aibrain.discord_v2")
 
 
@@ -132,6 +148,187 @@ class V2RelationshipGraphView(discord.ui.View):
         )
 
 
+class V2ModelSelectView(discord.ui.View):
+    def __init__(
+        self,
+        bot: Any,
+        owner_id: int,
+        choices: list[ModelChoice],
+        *,
+        mode: str = "chat",
+        page: int = 0,
+        query: str = "",
+    ):
+        super().__init__(timeout=_env_int("DISCORD_BRAIN_MODEL_VIEW_TIMEOUT_SECONDS", 240))
+        self.bot_ref = bot
+        self.owner_id = owner_id
+        self.all_choices = _ordered_model_choices_for_v2(_ensure_view_models(choices, bot), bot._current_model())
+        self.mode = "vision" if mode == "vision" else "chat"
+        self.query = query.strip()
+        self.page = max(0, page)
+        self._refresh_items()
+
+    @property
+    def current_model(self) -> str:
+        return self.bot_ref.vision_model if self.mode == "vision" else self.bot_ref._current_model()
+
+    @property
+    def visible_choices(self) -> list[ModelChoice]:
+        choices = self.all_choices
+        if self.mode == "vision":
+            choices = [choice for choice in choices if _model_choice_supports_vision(choice)]
+        if self.query:
+            query = self.query.lower()
+            choices = [
+                choice
+                for choice in choices
+                if query in choice.id.lower()
+                or query in choice.label.lower()
+                or query in str(choice.owned_by or "").lower()
+                or (query in {"vision", "image", "multimodal"} and _model_choice_supports_vision(choice))
+            ]
+        current = self.current_model
+        return _ordered_model_choices_for_v2(choices, current)
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.visible_choices) + V2_MODEL_SELECT_PAGE_SIZE - 1) // V2_MODEL_SELECT_PAGE_SIZE)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the requester can change this model selector.", ephemeral=True)
+        return False
+
+    def message_text(self) -> str:
+        selected = self.current_model or "unset"
+        query = f" search=`{self.query}`" if self.query else ""
+        visible = len(self.visible_choices)
+        return (
+            f"mode: `{self.mode}` current: `{selected}`\n"
+            f"chat: `{self.bot_ref._current_model()}` vision: `{self.bot_ref.vision_model or 'unset'}`\n"
+            f"models: `{visible}/{len(self.all_choices)}` page `{self.page + 1}/{self.total_pages}`{query}"
+        )
+
+    async def select_model(self, interaction: discord.Interaction, index: int) -> None:
+        choices = self.visible_choices
+        if index < 0 or index >= len(choices):
+            await interaction.response.send_message("That model option is no longer available.", ephemeral=True)
+            return
+        selected = choices[index]
+        if self.mode == "vision":
+            self.bot_ref._set_vision_model(selected.id)
+        else:
+            self.bot_ref._set_runtime_model(selected.id)
+        self.page = 0
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    async def previous_page(self, interaction: discord.Interaction) -> None:
+        self.page = max(0, self.page - 1)
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    async def search(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(V2ModelSearchModal(self))
+
+    async def clear_search(self, interaction: discord.Interaction) -> None:
+        self.query = ""
+        self.page = 0
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    async def set_chat_mode(self, interaction: discord.Interaction) -> None:
+        self.mode = "chat"
+        self.page = 0
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    async def set_vision_mode(self, interaction: discord.Interaction) -> None:
+        self.mode = "vision"
+        self.page = 0
+        self._refresh_items()
+        await interaction.response.edit_message(content=self.message_text(), view=self)
+
+    def _refresh_items(self) -> None:
+        self.clear_items()
+        choices = self.visible_choices
+        self.page = min(max(self.page, 0), self.total_pages - 1)
+        start = self.page * V2_MODEL_SELECT_PAGE_SIZE
+        page_choices = choices[start : start + V2_MODEL_SELECT_PAGE_SIZE]
+        if page_choices:
+            self.add_item(V2ModelSelectMenu(self, page_choices, start))
+        self._add_button("Chat", discord.ButtonStyle.primary if self.mode == "chat" else discord.ButtonStyle.secondary, self.set_chat_mode, row=1)
+        self._add_button("Vision", discord.ButtonStyle.primary if self.mode == "vision" else discord.ButtonStyle.secondary, self.set_vision_mode, row=1)
+        self._add_button("Search", discord.ButtonStyle.secondary, self.search, row=1)
+        self._add_button("Clear", discord.ButtonStyle.secondary, self.clear_search, row=1, disabled=not self.query)
+        self._add_button("Prev", discord.ButtonStyle.secondary, self.previous_page, row=2, disabled=self.page == 0)
+        self._add_button("Next", discord.ButtonStyle.secondary, self.next_page, row=2, disabled=self.page >= self.total_pages - 1)
+
+    def _add_button(
+        self,
+        label: str,
+        style: discord.ButtonStyle,
+        callback: Any,
+        *,
+        row: int,
+        disabled: bool = False,
+    ) -> None:
+        button = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+        button.callback = callback
+        self.add_item(button)
+
+
+class V2ModelSelectMenu(discord.ui.Select):
+    def __init__(self, model_view: V2ModelSelectView, choices: list[ModelChoice], start_index: int):
+        self.model_view = model_view
+        current = model_view.current_model
+        options = [
+            discord.SelectOption(
+                label=_truncate_select_text(choice.label or choice.id),
+                value=str(start_index + index),
+                description=_v2_model_choice_description(choice, choice.id == current, mode=model_view.mode),
+                default=choice.id == current,
+            )
+            for index, choice in enumerate(choices)
+        ]
+        super().__init__(
+            placeholder="Choose vision model" if model_view.mode == "vision" else "Choose chat model",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.model_view.select_model(interaction, int(self.values[0]))
+
+
+class V2ModelSearchModal(discord.ui.Modal):
+    def __init__(self, model_view: V2ModelSelectView):
+        super().__init__(title="Search Models", timeout=_env_int("DISCORD_BRAIN_MODEL_SEARCH_TIMEOUT_SECONDS", 180))
+        self.model_view = model_view
+        self.query = discord.ui.TextInput(
+            label="Search",
+            placeholder="gemini, deepseek, vision, flash...",
+            required=False,
+            max_length=80,
+            default=model_view.query,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self.model_view.query = str(self.query.value or "").strip()
+        self.model_view.page = 0
+        self.model_view._refresh_items()
+        await interaction.response.edit_message(content=self.model_view.message_text(), view=self.model_view)
+
+
 class DiscordBrainV2Bot(commands.Bot):
     def __init__(self, *, brain: BrainV2, discord_token: str | None = None):
         intents = discord.Intents.default()
@@ -171,6 +368,19 @@ class DiscordBrainV2Bot(commands.Bot):
         self.send_tts_replies = _env_bool("DISCORD_BRAIN_V2_TTS_REPLIES", _env_bool("DISCORD_BRAIN_TTS_REPLIES", False))
         self.model_cache: dict[str, Any] = {"expires_at": 0.0, "models": None}
         self.model_cache_lock = asyncio.Lock()
+        self.runtime_settings_path = self.brain_v2.config.database_path
+        self.vision_model = (
+            os.getenv("DISCORD_BRAIN_V2_VISION_MODEL")
+            or os.getenv("DISCORD_BRAIN_VISION_MODEL")
+            or os.getenv("AI_GATEWAY_VISION_MODEL")
+            or DEFAULT_DISCORD_V2_VISION_MODEL
+        ).strip()
+        persisted_model = _load_runtime_setting(self.runtime_settings_path, "model")
+        persisted_vision_model = _load_runtime_setting(self.runtime_settings_path, "vision_model")
+        if persisted_model:
+            self._set_runtime_model(persisted_model, persist=False)
+        if persisted_vision_model:
+            self._set_vision_model(persisted_vision_model, persist=False)
         self.shitlist_store = DiscordShitlistStore(
             _discord_shitlist_path(self.brain_v2.config.database_path),
             owner_user_ids=self.owner_users,
@@ -373,6 +583,7 @@ class DiscordBrainV2Bot(commands.Bot):
             await self._reply_with_shitlist(message, shitlist_entry)
             return
         images = _v1_image_inputs(message)
+        response_options = await self._response_options_for_images(images)
         discord_context = self._context_for_message(message)
         metadata = dict(discord_context.get("discord_metadata") or {})
         context_token = DISCORD_CONTEXT.set(discord_context)
@@ -392,6 +603,7 @@ class DiscordBrainV2Bot(commands.Bot):
                     images=images,
                     tool_names=DEFAULT_DISCORD_TOOL_NAMES,
                     use_memory=MemoryPolicy(top_k=_env_int("DISCORD_BRAIN_MEMORY_TOP_K", 8)),
+                    response_options=response_options,
                 )
         finally:
             DISCORD_TOOL_CONTEXT.reset(tool_token)
@@ -469,7 +681,7 @@ class DiscordBrainV2Bot(commands.Bot):
             return str(default_model)
         return str(self.brain_v2.config.model)
 
-    def _set_runtime_model(self, model_id: str) -> None:
+    def _set_runtime_model(self, model_id: str, *, persist: bool = True) -> None:
         model_id = model_id.strip()
         self.brain_v2.config.model = model_id
         if hasattr(self.brain_v2.json_client, "model"):
@@ -483,6 +695,17 @@ class DiscordBrainV2Bot(commands.Bot):
                 self.brain_v2.response_persona = response_persona.model_copy(update={"model": model_id})
             else:
                 setattr(response_persona, "model", model_id)
+        if persist:
+            path = _bot_runtime_settings_path(self)
+            if path is not None:
+                _save_runtime_setting(path, "model", model_id)
+
+    def _set_vision_model(self, model_id: str, *, persist: bool = True) -> None:
+        self.vision_model = model_id.strip()
+        if persist:
+            path = _bot_runtime_settings_path(self)
+            if path is not None:
+                _save_runtime_setting(path, "vision_model", self.vision_model)
 
     async def _load_model_choices(self, *, refresh: bool = False) -> list[ModelChoice]:
         response_brain = getattr(self.brain_v2, "response_brain", None)
@@ -495,10 +718,46 @@ class DiscordBrainV2Bot(commands.Bot):
             cache_lock=self.model_cache_lock,
             ttl_seconds=ttl,
             refresh=refresh,
-            default_models=(self._current_model(), self.brain_v2.config.model),
+            default_models=(self._current_model(), self.brain_v2.config.model, self.vision_model),
             log=logger,
         )
         return _ordered_model_choices_for_v2(choices, self._current_model())
+
+    async def _response_options_for_images(self, images: list[Any]) -> dict[str, Any]:
+        if not images:
+            return {}
+        choices = await self._load_model_choices()
+        current_model = self._current_model()
+        if self.vision_model and _normalize_model_id(self.vision_model) != _normalize_model_id(current_model):
+            logger.info(
+                "Routing %s Discord image attachment(s) through configured vision model %s; current chat model is %s",
+                len(images),
+                self.vision_model,
+                current_model,
+            )
+            return {"model": self.vision_model}
+        current_choice = _find_model_choice(choices, current_model)
+        if current_choice is not None and _model_choice_supports_vision(current_choice):
+            return {}
+        vision_model = _select_vision_model(
+            choices,
+            current_model=current_model,
+            configured_model=self.vision_model,
+        )
+        if not vision_model or vision_model == current_model:
+            if current_choice is not None:
+                logger.warning(
+                    "Discord image attachment received but model %s metadata does not advertise vision and no fallback vision model is available",
+                    current_model,
+                )
+            return {}
+        logger.info(
+            "Routing %s Discord image attachment(s) through vision model %s; current model %s lacks vision metadata",
+            len(images),
+            vision_model,
+            current_model,
+        )
+        return {"model": vision_model}
 
     async def _maybe_send_tts_reply(self, message: discord.Message, text: str) -> None:
         if not self.send_tts_replies or not self.discord_token or not text.strip():
@@ -1227,7 +1486,7 @@ def _help_command(bot: DiscordBrainV2Bot):
                     "`!remember <text>` - pin a manual GRILLO v2 memory for you",
                     "`!recall <query>` - search scoped GRILLO v2 facts, memory, and opinions",
                     "`!ping @user` - tag someone with a short hello",
-                    "`!model` / `!model set/info/export/refresh` - admin/owner model control",
+                    "`!model` / `!model set/vision/info/export/refresh` - admin/owner model control",
                     "`!jb <message>` - separate one-shot JB path with no memory/tools",
                     "`!say <text>` - send a Piper Discord voice clip",
                     "`!tts` / `!tts toggle` / `!tts voices` / `!tts voice <id>` - voice clip controls",
@@ -1439,7 +1698,25 @@ def _model_control_group(bot: DiscordBrainV2Bot):
         known = {choice.id for choice in choices}
         bot._set_runtime_model(model_id)
         note = "" if model_id in known else " (manual id; not in cached model metadata)"
-        await ctx.reply(f"model set to `{model_id}`{note}", mention_author=False)
+        await ctx.reply(f"model set to `{model_id}`{note}; persisted", mention_author=False)
+
+    @model_control.command(name="vision")
+    async def model_vision(ctx: commands.Context, *, model_id: str = "") -> None:
+        if not await _require_admin_or_owner(bot, ctx, "vision model control"):
+            return
+        model_id = model_id.strip()
+        if not model_id:
+            await _send_model_picker(bot, ctx, mode="vision")
+            return
+        choices = await bot._load_model_choices()
+        choice = _find_model_choice(choices, model_id)
+        note = ""
+        if choice is None:
+            note = " (manual id; not in cached model metadata)"
+        elif not _model_choice_supports_vision(choice):
+            note = " (warning: cached metadata does not advertise vision)"
+        bot._set_vision_model(model_id)
+        await ctx.reply(f"vision model set to `{model_id}`{note}; persisted", mention_author=False)
 
     @model_control.command(name="info")
     async def model_info(ctx: commands.Context, *, model_id: str = "") -> None:
@@ -1452,14 +1729,20 @@ def _model_control_group(bot: DiscordBrainV2Bot):
     return model_control
 
 
-async def _send_model_picker(bot: DiscordBrainV2Bot, ctx: commands.Context, *, refresh: bool = False) -> None:
+async def _send_model_picker(
+    bot: DiscordBrainV2Bot,
+    ctx: commands.Context,
+    *,
+    refresh: bool = False,
+    mode: str = "chat",
+) -> None:
     if not await _require_admin_or_owner(bot, ctx, "model control"):
         return
     choices = await bot._load_model_choices(refresh=refresh)
     if not choices:
         await ctx.reply("no model choices are available.", mention_author=False)
         return
-    view = ModelSelectView(bot, ctx.author.id, choices)
+    view = V2ModelSelectView(bot, ctx.author.id, choices, mode=mode)
     await ctx.reply(view.message_text(), view=view, mention_author=False)
 
 
@@ -1485,6 +1768,166 @@ async def _send_model_metadata_export(bot: DiscordBrainV2Bot, ctx: commands.Cont
     )
 
 
+def _load_runtime_setting(path: Path, key: str) -> str | None:
+    try:
+        with sqlite3.connect(path) as conn:
+            _ensure_runtime_settings_table(conn)
+            row = conn.execute(
+                "SELECT value FROM discord_brain_v2_runtime_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.warning("Could not load Discord Brain v2 runtime setting %s", key, exc_info=True)
+        return None
+    if row is None:
+        return None
+    value = str(row[0] or "").strip()
+    return value or None
+
+
+def _bot_runtime_settings_path(bot: Any) -> Path | None:
+    path = getattr(bot, "runtime_settings_path", None)
+    if path is not None:
+        return Path(path)
+    config = getattr(getattr(bot, "brain_v2", None), "config", None)
+    path = getattr(config, "database_path", None)
+    return Path(path) if path is not None else None
+
+
+def _save_runtime_setting(path: Path, key: str, value: str) -> None:
+    try:
+        with sqlite3.connect(path) as conn:
+            _ensure_runtime_settings_table(conn)
+            conn.execute(
+                """
+                INSERT INTO discord_brain_v2_runtime_settings(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value.strip(), datetime.now(timezone.utc).isoformat()),
+            )
+    except sqlite3.Error:
+        logger.warning("Could not save Discord Brain v2 runtime setting %s", key, exc_info=True)
+
+
+def _ensure_runtime_settings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discord_brain_v2_runtime_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _find_model_choice(choices: list[ModelChoice], model_id: str) -> ModelChoice | None:
+    normalized = _normalize_model_id(model_id)
+    for choice in choices:
+        if _normalize_model_id(choice.id) == normalized:
+            return choice
+    return None
+
+
+def _ensure_view_models(choices: list[ModelChoice], bot: Any) -> list[ModelChoice]:
+    by_id = {choice.id: choice for choice in choices}
+    for model_id, owned_by in (
+        (bot._current_model(), "current"),
+        (getattr(getattr(bot, "brain_v2", None), "config", SimpleNamespace(model="")).model, "configured"),
+        (getattr(bot, "vision_model", ""), "vision"),
+    ):
+        model_id = str(model_id or "").strip()
+        if model_id and model_id not in by_id:
+            by_id[model_id] = ModelChoice(id=model_id, label=model_id, owned_by=owned_by)
+    return sorted(by_id.values(), key=lambda choice: choice.id.lower())
+
+
+def _v2_model_choice_description(choice: ModelChoice, is_current: bool, *, mode: str) -> str | None:
+    metadata = choice.metadata or {}
+    parts: list[str] = []
+    if is_current:
+        parts.append("current")
+    if _model_choice_supports_vision(choice):
+        parts.append("vision")
+    elif mode == "vision":
+        parts.append("no vision metadata")
+    owned_by = choice.owned_by or metadata.get("owned_by") or metadata.get("provider")
+    if owned_by:
+        parts.append(str(owned_by))
+    for key in ("context_window", "max_tokens", "max_output_tokens"):
+        value = metadata.get(key)
+        if value:
+            parts.append(f"{key} {value}")
+            break
+    return _truncate_select_text(" | ".join(parts), 100) if parts else None
+
+
+def _model_choice_supports_vision(choice: ModelChoice) -> bool:
+    metadata = choice.metadata or {}
+    if _metadata_has_vision(metadata):
+        return True
+    combined = " ".join(str(value) for value in (choice.id, choice.label, choice.owned_by or ""))
+    return _text_has_vision_marker(combined)
+
+
+def _select_vision_model(
+    choices: list[ModelChoice],
+    *,
+    current_model: str,
+    configured_model: str,
+) -> str | None:
+    configured = configured_model.strip()
+    if configured:
+        return configured
+    by_id = {_normalize_model_id(choice.id): choice for choice in choices}
+    current = _normalize_model_id(current_model)
+    for candidate in DEFAULT_VISION_MODEL_CANDIDATES:
+        choice = by_id.get(_normalize_model_id(candidate))
+        if choice is not None and _model_choice_supports_vision(choice):
+            return choice.id
+    for choice in choices:
+        if _normalize_model_id(choice.id) != current and _model_choice_supports_vision(choice):
+            return choice.id
+    return None
+
+
+def _metadata_has_vision(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return _text_has_vision_marker(value)
+    if isinstance(value, (list, tuple, set)):
+        return any(_metadata_has_vision(item) for item in value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in {"tags", "capabilities", "modalities", "input_modalities", "supported_modalities"}:
+                if _metadata_has_vision(item):
+                    return True
+            elif isinstance(item, bool) and item and key_text in {"vision", "image", "image_input", "images"}:
+                return True
+            elif isinstance(item, (dict, list, tuple, set)):
+                if _metadata_has_vision(item):
+                    return True
+        return False
+    return False
+
+
+def _text_has_vision_marker(text: str) -> bool:
+    normalized = text.strip().lower().replace("_", "-")
+    if not normalized:
+        return False
+    tokens = re.split(r"[^a-z0-9-]+", normalized)
+    return "vision" in tokens or "image" in tokens or "image-input" in tokens or "multimodal" in tokens
+
+
+def _normalize_model_id(model_id: str) -> str:
+    return model_id.strip().lower()
+
+
 async def _send_model_info(bot: DiscordBrainV2Bot, ctx: commands.Context, *, model_id: str | None = None) -> None:
     if not await _require_admin_or_owner(bot, ctx, "model info"):
         return
@@ -1499,8 +1942,11 @@ async def _send_model_info(bot: DiscordBrainV2Bot, ctx: commands.Context, *, mod
         f"id: `{choice.id}`",
         f"owned_by: `{choice.owned_by or metadata.get('owned_by') or 'unknown'}`",
         f"created: `{choice.created or metadata.get('created') or 'unknown'}`",
+        f"active_chat_model: `{'yes' if choice.id == bot._current_model() else 'no'}`",
+        f"active_vision_model: `{'yes' if choice.id == bot.vision_model else 'no'}`",
     ]
-    for key in ("provider", "context_window", "max_output_tokens", "input_modalities", "output_modalities"):
+    lines.append(f"vision: `{'yes' if _model_choice_supports_vision(choice) else 'no'}`")
+    for key in ("provider", "context_window", "max_output_tokens", "max_tokens", "tags", "input_modalities", "output_modalities"):
         if key in metadata:
             lines.append(f"{key}: `{metadata[key]}`")
     await _reply_text_chunks(ctx, "\n".join(lines), limit=bot.max_reply_chars)

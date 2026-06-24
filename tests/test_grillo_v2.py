@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
@@ -8,6 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 import aibrain.discord_bot_v2 as discord_bot_v2_module
@@ -19,6 +20,7 @@ from aibrain.model_catalog import ModelChoice
 from aibrain.types import BrainEvent
 from aibrain.discord_bot_v2 import (
     DiscordBrainV2Bot,
+    V2ModelSelectView,
     V2RelationshipGraphView,
     _append_readable_attachment_context,
     _complete_jb_turn,
@@ -35,12 +37,16 @@ from aibrain.discord_bot_v2 import (
     _grillo_control_group,
     _grillo_v2_slot_documents,
     _ladybug_control_group,
+    _load_runtime_setting,
+    _model_choice_supports_vision,
     _recent_message_item,
     _relationship_v2_embed,
     _relationship_v2_snapshot,
     _reply_text_chunks,
     _scope_for_message,
     _send_tts_voice_message,
+    _select_vision_model,
+    _save_runtime_setting,
     build_brain_v2,
 )
 from grillo_v2 import (
@@ -1567,6 +1573,132 @@ def test_discord_bot_v2_package_memory_sync_can_be_explicitly_disabled(tmp_path,
     assert brain.package_index is not None
 
 
+def test_discord_bot_v2_model_metadata_detects_vision_tags():
+    flash = ModelChoice(
+        id="deepseek/deepseek-v4-flash",
+        label="deepseek/deepseek-v4-flash",
+        metadata={"tags": ["reasoning", "tool-use", "file-input", "vision"]},
+    )
+    pro = ModelChoice(
+        id="deepseek/deepseek-v4-pro",
+        label="deepseek/deepseek-v4-pro",
+        metadata={"tags": ["reasoning", "tool-use", "file-input"]},
+    )
+    image_input = ModelChoice(
+        id="vendor/model",
+        label="vendor/model",
+        metadata={"input_modalities": ["text", "image"]},
+    )
+
+    assert _model_choice_supports_vision(flash) is True
+    assert _model_choice_supports_vision(pro) is False
+    assert _model_choice_supports_vision(image_input) is True
+
+
+def test_discord_bot_v2_selects_configured_or_metadata_vision_fallback():
+    choices = [
+        ModelChoice(
+            id="deepseek/deepseek-v4-pro",
+            label="deepseek/deepseek-v4-pro",
+            metadata={"tags": ["reasoning", "tool-use", "file-input"]},
+        ),
+        ModelChoice(
+            id="openai/gpt-5.4-mini",
+            label="openai/gpt-5.4-mini",
+            metadata={"tags": ["vision", "tool-use"]},
+        ),
+    ]
+
+    assert (
+        _select_vision_model(
+            choices,
+            current_model="deepseek/deepseek-v4-pro",
+            configured_model="",
+        )
+        == "openai/gpt-5.4-mini"
+    )
+    assert (
+        _select_vision_model(
+            choices,
+            current_model="deepseek/deepseek-v4-pro",
+            configured_model="google/gemini-3-pro",
+        )
+        == "google/gemini-3-pro"
+    )
+
+
+def test_discord_bot_v2_model_picker_uses_discord_max_page_size():
+    bot = SimpleNamespace(
+        _current_model=lambda: "provider/model-00",
+        vision_model="provider/model-vision",
+        brain_v2=SimpleNamespace(config=SimpleNamespace(model="provider/model-00")),
+    )
+    choices = [
+        ModelChoice(id=f"provider/model-{index:02d}", label=f"provider/model-{index:02d}")
+        for index in range(30)
+    ]
+
+    view = V2ModelSelectView(bot, 123, choices)
+    selects = [item for item in view.children if isinstance(item, discord.ui.Select)]
+
+    assert view.total_pages == 2
+    assert len(selects) == 1
+    assert len(selects[0].options) == 25
+
+
+def test_discord_bot_v2_vision_picker_filters_to_vision_models_and_keeps_configured_model():
+    bot = SimpleNamespace(
+        _current_model=lambda: "deepseek/deepseek-v4-pro",
+        vision_model="google/gemini-3.1-flash-lite",
+        brain_v2=SimpleNamespace(config=SimpleNamespace(model="deepseek/deepseek-v4-pro")),
+    )
+    choices = [
+        ModelChoice(
+            id="deepseek/deepseek-v4-pro",
+            label="deepseek/deepseek-v4-pro",
+            metadata={"tags": ["reasoning", "tool-use"]},
+        ),
+        ModelChoice(
+            id="google/gemini-3.1-flash-lite",
+            label="google/gemini-3.1-flash-lite",
+            metadata={"tags": ["vision", "tool-use"]},
+        ),
+    ]
+
+    view = V2ModelSelectView(bot, 123, choices, mode="vision")
+
+    assert [choice.id for choice in view.visible_choices] == ["google/gemini-3.1-flash-lite"]
+    assert view.current_model == "google/gemini-3.1-flash-lite"
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_v2_routes_images_to_configured_vision_model_first():
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.vision_model = "google/gemini-3.1-flash-lite"
+    bot.brain_v2 = SimpleNamespace(
+        config=SimpleNamespace(model="deepseek/deepseek-v4-flash"),
+        response_persona=SimpleNamespace(model="deepseek/deepseek-v4-flash"),
+    )
+
+    async def load_model_choices(*, refresh=False):
+        return [
+            ModelChoice(
+                id="deepseek/deepseek-v4-flash",
+                label="deepseek/deepseek-v4-flash",
+                metadata={"tags": ["vision", "tool-use"]},
+            ),
+            ModelChoice(
+                id="google/gemini-3.1-flash-lite",
+                label="google/gemini-3.1-flash-lite",
+                metadata={"tags": ["vision", "tool-use"]},
+            ),
+        ]
+
+    bot._load_model_choices = load_model_choices
+
+    assert await bot._response_options_for_images([object()]) == {"model": "google/gemini-3.1-flash-lite"}
+
+
 def test_discord_bot_v2_helpers_make_server_scope_and_metadata():
     guild = SimpleNamespace(id=222, name="Test Guild")
     channel = SimpleNamespace(id=333, name="bot-chat")
@@ -2202,6 +2334,46 @@ def test_discord_bot_v2_owner_ids_include_v1_default_with_env_overrides(monkeypa
     assert bot.treblo_song_queue.owner_user_ids == bot.owner_users
 
 
+def test_discord_bot_v2_runtime_model_updates_v2_v1_and_persists(tmp_path):
+    response_brain = SimpleNamespace(config=SimpleNamespace(default_model="deepseek/deepseek-v4-flash"))
+    response_persona = SimpleNamespace(model="deepseek/deepseek-v4-flash")
+    brain = BrainV2(
+        BrainV2Config(database_path=tmp_path / "brain-v2.sqlite3", model="deepseek/deepseek-v4-flash"),
+        json_client=SimpleNamespace(model="deepseek/deepseek-v4-flash"),
+        response_brain=response_brain,
+        response_persona=response_persona,
+    )
+    bot = DiscordBrainV2Bot(brain=brain)
+
+    bot._set_runtime_model("google/gemini-3.1-flash-lite")
+
+    assert brain.config.model == "google/gemini-3.1-flash-lite"
+    assert brain.json_client.model == "google/gemini-3.1-flash-lite"
+    assert response_brain.config.default_model == "google/gemini-3.1-flash-lite"
+    assert response_persona.model == "google/gemini-3.1-flash-lite"
+    assert _load_runtime_setting(tmp_path / "brain-v2.sqlite3", "model") == "google/gemini-3.1-flash-lite"
+
+
+def test_discord_bot_v2_runtime_settings_restore_models_on_init(tmp_path, monkeypatch):
+    db_path = tmp_path / "brain-v2.sqlite3"
+    _save_runtime_setting(db_path, "model", "deepseek/deepseek-v4-pro")
+    _save_runtime_setting(db_path, "vision_model", "google/gemini-3.1-flash-lite")
+    monkeypatch.setenv("DISCORD_BRAIN_V2_VISION_MODEL", "openai/gpt-5.4-mini")
+    response_brain = SimpleNamespace(config=SimpleNamespace(default_model="deepseek/deepseek-v4-flash"))
+    brain = BrainV2(
+        BrainV2Config(database_path=db_path, model="deepseek/deepseek-v4-flash"),
+        json_client=SimpleNamespace(model="deepseek/deepseek-v4-flash"),
+        response_brain=response_brain,
+    )
+
+    bot = DiscordBrainV2Bot(brain=brain)
+
+    assert bot._current_model() == "deepseek/deepseek-v4-pro"
+    assert brain.json_client.model == "deepseek/deepseek-v4-pro"
+    assert response_brain.config.default_model == "deepseek/deepseek-v4-pro"
+    assert bot.vision_model == "google/gemini-3.1-flash-lite"
+
+
 def test_discord_bot_v2_members_intent_defaults_to_v1_enabled(monkeypatch, tmp_path):
     monkeypatch.delenv("DISCORD_BRAIN_V2_MEMBERS_INTENT", raising=False)
     bot = DiscordBrainV2Bot(
@@ -2307,8 +2479,9 @@ def test_discord_bot_v2_runtime_model_set_updates_all_backends():
     assert response_persona.model == "deepseek/new-model"
 
 
-def test_discord_bot_v2_uses_v1_model_select_view():
+def test_discord_bot_v2_uses_v2_model_select_view():
     bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.vision_model = "openai/vision"
     bot.brain_v2 = SimpleNamespace(
         config=SimpleNamespace(model="deepseek/current"),
         json_client=SimpleNamespace(model="deepseek/current"),
@@ -2320,10 +2493,10 @@ def test_discord_bot_v2_uses_v1_model_select_view():
         ModelChoice(id="deepseek/current", label="deepseek/current"),
     ]
 
-    view = discord_bot_v2_module.ModelSelectView(bot, owner_id=123, choices=choices)
+    view = discord_bot_v2_module.V2ModelSelectView(bot, owner_id=123, choices=choices)
 
-    assert "current model: `deepseek/current`" in view.message_text()
-    assert view.choices[0].id == "deepseek/current"
+    assert "mode: `chat` current: `deepseek/current`" in view.message_text()
+    assert view.visible_choices[0].id == "deepseek/current"
 
 
 def test_discord_bot_v2_formats_grillo_diagnostics():
