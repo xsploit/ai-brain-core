@@ -154,6 +154,37 @@ def test_piper_env_overrides(monkeypatch):
     assert str(merged.piper_model_path).replace("\\", "/") == "C:/override/voice.onnx"
 
 
+def test_aibrain_tts_voice_wins_over_generic_piper_model_env(tmp_path, monkeypatch):
+    root = tmp_path / "voices"
+    root.mkdir()
+    preferred = root / "preferred.onnx"
+    preferred_config = root / "preferred.onnx.json"
+    generic = root / "generic.onnx"
+    generic_config = root / "generic.onnx.json"
+    preferred.write_bytes(b"model")
+    preferred_config.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    generic.write_bytes(b"model")
+    generic_config.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    monkeypatch.setenv("AIBRAIN_TTS_VOICE_ROOTS", str(root))
+    monkeypatch.setenv("AIBRAIN_TTS_VOICE", "preferred")
+    monkeypatch.setenv("PIPER_MODEL", str(generic))
+    monkeypatch.delenv("PIPER_CONFIG", raising=False)
+
+    config = TTSConfig(provider="null")
+    merged = with_env_overrides(
+        TTSConfig(
+            provider="null",
+            piper_model_path=generic,
+            piper_config_path=generic_config,
+        )
+    )
+
+    assert config.piper_model_path == preferred
+    assert config.piper_config_path == preferred_config
+    assert merged.piper_model_path == preferred
+    assert merged.piper_config_path == preferred_config
+
+
 def test_default_piper_config_matches_explicit_model_env(tmp_path, monkeypatch):
     model = tmp_path / "voice.onnx"
     config_path = tmp_path / "voice.onnx.json"
@@ -186,8 +217,10 @@ def test_tts_defaults_do_not_use_user_specific_paths(monkeypatch):
     config = TTSConfig(provider="null")
 
     assert config.piper_executable_path is None
-    assert config.piper_model_path is None
-    assert config.piper_config_path is None
+    if config.piper_model_path is not None:
+        assert "voices" in str(config.piper_model_path)
+    if config.piper_config_path is not None:
+        assert "voices" in str(config.piper_config_path)
     assert config.piper_espeak_data_path is None
 
 
@@ -207,6 +240,11 @@ def test_tts_provider_env_controls_enabled(monkeypatch):
 def test_piper_idle_timeout_env_override(monkeypatch):
     monkeypatch.setenv("PIPER_PROCESS_IDLE_TIMEOUT", "0.7")
     assert TTSConfig(provider="null").process_idle_timeout == 0.7
+
+
+def test_piper_synthesis_idle_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("PIPER_PROCESS_SYNTHESIS_IDLE_TIMEOUT", "1.25")
+    assert TTSConfig(provider="null").process_synthesis_idle_timeout == 1.25
 
 
 def test_discover_piper_voices_uses_env_roots_and_manifests(tmp_path, monkeypatch):
@@ -243,6 +281,45 @@ def test_discover_piper_voices_uses_env_roots_and_manifests(tmp_path, monkeypatc
     assert {"manifest", "rooted"} <= slugs
 
 
+def test_discover_piper_voices_includes_bundled_root(tmp_path, monkeypatch):
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    model = bundled / "bundled_voice.onnx"
+    config_path = bundled / "bundled_voice.onnx.json"
+    model.write_bytes(b"model")
+    config_path.write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    monkeypatch.delenv("AIBRAIN_TTS_MANIFESTS", raising=False)
+    monkeypatch.delenv("AIBRAIN_TTS_VOICE_ROOTS", raising=False)
+    monkeypatch.setattr(tts_module, "_bundled_piper_voice_root", lambda: bundled)
+
+    voices = tts_module.discover_piper_voices(refresh=True)
+
+    assert {voice.slug for voice in voices} == {"bundled_voice"}
+    assert voices[0].config == config_path
+
+
+def test_discover_piper_voices_keeps_duplicate_model_stems(tmp_path):
+    root = tmp_path / "voices"
+    first = root / "first_dojo" / "tts_voices" / "same"
+    second = root / "second_dojo" / "tts_voices" / "same"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    for directory in [first, second]:
+        model = directory / "en_US-same-medium.onnx"
+        model.write_bytes(b"model")
+        model.with_suffix(model.suffix + ".json").write_text(
+            '{"audio":{"sample_rate":22050}}',
+            encoding="utf-8",
+        )
+
+    voices = tts_module.discover_piper_voices(search_roots=[root], refresh=True)
+
+    assert [voice.slug for voice in voices] == [
+        "same",
+        "second_dojo_same_same",
+    ]
+
+
 def test_discover_piper_voices_caches_and_refreshes_env_scan(tmp_path, monkeypatch):
     model = tmp_path / "voice.onnx"
     config_path = tmp_path / "voice.onnx.json"
@@ -264,9 +341,9 @@ def test_discover_piper_voices_caches_and_refreshes_env_scan(tmp_path, monkeypat
     cached = tts_module.discover_piper_voices()
     refreshed = tts_module.discover_piper_voices(refresh=True)
 
-    assert first[0].label == "First"
-    assert cached[0].label == "First"
-    assert refreshed[0].label == "Second"
+    assert {voice.slug: voice.label for voice in first}["voice"] == "First"
+    assert {voice.slug: voice.label for voice in cached}["voice"] == "First"
+    assert {voice.slug: voice.label for voice in refreshed}["voice"] == "Second"
 
 
 class FakePiperProcess(PiperProcessTTS):
@@ -287,6 +364,11 @@ class FakePiperProcess(PiperProcessTTS):
             text=text,
             voice=str(runtime_config.piper_model_path) if runtime_config.piper_model_path else None,
         )
+
+    async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
+        runtime_config = config or self.config
+        self.used_models.append(runtime_config.piper_model_path)
+        return text.encode()
 
 
 class PartialFailurePiperProcess(PiperProcessTTS):
@@ -375,6 +457,28 @@ class ConcurrentFakePiperProcess(PiperProcessTTS):
             self.active -= 1
 
 
+class RecordingFreshStreamPiperProcess(PiperProcessTTS):
+    def __init__(self, config: TTSConfig | None = None):
+        super().__init__(config or TTSConfig(provider="null"))
+        self.calls = []
+        self.idle_timeouts = []
+
+    async def _stream_process(self, text: str, *, config=None, start_index: int = 0):
+        runtime_config = config or self.config
+        self.calls.append(text)
+        self.idle_timeouts.append(runtime_config.process_idle_timeout)
+        yield TTSChunk(
+            audio=text.encode(),
+            sample_rate=runtime_config.resolved_sample_rate(),
+            index=start_index,
+            final=True,
+            text=text,
+        )
+
+    async def _run_piper(self, text: str, *, output_raw: bool, config=None) -> bytes:
+        raise AssertionError("full synth should use the fresh streaming Piper path")
+
+
 @pytest.mark.asyncio
 async def test_piper_process_stream_splits_multi_sentence_text():
     provider = FakePiperProcess()
@@ -425,6 +529,25 @@ async def test_piper_process_locks_per_voice(tmp_path):
     await asyncio.gather(first, second)
 
     assert provider.max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_piper_process_synthesize_uses_fresh_streaming_process():
+    provider = RecordingFreshStreamPiperProcess(
+        TTSConfig(
+            provider="null",
+            process_idle_timeout=0.05,
+            process_synthesis_idle_timeout=0.6,
+        )
+    )
+
+    first = await provider.synthesize("previous response")
+    second = await provider.synthesize("new response")
+
+    assert provider.calls == ["previous response", "new response"]
+    assert provider.idle_timeouts == [0.6, 0.6]
+    assert first.audio == b"previous response"
+    assert second.audio == b"new response"
 
 
 @pytest.mark.asyncio

@@ -177,7 +177,7 @@ async def test_brain_warmup_warms_existing_vad(tmp_path):
 @pytest.mark.asyncio
 async def test_voice_stream_transcribes_then_runs_brain_and_tts(tmp_path):
     brain = Brain(
-        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", openai_stream_transport="http"),
         client=FakeClient(),
         stt_provider=FakeSTT(),
         tts_provider=FakeTTS(TTSConfig(provider="null")),
@@ -224,7 +224,7 @@ def test_stt_http_endpoint_uses_brain_provider(tmp_path):
 
 def test_voice_websocket_endpoint_runs_full_loop(tmp_path):
     brain = Brain(
-        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", openai_stream_transport="http"),
         client=FakeClient(),
         stt_provider=FakeSTT(),
         tts_provider=FakeTTS(TTSConfig(provider="null")),

@@ -45,6 +45,25 @@ async def test_memory_insert_search_forget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_memory_search_tolerates_qualitative_importance(tmp_path):
+    store = SQLiteMemoryStore(
+        tmp_path / "brain.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=64),
+        dimensions=64,
+    )
+    record = await store.remember("Qualitative importance memory", scope="global")
+    store._connect().execute(
+        "UPDATE brain_memories SET importance = ? WHERE id = ?",
+        ("high", record.id),
+    )
+
+    results = await store.search("Qualitative importance", top_k=1)
+
+    assert results[0].id == record.id
+    assert results[0].importance == 0.8
+
+
+@pytest.mark.asyncio
 async def test_memory_policy_reuses_one_query_embedding_across_scopes(tmp_path):
     provider = CountingEmbeddingProvider(dimensions=64)
     store = SQLiteMemoryStore(

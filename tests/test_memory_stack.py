@@ -1,0 +1,1303 @@
+import asyncio
+import importlib.util
+import json
+from types import SimpleNamespace
+import pytest
+
+from aibrain import Brain, BrainConfig, MemoryStackConfig
+from aibrain.embeddings import HashEmbeddingProvider
+from aibrain.memory_stack import (
+    GRILLOMemoryWorker,
+    GrilloCandidate,
+    GrilloRuntime,
+    GrilloDiaryEntry,
+    GrilloRelationshipProfile,
+    GraphQuery,
+    HybridMemoryStack,
+    HybridRetriever,
+    RawEvent,
+    RecallHit,
+    RecallItem,
+    SQLiteGrilloStore,
+    SQLiteRawEventStore,
+    SQLiteTemporalGraphStore,
+    SQLiteVectorRecallStore,
+    LadybugGraphMemoryStore,
+    TemporalFact,
+    TurboVecRecallStore,
+)
+from aibrain.memory_stack.grillo import (
+    GrilloContextPacket,
+    GrilloTurn,
+    _build_backend_beat_prompt,
+    _build_backend_worker_system_prompt,
+)
+from aibrain.memory_stack.stack import _recover_ladybug_wal
+
+
+WEBWAIFU_GRILLO_WORKER_SYSTEM_PROMPT = "\n".join(
+    [
+        "You are the private backend GRILLO memory worker for Web Waifu 4.",
+        "You are not writing a user-facing chat reply.",
+        "Return only JSON matching the schema.",
+        "Use worker tools by returning toolCalls. Do not claim a write happened unless you call a write tool.",
+        "Extract durable memory only when the transcript contains a preference, fact, goal, boundary, bond signal, or ongoing thread.",
+        "Write diary entries only when the exchange meaningfully changes mood, relationship, goals, or stream context.",
+        "Diary personal_thought is private first-person avatar reflection, not a mechanical receipt.",
+        "Reflection beats synthesize higher-order insight from clusters of turns and memories; they do not restate isolated facts.",
+        "A useful reflection explains what pattern is emerging, what changed emotionally or relationally, and how future replies should adapt.",
+        "Use memory_write only for grounded consolidated slots such as open_threads, ongoing_threads, preferences, boundaries, verified_facts, or relationship_state.",
+        "",
+        "Available tools:",
+        '- core.worker_memory_read args: {"block_name"?: string}',
+        '- core.worker_memory_search args: {"query": string, "limit"?: number}',
+        '- core.worker_candidate_list args: {"limit"?: number, "type_filter"?: string}',
+        '- core.worker_candidate_write args: {"type": "preference|fact|goal|boundary|bond_signal|thread", "content": string, "summary": string, "confidence": number, "tags"?: string[], "source_turn_ids"?: string[]}',
+        '- core.worker_diary_write args: {"summary": string, "personal_thought": string, "tags"?: string[], "beat_type"?: string, "source_turn_ids"?: string[]}',
+        '- core.worker_memory_write args: {"block_name": string, "items": string[], "operation": "merge|replace", "reason"?: string, "source_candidate_ids"?: string[]}',
+        '- core.worker_profile_patch args: {"field": "tone_preferences|interaction_style|boundaries|active_threads", "operation": "add|remove", "value": string}',
+        '- core.worker_emotion_read args: {}',
+        '- core.worker_emotion_update args: {"intensities": {"emotion_name": number}, "operation"?: "merge|replace", "last_signal_source"?: string}',
+        '- core.worker_memory_insert_archival args: {"text": string}',
+        "",
+        "First read or search memory if needed. Then call write tools. When finished, return done=true and toolCalls=[].",
+    ]
+)
+
+
+class FakeConversations:
+    async def create(self, **kwargs):
+        return SimpleNamespace(id="conv_memory")
+
+
+class FakeResponses:
+    async def create(self, **kwargs):
+        return SimpleNamespace(
+            id="resp_memory",
+            output=[],
+            output_text="noted",
+            conversation=kwargs.get("conversation"),
+            usage=None,
+        )
+
+
+class FakeOpenAI:
+    def __init__(self):
+        self.conversations = FakeConversations()
+        self.responses = FakeResponses()
+
+
+class RecordingEmbeddingProvider:
+    def __init__(self, *, dimensions: int = 16, max_len: int = 12):
+        self.dimensions = dimensions
+        self.max_len = max_len
+        self.calls = []
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        if len(text) > self.max_len:
+            raise AssertionError(f"embedding input too long: {len(text)}")
+        return [1.0, *([0.0] * (self.dimensions - 1))]
+
+
+def test_grillo_worker_prompts_match_webwaifu_contract():
+    assert _build_backend_worker_system_prompt() == WEBWAIFU_GRILLO_WORKER_SYSTEM_PROMPT
+
+    packet = GrilloContextPacket(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        background_information=["scope_key: discord:guild:alpha"],
+        channel_history=["Subby: make it one to one"],
+        relationship_memory=["stage=familiar mood=guarded"],
+        recalled_memories=[{"score": 0.9, "text": "[candidate:thread] GRILLO parity"}],
+        thoughts=["[diary:relationship] I should preserve source semantics."],
+        output_description=[
+            "Use this GRILLO packet as scoped memory/context for the current reply.",
+            "Treat channel_history as transcript, relationship_memory as durable participant context, recalled_memories as recall, and thoughts as private reflection.",
+            "If memory conflicts with the current user turn, trust the current user turn first.",
+        ],
+    )
+    recent = [
+        GrilloTurn(
+            turn_id="turn-user",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            role="user",
+            content="make sure it is 1 to 1",
+            author_name="Subby",
+            source="discord",
+        ),
+        GrilloTurn(
+            turn_id="turn-assistant",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            role="assistant",
+            content="I will check the source.",
+            author_name="Neuro-sama",
+            source="discord",
+        ),
+    ]
+    prompt = _build_backend_beat_prompt(
+        beat_type="relationship",
+        context_packet=packet,
+        recent_turns=recent,
+        scope_key="discord:guild:alpha",
+    )
+
+    assert "This is a relationship beat." in prompt
+    assert "Canonical GRILLO context packet:" in prompt
+    assert '"id": "turn-user"' in prompt
+    assert '"participantKey": "user-alpha"' in prompt
+    assert "channelId" not in prompt
+    assert "interfacePath" not in prompt
+    assert "Do not finish with zero writes" not in prompt
+    assert "Only after a write tool succeeds" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_raw_log_appends_and_lists_thread_events(tmp_path):
+    store = SQLiteRawEventStore(tmp_path / "brain.sqlite3")
+    await store.append(
+        RawEvent(
+            id="event-1",
+            event_type="message",
+            actor="user",
+            thread_id="thread-1",
+            content="hello",
+        )
+    )
+
+    events = await store.list_thread_events("thread-1")
+
+    assert [event.id for event in events] == ["event-1"]
+    assert events[0].content == "hello"
+
+
+@pytest.mark.asyncio
+async def test_raw_log_lists_matching_thread_events(tmp_path):
+    store = SQLiteRawEventStore(tmp_path / "brain.sqlite3")
+    await store.append(
+        RawEvent(
+            id="event-dm",
+            event_type="message",
+            actor="user",
+            thread_id="discord:dm:123",
+            persona_id="neuro-sama",
+            content="dm hello",
+            created_at="2026-06-21T00:00:00+00:00",
+        )
+    )
+    await store.append(
+        RawEvent(
+            id="event-guild-user",
+            event_type="message",
+            actor="user",
+            thread_id="discord:guild:222:channel:333:user:123",
+            persona_id="neuro-sama",
+            content="guild hello",
+            created_at="2026-06-21T00:00:01+00:00",
+        )
+    )
+    await store.append(
+        RawEvent(
+            id="event-other-persona",
+            event_type="message",
+            actor="user",
+            thread_id="discord:guild:222:channel:444:user:123",
+            persona_id="other",
+            content="wrong persona",
+            created_at="2026-06-21T00:00:02+00:00",
+        )
+    )
+
+    events = await store.list_thread_events_matching(
+        thread_ids=["discord:dm:123"],
+        thread_like_patterns=["discord:guild:222:channel:%:user:123"],
+        persona_id="neuro-sama",
+        limit=10,
+    )
+
+    assert [event.id for event in events] == ["event-dm", "event-guild-user"]
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_extracts_temporal_fact_and_indexes_recall(tmp_path):
+    provider = HashEmbeddingProvider(dimensions=32)
+    graph = SQLiteTemporalGraphStore(tmp_path / "brain.sqlite3")
+    vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)
+    worker = GRILLOMemoryWorker(graph_store=graph, vector_store=vector)
+
+    facts = await worker.process_event(
+        RawEvent(
+            id="event-like",
+            event_type="message",
+            actor="user",
+            thread_id="thread-1",
+            persona_id="riko",
+            content="I like LadybugDB for memory graphs.",
+            created_at="2026-06-08T00:00:00+00:00",
+        )
+    )
+
+    assert facts[0].predicate == "likes"
+    graph_hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=3))
+    vector_hits = await vector.search("memory graph", top_k=3)
+    assert graph_hits[0].source_event_id == "event-like"
+    assert vector_hits[0].source_fact_id == facts[0].id
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_fuses_graph_and_vector_hits(tmp_path):
+    provider = HashEmbeddingProvider(dimensions=32)
+    graph = SQLiteTemporalGraphStore(tmp_path / "brain.sqlite3")
+    vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)
+    worker = GRILLOMemoryWorker(graph_store=graph, vector_store=vector)
+    retriever = HybridRetriever(graph_store=graph, vector_store=vector)
+
+    await worker.process_event(
+        RawEvent(
+            id="event-graph",
+            event_type="message",
+            actor="user",
+            thread_id="thread-1",
+            persona_id="riko",
+            content="I am working on ai-brain-core.",
+            created_at="2026-06-08T00:00:00+00:00",
+        )
+    )
+    await vector.add(
+        RecallItem(
+            id="doc-1",
+            text="ai-brain-core has a hybrid memory system.",
+            thread_id="thread-1",
+            persona_id="riko",
+            scope="thread",
+        )
+    )
+
+    hits = await retriever.retrieve_records(
+        "what brain memory system",
+        top_k=5,
+        thread_id="thread-1",
+        persona_id="riko",
+    )
+
+    assert hits
+    assert any("ai-brain-core" in hit.content for hit in hits)
+    assert {hit.metadata["memory_source"] for hit in hits} <= {"graph", "vector"}
+
+
+def test_hybrid_memory_stack_auto_backend_falls_back_when_extras_missing(tmp_path):
+    stack = HybridMemoryStack.sqlite_paths(
+        raw_log_path=tmp_path / "brain.sqlite3",
+        graph_path=tmp_path / "brain.sqlite3",
+        vector_path=tmp_path / "brain.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=32),
+        embedding_dimensions=32,
+        graph_backend="auto",
+        vector_backend="auto",
+    )
+
+    assert stack.grillo is not None
+    assert stack.graph_store is not None
+    assert stack.vector_store is not None
+    stack.close()
+
+
+@pytest.mark.asyncio
+async def test_grillo_runtime_ingests_diary_slots_and_context_packet(tmp_path):
+    provider = HashEmbeddingProvider(dimensions=32)
+    vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=vector,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:1:2",
+        participant_key="user-1",
+        user_text="I like LadybugDB and I am working on TurboVec memory for AI Brain.",
+        assistant_text="Noted.",
+        author_name="Tyler",
+        assistant_name="Neuro-sama",
+        source="discord",
+    )
+    await runtime.run_tick(scope_key="discord:1:2", participant_key="user-1", beat_type="extraction")
+
+    status = await runtime.status()
+    packet = await runtime.build_context_packet(
+        scope_key="discord:1:2",
+        participant_key="user-1",
+        query="what memory stack",
+        persona_name="Neuro-sama",
+    )
+
+    assert status.turns == 2
+    assert status.candidates >= 2
+    assert status.diary_entries == 1
+    assert status.slots >= 2
+    assert any("LadybugDB" in item for item in packet.relationship_memory)
+    assert packet.thoughts
+    assert "grillo_context_packet" in packet.as_prompt_text()
+
+
+@pytest.mark.asyncio
+async def test_grillo_runtime_uses_llm_reflector_for_clean_reflections(tmp_path):
+    async def reflector(context):
+        user_turn = next(turn for turn in context["turns"] if turn["role"] == "user")
+        return {
+            "done": True,
+            "notes": "stored profile and relationship memory",
+            "candidates": [
+                {
+                    "type": "fact",
+                    "content": "LO is a male adult erotica author.",
+                    "summary": "LO is a male adult erotica author.",
+                    "confidence": 0.91,
+                    "tags": ["profile"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+                {
+                    "type": "preference",
+                    "content": "LO prefers crude direct language in adult writing contexts.",
+                    "summary": "LO prefers crude direct language in adult writing contexts.",
+                    "confidence": 0.88,
+                    "tags": ["preference"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+                {
+                    "type": "bond_signal",
+                    "content": "LO is correcting the assistant toward the real GRILLO reflection design.",
+                    "summary": "LO expects GRILLO to be an AI diary/reflection system.",
+                    "confidence": 0.84,
+                    "tags": ["relationship"],
+                    "source_turn_ids": [user_turn["turn_id"]],
+                },
+            ],
+            "diary": {
+                "summary": "LO clarified what GRILLO is supposed to be.",
+                "personal_thought": "I should treat LO's memory as reflective relationship context, not as pattern-matched labels.",
+                "tags": ["grillo", "relationship"],
+                "source_turn_ids": [user_turn["turn_id"]],
+            },
+            "slots": [
+                {
+                    "slot_name": "user_facts",
+                    "items": ["LO is a male adult erotica author."],
+                    "operation": "merge",
+                },
+                {
+                    "slot_name": "preferences",
+                    "items": ["LO prefers crude direct language in adult writing contexts."],
+                    "operation": "merge",
+                },
+                {
+                    "slot_name": "relationship_state",
+                    "items": ["LO expects GRILLO to be an AI diary/reflection system."],
+                    "operation": "merge",
+                },
+            ],
+            "relationship_profile": {
+                "relationship_stage": "familiar",
+                "mood": "focused",
+                "trust": 6,
+                "respect": 6,
+                "guard": 12,
+                "summary": "LO wants GRILLO implemented as reflective relationship memory.",
+                "facts": ["LO expects GRILLO to be an AI diary/reflection system."],
+            },
+            "profile_patches": [
+                {
+                    "field": "interaction_style",
+                    "operation": "add",
+                    "value": "Treat corrections about memory architecture as high-signal.",
+                }
+            ],
+        }
+
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=None,
+        reflector=reflector,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        user_text=(
+            "This applies to all chats, always Some things about me: "
+            "My name is LO, a male. I am an Adult Erotica Author. "
+            "I prefer crude direct language. 500 words minimum length."
+        ),
+        assistant_text="Noted.",
+        source="discord",
+    )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="relationship")
+
+    slots = await runtime.store.list_slots("discord:guild:alpha", "user-alpha")
+    profile = await runtime.store.get_relationship_profile("discord:guild:alpha")
+    packet = await runtime.build_context_packet(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        persona_name="Neuro-sama",
+    )
+    by_slot = {slot.slot_name: slot.items for slot in slots}
+    all_items = [item for slot in slots for item in slot.items]
+    relationship_text = "\n".join(packet.relationship_memory)
+
+    assert any("adult erotica author" in item.lower() for item in by_slot["user_facts"])
+    assert any("crude direct language" in item for item in by_slot["preferences"])
+    assert any("AI diary/reflection system" in item for item in by_slot["relationship_state"])
+    assert profile is not None
+    assert profile.relationship_stage == "familiar"
+    assert profile.mood == "focused"
+    assert profile.trust == 6
+    assert any("high-signal" in item for item in profile.interaction_style)
+    assert not any("This applies to all chats" in item for item in all_items)
+    assert "This applies to all chats" not in relationship_text
+    assert "Preference signal:" not in relationship_text
+    assert "stage=familiar mood=focused" in relationship_text
+    assert "pattern-matched labels" in packet.thoughts[0]
+
+
+@pytest.mark.asyncio
+async def test_grillo_runtime_uses_webwaifu_worker_loop_to_reflect_with_context(tmp_path):
+    seen_requests = []
+
+    async def worker_completion(request):
+        seen_requests.append(request)
+        if len(seen_requests) == 1:
+            system = request["messages"][0]["content"]
+            prompt = request["messages"][1]["content"]
+            assert "First read or search memory if needed. Then call write tools." in system
+            assert "relationship must use the WebWaifu legacy merge shape" not in system
+            assert "Canonical GRILLO context packet" in prompt
+            assert "stage=familiar mood=guarded" in prompt
+            assert "I already feel guarded but invested around LO." in prompt
+            return {
+                "text": json.dumps(
+                    {
+                        "done": False,
+                        "notes": "reflect with tools",
+                        "toolCalls": [
+                            {"name": "core.worker_memory_read", "args": {}},
+                            {
+                                "name": "core.worker_candidate_write",
+                                "args": {
+                                    "type": "bond_signal",
+                                    "content": "LO wants the real WebWaifu GRILLO worker loop ported one-to-one.",
+                                    "summary": "LO expects one-to-one GRILLO worker parity.",
+                                    "confidence": 0.93,
+                                    "tags": ["relationship", "grillo"],
+                                },
+                            },
+                            {
+                                "name": "core.worker_diary_write",
+                                "args": {
+                                    "summary": "LO pushed for real GRILLO parity.",
+                                    "personal_thought": (
+                                        "I should treat LO's correction as a serious relationship signal: "
+                                        "he wants the real reflective worker, not a shallow memory parser."
+                                    ),
+                                    "tags": ["relationship", "grillo"],
+                                    "beat_type": "relationship",
+                                },
+                            },
+                            {
+                                "name": "core.worker_memory_write",
+                                "args": {
+                                    "block_name": "relationship_state",
+                                    "items": ["LO expects the Discord bot to use the real GRILLO worker loop."],
+                                    "operation": "merge",
+                                    "reason": "grounded relationship beat",
+                                },
+                            },
+                            {
+                                "name": "core.worker_profile_patch",
+                                "args": {
+                                    "field": "interaction_style",
+                                    "operation": "add",
+                                    "value": "Treat one-to-one port requests as literal architecture requirements.",
+                                },
+                            },
+                            {
+                                "name": "core.worker_emotion_update",
+                                "args": {
+                                    "intensities": {"focused": 0.82, "guarded": 0.25},
+                                    "last_signal_source": "relationship beat",
+                                },
+                            },
+                            {
+                                "name": "core.worker_memory_insert_archival",
+                                "args": {"text": "One-to-one GRILLO parity requires the worker loop and tool executor."},
+                            },
+                        ],
+                    }
+                ),
+                "meta": {"provider": "test", "model": "worker-test"},
+            }
+        assert any("core.worker_memory_read" in message["content"] for message in request["messages"])
+        return {
+            "text": json.dumps(
+                {
+                    "done": True,
+                    "notes": "done",
+                    "toolCalls": [],
+                    "relationship": {
+                        "relationshipStage": "rapport_building",
+                        "mood": "warm",
+                        "trustDelta": 2,
+                        "summary": "LO's direct correction moved the relationship from guarded parity checking into warmer trust.",
+                        "rikoDiaryEntry": "I feel more trusted after proving the worker loop is real.",
+                        "facts": ["LO treats one-to-one GRILLO parity as a trust requirement."],
+                    },
+                }
+            )
+        }
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    await store.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:alpha",
+            scope_key="discord:guild:alpha",
+            persona_id="neuro",
+            participant_keys=["user-alpha"],
+            relationship_stage="familiar",
+            mood="guarded",
+            trust=5,
+            summary="LO wants literal GRILLO parity.",
+        )
+    )
+    await store.append_diary(
+        GrilloDiaryEntry(
+            diary_id="diary-existing",
+            scope_key="discord:guild:alpha",
+            participant_key="user-alpha",
+            beat_type="relationship",
+            summary="Existing relationship reflection.",
+            personal_thought="I already feel guarded but invested around LO.",
+            tags=["relationship"],
+            source_turn_ids=[],
+            created_at="2026-06-20T00:00:00+00:00",
+        )
+    )
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        user_text="Get the WebWaifu GRILLO reflection worker one-to-one.",
+        assistant_text="I will port the worker loop.",
+        source="discord",
+    )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="relationship")
+
+    assert len(seen_requests) == 2
+    slots = await store.list_slots("discord:guild:alpha", "user-alpha")
+    profile = await store.get_relationship_profile("discord:guild:alpha")
+    emotion = await store.get_emotion_state("discord:guild:alpha")
+    archival = await store.list_archival_memories("discord:guild:alpha")
+    diary = await store.list_diary("discord:guild:alpha", "user-alpha", limit=4)
+
+    assert any(
+        "real GRILLO worker loop" in item
+        for slot in slots
+        if slot.slot_name == "relationship_state"
+        for item in slot.items
+    )
+    assert profile is not None
+    assert profile.relationship_stage == "familiar"
+    assert profile.mood == "guarded"
+    assert profile.trust == 5
+    assert "literal GRILLO parity" in profile.summary
+    assert any("literal architecture requirements" in item for item in profile.interaction_style)
+    assert emotion["intensities"]["focused"] == 0.82
+    assert archival and "worker loop" in archival[0]["text"]
+    assert any("serious relationship signal" in entry.personal_thought for entry in diary)
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_extraction_debrief_can_request_ai_diary_write(tmp_path):
+    requests = []
+
+    async def worker_completion(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+        if len(requests) == 2:
+            assert "previous extraction round ended" in request["messages"][-1]["content"]
+            return {
+                "text": json.dumps(
+                        {
+                            "done": False,
+                            "notes": "debrief diary write",
+                        "toolCalls": [
+                            {
+                                "name": "core.worker_diary_write",
+                                "args": {
+                                    "summary": "Subby clarified the cross-channel memory identity issue.",
+                                    "personal_thought": (
+                                        "Subby got frustrated because the bot confused context across channels. "
+                                        "I should remember that he wants the memory worker itself to write reflections, "
+                                        "with the WebWaifu extraction debrief flow when a real signal exists."
+                                    ),
+                                    "tags": ["relationship", "memory"],
+                                    "beat_type": "relationship",
+                                },
+                            }
+                        ],
+                    }
+                )
+            }
+        return {"text": json.dumps({"done": True, "notes": "done after write", "toolCalls": [], "relationship": None})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+
+    result = await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="Remember that my name is Subby and the channel move confused context.",
+        assistant_text="Got it, I should remember that across channels.",
+        source="discord",
+        channel_id="222",
+    )
+    await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="extraction",
+    )
+
+    diary = await store.list_diary(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+    turns = await store.list_turns(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+
+    assert result[0].channel_id == "222"
+    assert len(requests) == 3
+    assert diary
+    assert "WebWaifu extraction debrief flow" in diary[0].personal_thought
+    assert all(turn.channel_id == "222" for turn in turns)
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_relationship_state_slot_syncs_profile(tmp_path):
+    requests = []
+
+    async def worker_completion(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {
+                "text": json.dumps(
+                    {
+                        "done": False,
+                        "notes": "write structured relationship slot",
+                        "toolCalls": [
+                            {
+                                "name": "core.worker_memory_write",
+                                "args": {
+                                    "block_name": "relationship_state",
+                                    "items": [
+                                        "stage=rapport_building mood=focused",
+                                        "scores=trust:7 respect:6 attraction:1 irritation:0 jealousy:0 guard:10",
+                                        "active_threads=Subby treats memory tests as bonding rituals.",
+                                        'known_facts=["Subby expects GRILLO profile state to mirror structured relationship memory."]',
+                                    ],
+                                    "operation": "merge",
+                                },
+                            }
+                        ],
+                    }
+                )
+            }
+        return {"text": json.dumps({"done": True, "notes": "no separate relationship merge", "toolCalls": [], "relationship": None})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="Memory tests should update the relationship profile too.",
+        assistant_text="I will keep the relationship state synced.",
+        source="discord",
+    )
+    await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="relationship",
+    )
+
+    profile = await store.get_relationship_profile("discord:guild:alpha:user:user-alpha:persona:neuro")
+    assert profile is not None
+    assert profile.relationship_stage == "rapport_building"
+    assert profile.mood == "focused"
+    assert profile.trust == 7
+    assert profile.respect == 6
+    assert profile.guard == 10
+    assert "bonding rituals" in profile.active_threads[-1]
+    assert "GRILLO profile state" in profile.facts[-1]
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_persistent_noop_is_allowed_without_fallback(tmp_path):
+    async def worker_completion(request):
+        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(
+        store=store,
+        vector_store=None,
+        worker_completion=worker_completion,
+    )
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        user_text="This should allow the AI worker to decide nothing durable exists.",
+        assistant_text="I should write memory through GRILLO tools.",
+        source="discord",
+        run_tick=False,
+    )
+
+    result = await runtime.run_tick(
+        scope_key="discord:guild:alpha:user:user-alpha:persona:neuro",
+        participant_key="user-alpha",
+        beat_type="relationship",
+    )
+    diary = await store.list_diary(
+        "discord:guild:alpha:user:user-alpha:persona:neuro",
+        "user-alpha",
+        limit=4,
+    )
+
+    assert result["ok"] is True
+    assert result["no_op_reason"] == "worker_no_writes"
+    assert diary == []
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_exception_does_not_fallback_or_mark_processed(tmp_path):
+    async def worker_completion(request):
+        raise RuntimeError("worker exploded")
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="This should remain pending if the worker crashes.",
+        assistant_text="I should not pretend a fallback reflection happened.",
+        source="discord",
+        run_tick=False,
+    )
+
+    result = await runtime.run_tick(scope_key=scope, participant_key=participant, beat_type="extraction")
+    state = await store.get_worker_state(scope)
+    diary = await store.list_diary(scope, participant, limit=4)
+    candidates = await store.list_candidates(scope, participant, limit=4)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "RuntimeError"
+    assert state.get("processedTurnIds") in (None, [])
+    assert diary == []
+    assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_grillo_worker_scans_past_latest_20_for_old_unprocessed_turns(tmp_path):
+    requests = []
+
+    async def worker_completion(request):
+        requests.append(request)
+        return {"text": json.dumps({"done": True, "notes": "nothing to write", "toolCalls": []})}
+
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None, worker_completion=worker_completion)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    processed_ids = []
+    for index in range(25):
+        user_id = f"user-{index}"
+        assistant_id = f"assistant-{index}"
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=user_id,
+                scope_key=scope,
+                participant_key=participant,
+                role="user",
+                content=f"old durable signal {index}",
+                author_name="Subby",
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:00+00:00",
+            )
+        )
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=assistant_id,
+                scope_key=scope,
+                participant_key=participant,
+                role="assistant",
+                content=f"reply {index}",
+                author_name="Neuro-sama",
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:01+00:00",
+            )
+        )
+        if index != 0:
+            processed_ids.extend([user_id, assistant_id])
+    await store.set_worker_state(scope, {"processedTurnIds": processed_ids})
+
+    await runtime.run_tick(scope_key=scope, participant_key=participant, beat_type="extraction")
+
+    assert requests
+    assert any("old durable signal 0" in message["content"] for request in requests for message in request["messages"])
+
+
+@pytest.mark.asyncio
+async def test_grillo_channel_context_scans_beyond_latest_50_turns(tmp_path):
+    store = SQLiteGrilloStore(tmp_path / "brain.sqlite3")
+    runtime = GrilloRuntime(store=store, vector_store=None)
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+    for index in range(60):
+        channel_id = "target" if index < 2 else "other"
+        await store.append_turn(
+            GrilloTurn(
+                turn_id=f"turn-{index}",
+                scope_key=scope,
+                participant_key=participant,
+                role="user",
+                content=f"target channel memory {index}" if channel_id == "target" else f"other channel {index}",
+                author_name="Subby",
+                channel_id=channel_id,
+                source="discord",
+                created_at=f"2026-06-20T00:{index:02d}:00+00:00",
+            )
+        )
+
+    packet = await runtime.build_context_packet(
+        scope_key=scope,
+        participant_key=participant,
+        channel_id="target",
+    )
+
+    assert any("target channel memory 0" in item for item in packet.channel_history)
+
+
+@pytest.mark.asyncio
+async def test_grillo_context_packet_filters_semantic_recall_by_scope_and_participant(tmp_path):
+    provider = HashEmbeddingProvider(dimensions=32)
+    vector = SQLiteVectorRecallStore(tmp_path / "brain.sqlite3", embedding_provider=provider)
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=vector,
+    )
+
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        user_text="I like LadybugDB for Alpha project memory.",
+        assistant_text="Saved.",
+        source="discord",
+    )
+    await runtime.run_tick(scope_key="discord:guild:alpha", participant_key="user-alpha", beat_type="extraction")
+    await runtime.ingest_turn_pair(
+        scope_key="discord:guild:beta",
+        participant_key="user-beta",
+        user_text="I like TurboVec for Beta project memory.",
+        assistant_text="Saved.",
+        source="discord",
+    )
+    await runtime.run_tick(scope_key="discord:guild:beta", participant_key="user-beta", beat_type="extraction")
+
+    packet = await runtime.build_context_packet(
+        scope_key="discord:guild:alpha",
+        participant_key="user-alpha",
+        query="project memory",
+        persona_name="Neuro-sama",
+    )
+    recalled = " ".join(item["text"] for item in packet.recalled_memories)
+
+    assert "Alpha project" in recalled
+    assert "Beta project" not in recalled
+
+
+@pytest.mark.asyncio
+async def test_grillo_context_packet_keeps_channel_history_local_but_memory_cross_channel(tmp_path):
+    runtime = GrilloRuntime(
+        store=SQLiteGrilloStore(tmp_path / "brain.sqlite3"),
+        vector_store=None,
+    )
+    scope = "discord:guild:alpha:user:user-alpha:persona:neuro"
+    participant = "user-alpha"
+
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="In the first channel we were talking about the Filian wall countdown.",
+        assistant_text="I remember the wall context.",
+        author_name="Subby",
+        assistant_name="Neuro-sama",
+        channel_id="111",
+        source="discord",
+        run_tick=False,
+    )
+    await runtime.ingest_turn_pair(
+        scope_key=scope,
+        participant_key=participant,
+        user_text="Now we moved channels and I am asking if you remember the wall thing.",
+        assistant_text="Yeah, that context should follow you.",
+        author_name="Subby",
+        assistant_name="Neuro-sama",
+        channel_id="222",
+        source="discord",
+        run_tick=False,
+    )
+    await runtime.store.append_candidate(
+        GrilloCandidate(
+            candidate_id="candidate-wall",
+            scope_key=scope,
+            participant_key=participant,
+            type="thread",
+            content="Subby discussed the Filian wall countdown in another Discord channel.",
+            summary="Subby has an ongoing Filian wall countdown thread.",
+            confidence=0.9,
+            tags=["discord", "cross_channel"],
+        )
+    )
+
+    packet = await runtime.build_context_packet(
+        scope_key=scope,
+        participant_key=participant,
+        query="wall countdown",
+        current_turn_text="remember the wall thing?",
+        channel_id="222",
+        persona_name="Neuro-sama",
+    )
+    history = "\n".join(packet.channel_history)
+    recalled = "\n".join(item["text"] for item in packet.recalled_memories)
+
+    assert "Now we moved channels" in history
+    assert "first channel" not in history
+    assert "Filian wall countdown" in recalled
+    assert "history_scope: current channel only (222)" in packet.background_information
+
+
+@pytest.mark.asyncio
+async def test_brain_memory_stack_logs_and_extracts_when_enabled(tmp_path):
+    config = BrainConfig(
+        database_path=tmp_path / "brain.sqlite3",
+        memory_stack=MemoryStackConfig(enabled=True, extract_user_events=True),
+    )
+    brain = Brain(config, client=FakeOpenAI())
+
+    response = await brain.ask(
+        "I like TurboVec for compressed recall.",
+        thread_id="thread-memory-stack",
+    )
+
+    assert response.text == "noted"
+    assert brain.memory_stack is not None
+    events = await brain.memory_stack.raw_log.list_thread_events("thread-memory-stack")
+    facts = await brain.memory_stack.graph_store.search_facts(
+        GraphQuery(text="TurboVec", top_k=3)
+    )
+
+    assert [event.event_type for event in events] == ["message", "response"]
+    assert facts
+    assert facts[0].predicate == "likes"
+    assert brain.memory_stack.grillo is not None
+    assert brain.memory_stack.grillo.worker_completion is not None
+    assert brain.memory_stack.grillo.reflector is not None
+
+
+@pytest.mark.asyncio
+async def test_brain_bounds_memory_retrieval_query_before_embedding(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIBRAIN_MEMORY_QUERY_MAX_CHARS", "12")
+    provider = RecordingEmbeddingProvider(max_len=12)
+    config = BrainConfig(
+        database_path=tmp_path / "brain.sqlite3",
+        memory_stack=MemoryStackConfig(enabled=True, retrieve=True),
+    )
+    brain = Brain(config, client=FakeOpenAI(), embedding_provider=provider)
+
+    response = await brain.ask("x" * 200, thread_id="thread-long-query")
+
+    assert response.text == "noted"
+    assert provider.calls
+    assert all(len(call) <= 12 for call in provider.calls)
+
+
+@pytest.mark.asyncio
+async def test_brain_can_keep_attachment_text_out_of_memory_and_history(tmp_path):
+    provider = RecordingEmbeddingProvider(dimensions=256, max_len=80)
+    config = BrainConfig(
+        database_path=tmp_path / "brain.sqlite3",
+        memory_stack=MemoryStackConfig(enabled=True, retrieve=True, extract_user_events=True),
+    )
+    brain = Brain(config, client=FakeOpenAI(), embedding_provider=provider)
+
+    response = await brain.ask(
+        "please summarize\n\n[Readable attachments]\nSECRET FILE TEXT",
+        thread_id="thread-file-context",
+        memory_query_text="please summarize",
+        memory_event_text="please summarize",
+        history_text="please summarize",
+    )
+
+    assert response.text == "noted"
+    assert all("SECRET FILE TEXT" not in call for call in provider.calls)
+    events = await brain.memory_stack.raw_log.list_thread_events("thread-file-context")
+    assert events[0].content == "please summarize"
+    history = brain.chat_store.list("thread-file-context", limit=10)
+    assert history[0]["content"] == [{"type": "input_text", "text": "please summarize"}]
+
+
+def test_ladybug_wal_recovery_only_moves_corrupt_wal(tmp_path):
+    graph_path = tmp_path / "graph.ladybug"
+    wal_path = tmp_path / "graph.ladybug.wal"
+    wal_path.write_text("locked", encoding="utf-8")
+
+    assert _recover_ladybug_wal(graph_path, RuntimeError("database is locked")) is False
+    assert wal_path.exists()
+
+    assert _recover_ladybug_wal(graph_path, RuntimeError("WAL checksum mismatch")) is True
+    assert not wal_path.exists()
+    assert list(tmp_path.glob("graph.ladybug.wal.corrupt-*"))
+
+
+@pytest.mark.asyncio
+async def test_ladybug_adapter_smoke_when_installed(tmp_path):
+    if importlib.util.find_spec("ladybug") is None:
+        pytest.skip("ladybug extra not installed")
+
+    graph = LadybugGraphMemoryStore(tmp_path / "graph.ladybug")
+    await graph.upsert_fact(
+        TemporalFact(
+            id="fact-ladybug",
+            subject="Tyler",
+            predicate="uses",
+            object="LadybugDB",
+            valid_from="2026-06-08T00:00:00+00:00",
+            metadata={"source": "smoke"},
+        )
+    )
+
+    hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=1))
+
+    assert [hit.object for hit in hits] == ["LadybugDB"]
+    await graph.invalidate_fact(
+        "fact-ladybug",
+        valid_until="2026-06-21T00:00:00+00:00",
+        reason="superseded",
+    )
+    expired_hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=1, include_expired=True))
+
+    assert expired_hits[0].metadata["source"] == "smoke"
+    assert expired_hits[0].metadata["invalidated_reason"] == "superseded"
+
+    await graph.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:persona:neuro",
+            scope_key="discord:guild:persona:neuro",
+            persona_id="neuro",
+            participant_keys=["discord:guild:lo"],
+            relationship_stage="familiar",
+            mood="focused",
+            trust=6,
+            respect=7,
+            guard=10,
+            facts=["LO expects GRILLO relationship memory."],
+            summary="LO wants WebWaifu-style GRILLO memory.",
+            updated_at="2026-06-20T00:00:00+00:00",
+        )
+    )
+    profile = await graph.get_relationship_profile_graph("discord:guild:persona:neuro")
+
+    assert profile is not None
+    assert profile["relationship_stage"] == "familiar"
+    assert profile["mood"] == "focused"
+    relationship_export = await graph.export_relationship_graph("discord:guild:persona:neuro")
+
+    assert relationship_export["profile"]["relationship_stage"] == "familiar"
+    assert [fact["text"] for fact in relationship_export["relationship_facts"]] == [
+        "LO expects GRILLO relationship memory."
+    ]
+    assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:lo"]
+    await graph.upsert_relationship_profile(
+        GrilloRelationshipProfile(
+            profile_id="relationship:discord:guild:persona:neuro",
+            scope_key="discord:guild:persona:neuro",
+            persona_id="neuro",
+            participant_keys=["discord:guild:subby"],
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            respect=8,
+            guard=9,
+            facts=["Subby expects current relationship graph exports."],
+            summary="Subby wants fresh graph state.",
+            updated_at="2026-06-20T00:01:00+00:00",
+        )
+    )
+    relationship_export = await graph.export_relationship_graph("discord:guild:persona:neuro")
+
+    assert [fact["text"] for fact in relationship_export["relationship_facts"]] == [
+        "Subby expects current relationship graph exports."
+    ]
+    assert [participant["id"] for participant in relationship_export["participants"]] == ["discord:guild:subby"]
+    graph.close()
+
+
+@pytest.mark.asyncio
+async def test_ladybug_adapter_serializes_concurrent_async_calls(tmp_path):
+    if importlib.util.find_spec("ladybug") is None:
+        pytest.skip("ladybug extra not installed")
+
+    graph = LadybugGraphMemoryStore(tmp_path / "graph.ladybug")
+
+    async def write_fact(index: int) -> None:
+        await graph.upsert_fact(
+            TemporalFact(
+                id=f"fact-{index}",
+                subject=f"user-{index}",
+                predicate="uses",
+                object="LadybugDB",
+                valid_from="2026-06-22T00:00:00+00:00",
+            )
+        )
+
+    await asyncio.gather(*(write_fact(index) for index in range(12)))
+
+    hits = await graph.search_facts(GraphQuery(text="LadybugDB", top_k=20))
+
+    assert {hit.id for hit in hits} >= {f"fact-{index}" for index in range(12)}
+    graph.close()
+
+
+@pytest.mark.asyncio
+async def test_ladybug_adapter_filters_by_thread_scope_when_requested(tmp_path):
+    if importlib.util.find_spec("ladybug") is None:
+        pytest.skip("ladybug extra not installed")
+
+    graph = LadybugGraphMemoryStore(tmp_path / "graph.ladybug")
+    await graph.upsert_fact(
+        TemporalFact(
+            id="fact-scope-a",
+            subject="Subby",
+            predicate="prefers",
+            object="scoped memory",
+            valid_from="2026-06-22T00:00:00+00:00",
+            source_session_id="discord:guild:1:persona:v2",
+        )
+    )
+    await graph.upsert_fact(
+        TemporalFact(
+            id="fact-scope-b",
+            subject="Subby",
+            predicate="prefers",
+            object="scoped memory",
+            valid_from="2026-06-22T00:00:00+00:00",
+            source_session_id="discord:guild:2:persona:v2",
+        )
+    )
+
+    hits = await graph.search_facts(
+        GraphQuery(
+            text="scoped memory",
+            thread_id="discord:guild:1:persona:v2",
+            persona_id="neuro-sama-v2",
+            top_k=5,
+        )
+    )
+
+    assert [hit.id for hit in hits] == ["fact-scope-a"]
+    graph.close()
+
+
+@pytest.mark.asyncio
+async def test_turbovec_search_maps_exact_numeric_ids_and_filters():
+    class FakeIndex:
+        def __init__(self):
+            self.requested_k = None
+
+        def search(self, vectors, k):
+            self.requested_k = k
+            return [[0.9, 0.8]], [[222, 111]]
+
+    class FakeMetadata:
+        def __init__(self):
+            self.requested_ids = None
+
+        async def hits_by_turbovec_ids(self, numeric_ids):
+            self.requested_ids = numeric_ids
+            return {
+                222: RecallHit(
+                    id="wanted",
+                    text="Subby asked for graph memory.",
+                    score=0.0,
+                    scope="archival",
+                    metadata={"turbovec_id": 222, "participant_key": "discord:user:subby"},
+                ),
+                111: RecallHit(
+                    id="other",
+                    text="Other memory.",
+                    score=0.0,
+                    scope="archival",
+                    metadata={"turbovec_id": 111, "participant_key": "discord:user:other"},
+                ),
+            }
+
+        async def search(self, *args, **kwargs):
+            raise AssertionError("TurboVec search should not use semantic metadata fallback")
+
+    store = TurboVecRecallStore.__new__(TurboVecRecallStore)
+    store.index = FakeIndex()
+    store.metadata = FakeMetadata()
+    store.embedding_provider = RecordingEmbeddingProvider(dimensions=2, max_len=20)
+    store._lock = asyncio.Lock()
+
+    hits = await store.search("graph", top_k=1, filters={"participant_key": "discord:user:subby"})
+
+    assert [hit.id for hit in hits] == ["wanted"]
+    assert store.index.requested_k == 8
+    assert store.metadata.requested_ids == [222, 111]
+
+
+@pytest.mark.asyncio
+async def test_turbovec_adapter_smoke_when_installed(tmp_path):
+    if importlib.util.find_spec("turbovec") is None or importlib.util.find_spec("numpy") is None:
+        pytest.skip("turbovec extra not installed")
+
+    vector = TurboVecRecallStore(
+        tmp_path / "vectors.turbovec",
+        tmp_path / "metadata.sqlite3",
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+        dimensions=16,
+    )
+    await vector.add(
+        RecallItem(
+            id="recall-turbovec",
+            text="TurboVec stores compressed semantic memory recall.",
+        )
+    )
+
+    hits = await vector.search("compressed recall", top_k=1)
+
+    assert [hit.id for hit in hits] == ["recall-turbovec"]

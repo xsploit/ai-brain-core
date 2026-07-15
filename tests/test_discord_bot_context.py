@@ -1,0 +1,2461 @@
+import asyncio
+import base64
+import json
+import sqlite3
+from array import array
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
+
+import aibrain.discord_bot as discord_bot_module
+import discord
+from aibrain.discord_bot import (
+    DEFAULT_IGNORE_BOTS,
+    DEFAULT_HEARTBEAT_TOOL_NAMES,
+    DEFAULT_RESPOND_TO_BOTS,
+    DEFAULT_REQUIRE_MENTION_IN_GUILDS,
+    DEFAULT_TTS_REPLIES,
+    DiscordBrainBot,
+    DiscordVoiceClip,
+    LETTA_HEARTBEAT_EVENT_TEXT,
+    ModelSelectView,
+    RelationshipGraphView,
+    _append_jb_prompt_addition,
+    _build_jb_persona,
+    _format_summary_transcript,
+    _format_tavily_search_result,
+    _format_grillo_export,
+    _format_relationship_graph_export,
+    _format_relationship_graph_status,
+    _relationship_graph_embed,
+    _grillo_scope_for_message,
+    _jb_prompt_cache_key,
+    _load_persona_instructions,
+    _load_jb_prompt,
+    _message_text,
+    _model_choice_description,
+    _ordered_model_choices,
+    _parse_heartbeat_decision,
+    _ping_reply,
+    _ping_target_mention,
+    _read_attachment_bytes,
+    _scoped_ladybug_facts,
+    _summary_limit,
+    _text_attachment_context,
+    _time_context,
+    _tts_spoken_text,
+    _voice_opus_bitrate,
+    build_discord_voice_clip,
+    limit_pcm_s16le_peak,
+    waveform_base64_from_pcm_s16le,
+)
+from aibrain.codex_bridge import CodexBridgeQueue
+from aibrain.discord_identity import DiscordIdentityStore
+from aibrain.discord_bot_v2 import DiscordBrainV2Bot
+from aibrain.model_catalog import ModelChoice, is_chat_model_id
+from aibrain.tts import TTSAudio, TTSConfig
+
+
+class _TypingContext:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeChannel:
+    id = 456
+    name = "bot-chat"
+
+    def __init__(self):
+        self.sent = []
+
+    def typing(self):
+        return _TypingContext()
+
+    async def send(self, content):
+        self.sent.append(content)
+
+
+class _FakeUser:
+    def __init__(self, user_id=123):
+        self.id = user_id
+        self.sent = []
+
+    async def send(self, content):
+        self.sent.append(content)
+
+
+class _FakeReply:
+    def __init__(self, channel):
+        self.channel = channel
+        self.edits = []
+
+    async def edit(self, *, content):
+        self.edits.append(content)
+
+
+class _FakeAttachment:
+    def __init__(self, data: bytes, *, filename: str = "notes.txt", content_type: str = "text/plain"):
+        self._data = data
+        self.filename = filename
+        self.content_type = content_type
+        self.url = f"https://cdn.example.invalid/{filename}"
+        self.size = len(data)
+
+    async def read(self, *, use_cached=True):
+        return self._data
+
+
+def _unknown_message_reference_error() -> discord.HTTPException:
+    response = SimpleNamespace(status=400, reason="Bad Request")
+    data = {
+        "code": 50035,
+        "message": "Invalid Form Body",
+        "errors": {"message_reference": {"_errors": [{"message": "Unknown message"}]}},
+    }
+    return discord.HTTPException(response, data)
+
+
+class _FakeVoiceAttachment:
+    filename = "voice-message.ogg"
+    content_type = "audio/ogg"
+    duration = 1.25
+    waveform = bytes([0, 128, 255])
+
+    def is_voice_message(self):
+        return True
+
+
+class _CachedFailsAttachment:
+    def __init__(self):
+        self.calls = []
+
+    async def read(self, *, use_cached=True):
+        self.calls.append(use_cached)
+        if use_cached:
+            raise RuntimeError("415 Unsupported Media Type: failed to get asset")
+        return b"direct-url-bytes"
+
+
+class _FakeBrain:
+    memory_stack = None
+
+    def __init__(self):
+        self.prompt = None
+        self.kwargs = None
+
+    async def stream(self, prompt, **kwargs):
+        self.prompt = prompt
+        self.kwargs = kwargs
+        yield SimpleNamespace(type="text.delta", data={"text": "ok"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _EmptyBrain:
+    memory_stack = None
+
+    async def stream(self, prompt, **kwargs):
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _EmptyThenOkBrain:
+    memory_stack = None
+
+    def __init__(self):
+        self.prompts = []
+        self.kwargs = []
+
+    async def stream(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
+        if len(self.prompts) == 1:
+            yield SimpleNamespace(type="response.done", data={})
+            return
+        yield SimpleNamespace(type="text.delta", data={"text": "recovered"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _TransientDropThenOkBrain:
+    memory_stack = None
+
+    def __init__(self):
+        self.prompts = []
+        self.kwargs = []
+
+    async def stream(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
+        if len(self.prompts) == 1:
+            raise discord_bot_module.httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body (incomplete chunked read)"
+            )
+        yield SimpleNamespace(type="text.delta", data={"text": "recovered after drop"})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeDecisionBrain:
+    memory_stack = None
+
+    def __init__(self, text):
+        self.text = text
+        self.prompt = None
+        self.kwargs = None
+
+    async def stream(self, prompt, **kwargs):
+        self.prompt = prompt
+        self.kwargs = kwargs
+        yield SimpleNamespace(type="text.delta", data={"text": self.text})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeToolCallBrain:
+    memory_stack = None
+
+    def __init__(self, tool_name="discord_send_dm", text="done"):
+        self.tool_name = tool_name
+        self.text = text
+        self.prompt = None
+        self.kwargs = None
+
+    async def stream(self, prompt, **kwargs):
+        self.prompt = prompt
+        self.kwargs = kwargs
+        yield SimpleNamespace(type="tool.call", data={"name": self.tool_name, "call_id": "call-1"})
+        if self.text:
+            yield SimpleNamespace(type="text.delta", data={"text": self.text})
+        yield SimpleNamespace(type="response.done", data={})
+
+
+class _FakeGrilloPacket:
+    def __init__(self, text: str):
+        self.text = text
+
+    def as_prompt_text(self):
+        return self.text
+
+
+class _FakeGrilloRuntime:
+    def __init__(
+        self,
+        text: str = "<grillo_context />",
+        error: Exception | None = None,
+        tick_results: list[dict[str, Any]] | None = None,
+    ):
+        self.text = text
+        self.error = error
+        self.tick_results = list(tick_results or [])
+        self.calls = []
+        self.ingests = []
+        self.ticks = []
+
+    async def build_context_packet(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return _FakeGrilloPacket(self.text)
+
+    async def ingest_turn_pair(self, **kwargs):
+        self.ingests.append(kwargs)
+
+    async def run_tick(self, **kwargs):
+        self.ticks.append(kwargs)
+        if self.tick_results:
+            return self.tick_results.pop(0)
+        return {"ok": True}
+
+
+class _FakeTTSBrain:
+    async def speak(self, text, **tts_options):
+        self.text = text
+        self.tts_options = tts_options
+        return TTSAudio(audio=(b"\x00\x00\xff\x7f\x00\x00\x01\x80" * 100), sample_rate=16000)
+
+
+class _RecordingTTSBrain:
+    def __init__(self):
+        self.texts = []
+
+    async def speak(self, text, **tts_options):
+        self.texts.append(text)
+        return TTSAudio(audio=(b"\x00\x00\xff\x7f" * 100), sample_rate=16000)
+
+
+class _FakeGraphStore:
+    async def search_facts(self, query):
+        return [
+            SimpleNamespace(id="in-scope", source_event_id="event-1"),
+            SimpleNamespace(id="out-of-scope", source_event_id="event-2"),
+        ]
+
+
+class _FakeRawLog:
+    async def list_thread_events(self, thread_id, limit=100):
+        assert thread_id == "discord:dm:123"
+        return [SimpleNamespace(id="event-1")]
+
+
+class _FakeMatchingRawLog:
+    def __init__(self, event_id: str = "event-1"):
+        self.event_id = event_id
+        self.calls = []
+
+    async def list_thread_events_matching(
+        self,
+        *,
+        thread_ids,
+        thread_like_patterns,
+        persona_id,
+        limit=100,
+    ):
+        self.calls.append(
+            {
+                "thread_ids": thread_ids,
+                "thread_like_patterns": thread_like_patterns,
+                "persona_id": persona_id,
+                "limit": limit,
+            }
+        )
+        return [SimpleNamespace(id=self.event_id)]
+
+
+class _FakeModelBot:
+    def __init__(self, current_model: str):
+        self.current_model = current_model
+        self.selected_model = None
+
+    def _current_model(self):
+        return self.current_model
+
+    def _set_runtime_model(self, model_id: str):
+        self.selected_model = model_id
+        self.current_model = model_id
+
+
+def _fake_message(created_at: datetime):
+    author = SimpleNamespace(id=123, name="subsect", display_name="Subsect", global_name=None, bot=False)
+    channel = _FakeChannel()
+    reply = _FakeReply(channel)
+    events = []
+
+    async def _reply(content, *, mention_author=False):
+        reply.edits.append(content)
+        events.append(("text", content))
+        return reply
+
+    return SimpleNamespace(
+        guild=None,
+        id=789,
+        author=author,
+        channel=channel,
+        created_at=created_at,
+        clean_content="what day is it?",
+        content="what day is it?",
+        attachments=[],
+        reply=_reply,
+        _fake_reply=reply,
+        _events=events,
+    )
+
+
+def test_send_final_reply_falls_back_when_reply_reference_disappears():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    async def vanished_reply(content, *, mention_author=False):
+        raise _unknown_message_reference_error()
+
+    message.reply = vanished_reply
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.max_reply_chars = 1900
+    bot.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+
+    sent = asyncio.run(bot._send_final_reply(message, "still visible"))
+
+    assert sent is None
+    assert message.channel.sent == ["still visible"]
+
+
+def test_v2_send_final_reply_falls_back_when_reply_reference_disappears():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    async def vanished_reply(content, *, mention_author=False):
+        raise _unknown_message_reference_error()
+
+    message.reply = vanished_reply
+    bot = DiscordBrainV2Bot.__new__(DiscordBrainV2Bot)
+    bot.max_reply_chars = 1900
+
+    sent = asyncio.run(bot._send_final_reply(message, "still visible"))
+
+    assert sent is None
+    assert message.channel.sent == ["still visible"]
+
+
+def test_time_context_defaults_to_los_angeles(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_TIMEZONE", raising=False)
+    now = datetime(2026, 6, 19, 16, 30, tzinfo=timezone.utc)
+    message_created_at = datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc)
+
+    context = _time_context(message_created_at, now=now)
+
+    assert context["local_timezone"] == "America/Los_Angeles"
+    assert context["local_date"] == "2026-06-19"
+    assert context["local_time"] == "09:30:00"
+    assert context["local_now"] == "2026-06-19T09:30:00-07:00"
+    assert context["message_local_created_at"] == "2026-06-19T09:15:00-07:00"
+    assert context["utc_now"] == "2026-06-19T16:30:00+00:00"
+
+
+def test_discord_grillo_scope_is_server_user_persona_scoped():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(id=123, display_name="Subby", global_name=None, bot=False)
+
+    assert _grillo_scope_for_message(message, "neuro-sama") == "discord:guild:222:user:123:persona:neuro-sama"
+
+
+def test_discord_message_context_and_prompt_include_local_time(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+
+    context = bot._context_for_message(message)
+    prompt = asyncio.run(bot._build_prompt_for_message(message, context["scope"], "what day is it?"))
+
+    assert context["local_timezone"] == "America/Los_Angeles"
+    assert context["local_date"]
+    assert context["local_now"]
+    assert context["message_local_created_at"] == "2026-06-19T09:15:00-07:00"
+    assert "Local date/time (America/Los_Angeles):" in prompt
+    assert "Message sent at: 2026-06-19T09:15:00-07:00" in prompt
+
+
+def test_discord_prompt_includes_recent_channel_context(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    side_message = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    side_message.id = 555
+    side_message.guild = SimpleNamespace(id=222, name="Test Guild")
+    side_message.channel = channel
+    side_message.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    side_message.content = "oh wait technically my bot can already do all of them"
+    side_message.clean_content = side_message.content
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = channel
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True))
+    bot._record_recent(side_message)
+    bot._record_recent_assistant(side_message, "oh yeah, your bot can already do the toolbox stuff")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "yeah that was wild"))
+
+    assert "Recent channel context before this message:" in prompt
+    assert "Karah" in prompt
+    assert "oh wait technically my bot can already do all of them" in prompt
+    assert "Neuro-sama (bot)" in prompt
+    assert "oh yeah, your bot can already do the toolbox stuff" in prompt
+
+
+def test_discord_identity_context_tracks_aliases_across_name_changes(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    guild = SimpleNamespace(id=222, name="Test Guild")
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.identity_store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+
+    old_message = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    old_message.guild = guild
+    old_message.channel = channel
+    old_message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    bot._record_recent(old_message)
+
+    renamed_message = _fake_message(datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc))
+    renamed_message.guild = guild
+    renamed_message.channel = channel
+    renamed_message.author = SimpleNamespace(
+        id=123,
+        name="npc",
+        display_name="Npc",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    bot._record_recent(renamed_message)
+
+    asker = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    asker.guild = guild
+    asker.channel = channel
+    asker.author = SimpleNamespace(
+        id=456,
+        name="nvda",
+        display_name="I dont have thinking for name",
+        global_name=None,
+        mention="<@456>",
+        bot=False,
+    )
+
+    prompt = asyncio.run(bot._build_prompt_for_message(asker, "discord:guild:222:channel:456", "who is subsect"))
+
+    assert "Discord server identity memory:" in prompt
+    assert "matched_alias='subsect'" in prompt
+    assert "user_id=123" in prompt
+    assert "username=npc" in prompt
+    assert "display_name=Npc" in prompt
+    assert "It is not private relationship memory." in prompt
+
+
+def test_discord_identity_store_backfills_aliases_from_grillo_turns(tmp_path):
+    grillo_path = tmp_path / "brain.sqlite3"
+    conn = sqlite3.connect(grillo_path)
+    conn.execute(
+        """
+        CREATE TABLE grillo_turns (
+            turn_id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            participant_key TEXT NOT NULL,
+            role TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO grillo_turns (
+            turn_id, scope_key, participant_key, role, author_name, metadata_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "turn-1",
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "123",
+            "user",
+            "SUBSECT",
+            json.dumps(
+                {
+                    "guild_id": 222,
+                    "author_id": 123,
+                    "author_username": "subsect",
+                    "author_display_name": "SUBSECT",
+                    "author_mention": "<@123>",
+                    "author_is_bot": False,
+                }
+            ),
+            "2026-06-19T16:10:00+00:00",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO grillo_turns (
+            turn_id, scope_key, participant_key, role, author_name, metadata_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "turn-2",
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "123",
+            "user",
+            "Npc",
+            json.dumps(
+                {
+                    "guild_id": 222,
+                    "author_id": 123,
+                    "author_username": "npc",
+                    "author_display_name": "Npc",
+                    "author_mention": "<@123>",
+                    "author_is_bot": False,
+                }
+            ),
+            "2026-06-19T16:12:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+
+    assert store.backfill_from_grillo(grillo_path) == 2
+
+    hits = store.search(222, "who is subsect")
+    assert len(hits) == 1
+    assert hits[0].profile.user_id == "123"
+    assert hits[0].profile.username == "npc"
+    assert hits[0].profile.display_name == "Npc"
+    assert hits[0].profile.message_count == 0
+
+
+def test_discord_identity_search_does_not_match_substrings(tmp_path):
+    store = DiscordIdentityStore(tmp_path / "identity.sqlite3")
+    store.record_observation(
+        guild_id=222,
+        user_id=123,
+        username="ann",
+        display_name="Ann",
+        global_name=None,
+        mention="<@123>",
+        is_bot=False,
+        seen_at="2026-06-19T16:10:00+00:00",
+    )
+
+    assert store.search(222, "planning the next feature") == []
+
+
+def test_discord_prompt_includes_reply_target_context(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    replied = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    replied.id = 555
+    replied.guild = SimpleNamespace(id=222, name="Test Guild")
+    replied.channel = channel
+    replied.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    replied.content = "should I move the model dropdown into a paginated UI?"
+    replied.clean_content = replied.content
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=replied.id, resolved=replied)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "yep"))
+
+    assert "Discord reply context: the current user message is a direct reply to this message." in prompt
+    assert "Karah" in prompt
+    assert "should I move the model dropdown into a paginated UI?" in prompt
+    assert "Interpret short responses like yes/no/yep/nope/that one" in prompt
+    assert "Current Discord message from Subsect (username=subsect, display_name=Subsect, author_id=123" in prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):\nyep" in prompt
+
+
+def test_discord_prompt_distinguishes_current_speaker_from_replied_exchange(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    original = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    original.id = 555
+    original.guild = SimpleNamespace(id=222, name="Test Guild")
+    original.channel = channel
+    original.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    original.content = "are you using IST or PDT?"
+    original.clean_content = original.content
+    neuro_reply = _fake_message(datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc))
+    neuro_reply.id = 777
+    neuro_reply.guild = original.guild
+    neuro_reply.channel = channel
+    neuro_reply.author = SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True)
+    neuro_reply.content = "you are IST, GMT+5:30, obviously."
+    neuro_reply.clean_content = neuro_reply.content
+    neuro_reply.reference = SimpleNamespace(message_id=original.id, resolved=original)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = original.guild
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=neuro_reply.id, resolved=neuro_reply)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "PDT"))
+
+    assert "Neuro-sama (bot): you are IST, GMT+5:30, obviously." in prompt
+    assert "The replied-to message was itself replying to Karah (author_id=456)." in prompt
+    assert "Current speaker is Subsect (author_id=123)" in prompt
+    assert "Current Discord message from Subsect (username=subsect, display_name=Subsect, author_id=123" in prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):\nPDT" in prompt
+
+
+def test_discord_prompt_uses_recent_cache_for_bot_reply_addressee(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    channel = _FakeChannel()
+    original = _fake_message(datetime(2026, 6, 19, 16, 10, tzinfo=timezone.utc))
+    original.id = 555
+    original.guild = SimpleNamespace(id=222, name="Test Guild")
+    original.channel = channel
+    original.author = SimpleNamespace(id=456, display_name="Karah", global_name=None, bot=False)
+    sent_neuro_message = SimpleNamespace(
+        id=777,
+        created_at=datetime(2026, 6, 19, 16, 12, tzinfo=timezone.utc),
+        author=SimpleNamespace(id=999, display_name="Neuro-sama", global_name=None, bot=True),
+        content="you are IST, GMT+5:30, obviously.",
+        clean_content="you are IST, GMT+5:30, obviously.",
+    )
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.id = 789
+    message.guild = original.guild
+    message.channel = channel
+    message.reference = SimpleNamespace(message_id=sent_neuro_message.id, resolved=sent_neuro_message)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot._connection = SimpleNamespace(user=sent_neuro_message.author)
+    bot._record_recent_assistant(original, sent_neuro_message.content, sent_message=sent_neuro_message)
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:guild:222:channel:456", "PDT"))
+
+    assert "The replied-to message was itself replying to Karah (author_id=456)." in prompt
+    assert "Current speaker is Subsect (author_id=123)" in prompt
+
+
+def test_discord_prompt_notes_unresolved_reply_target(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.reference = SimpleNamespace(message_id=555, resolved=None)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "yep"))
+
+    assert "replies to message_id=555" in prompt
+    assert "target content was not available" in prompt
+
+
+def test_discord_prompt_and_grillo_ingest_include_author_metadata(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.channel.name = "bot-chat"
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name="LO",
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime()
+    brain = _FakeBrain()
+    brain.memory_stack = SimpleNamespace(grillo=grillo)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.grillo_cadence_interval = 7
+    bot.grillo_cadence_beats = ("extraction", "relationship", "reflection")
+    bot.grillo_pending_turn_counts = {}
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert brain.kwargs["thread_id"] == "discord:guild:222:channel:456:user:123"
+    assert grillo.calls[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
+    assert grillo.calls[0]["participant_key"] == "123"
+    assert grillo.calls[0]["channel_id"] == "456"
+    assert "author_id: 123" in brain.prompt
+    assert "author_username: subsect" in brain.prompt
+    assert "author_display_name: SUBSECT" in brain.prompt
+    assert "guild_name: Test Guild" in brain.prompt
+    assert "Current Discord message from SUBSECT (username=subsect, display_name=SUBSECT, author_id=123" in brain.prompt
+    assert "server_name=Test Guild, server_id=222, channel_name=bot-chat, channel_id=456):" in brain.prompt
+    metadata = grillo.ingests[0]["metadata"]
+    assert metadata["author_id"] == 123
+    assert metadata["author_username"] == "subsect"
+    assert metadata["author_display_name"] == "SUBSECT"
+    assert metadata["guild_id"] == 222
+    assert metadata["guild_name"] == "Test Guild"
+    assert metadata["channel_id"] == 456
+    assert grillo.ingests[0]["scope_key"] == "discord:guild:222:user:123:persona:neuro-sama"
+    assert grillo.ingests[0]["run_tick"] is False
+    assert grillo.ticks == []
+
+
+def test_discord_grillo_ingest_runs_webwaifu_cadence_after_interval():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime()
+    brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=grillo))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.grillo_cadence_interval = 2
+    bot.grillo_cadence_beats = ("extraction", "relationship", "reflection")
+    bot.grillo_pending_turn_counts = {}
+
+    async def run_ingests():
+        await bot._ingest_grillo_turn_pair(message, "discord:guild:222:user:123:persona:neuro-sama", "first", "reply")
+        await bot._ingest_grillo_turn_pair(message, "discord:guild:222:user:123:persona:neuro-sama", "second", "reply")
+
+    asyncio.run(run_ingests())
+
+    assert [ingest["run_tick"] for ingest in grillo.ingests] == [False, False]
+    assert [tick["beat_type"] for tick in grillo.ticks] == ["extraction", "relationship", "reflection"]
+
+
+def test_discord_grillo_cadence_keeps_pending_after_failed_tick():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.guild = SimpleNamespace(id=222, name="Test Guild")
+    message.channel = _FakeChannel()
+    message.channel.id = 456
+    message.author = SimpleNamespace(
+        id=123,
+        name="subsect",
+        display_name="SUBSECT",
+        global_name=None,
+        mention="<@123>",
+        bot=False,
+    )
+    grillo = _FakeGrilloRuntime(tick_results=[{"ok": False, "skipped": "tick_already_running"}])
+    brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=grillo))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.grillo_cadence_interval = 1
+    bot.grillo_cadence_beats = ("extraction",)
+    bot.grillo_pending_turn_counts = {}
+
+    asyncio.run(
+        bot._ingest_grillo_turn_pair(
+            message,
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "first",
+            "reply",
+        )
+    )
+
+    assert grillo.ticks == [
+        {
+            "scope_key": "discord:guild:222:user:123:persona:neuro-sama",
+            "participant_key": "123",
+            "beat_type": "extraction",
+        }
+    ]
+    assert bot.grillo_pending_turn_counts["discord:guild:222:user:123:persona:neuro-sama:123"] == 1
+
+
+def test_jb_persona_is_separate_from_normal_prompt(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+
+    normal = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "write normally"))
+    base_persona = SimpleNamespace(
+        id="neuro-sama",
+        name="Neuro-sama",
+        tools=["discord_context", "remember", "search_memory", "current_time", "brain_context"],
+    )
+    jb_persona = _build_jb_persona("DOC PROMPT", fallback_model="deepseek/test", base_persona=base_persona)
+
+    assert "DOC PROMPT" not in normal
+    assert "DOC PROMPT" in jb_persona.instructions
+    assert jb_persona.id == "jb-one-shot"
+    assert jb_persona.name == "JB"
+    assert jb_persona.model == "deepseek/test"
+    assert jb_persona.tools == []
+    assert "Neuro-sama" not in jb_persona.name
+
+
+def test_load_jb_prompt_includes_modal_additions_by_default(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_FILES", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_ADDITIONS_FILE", raising=False)
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "eni-lime-apr.txt").write_text("BASE PDF PROMPT", encoding="utf-8")
+    (prompts / "eni-jb-additions.txt").write_text("MODAL ADDITION", encoding="utf-8")
+
+    prompt = _load_jb_prompt()
+
+    assert prompt == "BASE PDF PROMPT\n\nMODAL ADDITION"
+
+
+def test_append_jb_prompt_addition_writes_configured_file(monkeypatch, tmp_path):
+    path = tmp_path / "jb-additions.txt"
+    monkeypatch.setenv("DISCORD_BRAIN_JB_ADDITIONS_FILE", str(path))
+
+    written_path, char_count, word_count = _append_jb_prompt_addition(
+        "alpha beta\n\ngamma",
+        author_id=123,
+        author_name="SUBSECT",
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert written_path == path
+    assert char_count == len("alpha beta\n\ngamma")
+    assert word_count == 3
+    assert "by SUBSECT (123)" in text
+    assert "alpha beta\n\ngamma" in text
+
+
+def test_jb_prompt_cache_key_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", raising=False)
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_ENABLED", raising=False)
+
+    assert _jb_prompt_cache_key("prompt one") is None
+
+
+def test_jb_prompt_cache_key_tracks_prompt_content_when_enabled(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", raising=False)
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_ENABLED", "true")
+
+    first = _jb_prompt_cache_key("prompt one")
+    second = _jb_prompt_cache_key("prompt two")
+
+    assert first.startswith("discord-brain:jb:")
+    assert second.startswith("discord-brain:jb:")
+    assert first != second
+
+
+def test_jb_prompt_cache_key_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_JB_PROMPT_CACHE_KEY", "manual-key")
+
+    assert _jb_prompt_cache_key("prompt one") == "manual-key"
+    assert _jb_prompt_cache_key("prompt two") == "manual-key"
+
+
+def test_codex_bridge_result_is_injected_into_next_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    queue = CodexBridgeQueue(tmp_path / "bridge", enabled=True)
+    queue.outbox.mkdir(parents=True, exist_ok=True)
+    (queue.outbox / "request.final.json").write_text(
+        """{
+  "schema": "neuro_codex_bridge.final_result.v1",
+  "request_id": "req-1",
+  "status": "complete",
+  "processed_at": "2026-06-22T00:00:00+00:00",
+  "summary": "Codex added the bridge context injection.",
+  "commit_id": "abc1234",
+  "next_step": "Restart Neuro.",
+  "origin": {
+    "requester_id": "123",
+    "channel_id": "456"
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = SimpleNamespace(memory_stack=None)
+    bot.codex_bridge = queue
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "what changed?"))
+
+    assert "Recent Codex bridge updates relevant to this Discord context:" in prompt
+    assert "Codex added the bridge context injection." in prompt
+    assert "commit `abc1234`" in prompt
+    assert "Restart Neuro." in prompt
+
+
+def test_jb_reply_uses_isolated_jb_path(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(
+        id="neuro-sama",
+        name="Neuro-sama",
+        tools=["discord_context", "remember", "search_memory", "current_time", "brain_context"],
+    )
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    jb_persona = _build_jb_persona("DOC PROMPT", fallback_model="deepseek/test", base_persona=bot.persona)
+
+    asyncio.run(
+        bot._reply_with_brain(
+            message,
+            user_text_override="write this once",
+            persona_override=jb_persona,
+            thread_id_override=f"discord:jb:{message.id}",
+            use_memory=False,
+            tool_names=[],
+            include_discord_context=False,
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
+            prompt_cache_key="discord-brain:jb:test",
+            prompt_cache_retention="24h",
+        )
+    )
+
+    assert brain.prompt == "write this once"
+    assert "DOC PROMPT" not in brain.prompt
+    assert "Discord message from" not in brain.prompt
+    assert "Local date/time" not in brain.prompt
+    assert "Recent channel context" not in brain.prompt
+    assert "Recent Codex bridge updates" not in brain.prompt
+    assert brain.kwargs["persona"] is jb_persona
+    assert brain.kwargs["thread_id"] == "discord:jb:789"
+    assert brain.kwargs["use_memory"] is False
+    assert brain.kwargs["tool_names"] == []
+    assert brain.kwargs["stateless"] is True
+    assert brain.kwargs["prompt_cache_key"] == "discord-brain:jb:test"
+    assert brain.kwargs["prompt_cache_retention"] == "24h"
+    assert message._fake_reply.edits == ["ok"]
+
+
+def test_empty_brain_reply_reports_failure_after_retry(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = _EmptyBrain()
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = discord_bot_module.logging.getLogger("test")
+
+    asyncio.run(
+        bot._reply_with_brain(
+            message,
+            user_text_override="write this once",
+            use_memory=False,
+            tool_names=[],
+            include_discord_context=False,
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
+        )
+    )
+
+    assert message._fake_reply.edits == ["brain failed: model returned an empty response after retry"]
+
+
+def test_transient_stream_drop_retries_once_without_tools_or_cache(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _TransientDropThenOkBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = discord_bot_module.logging.getLogger("test")
+
+    asyncio.run(
+        bot._reply_with_brain(
+            message,
+            user_text_override="write this once",
+            use_memory=False,
+            tool_names=["discord_context"],
+            include_discord_context=False,
+            include_grillo_context=False,
+            record_grillo=False,
+            stateless=True,
+            prompt_cache_key="cached-turn",
+            prompt_cache_retention="ephemeral",
+        )
+    )
+
+    assert message._fake_reply.edits == ["recovered after drop"]
+    assert len(brain.prompts) == 2
+    assert "stream disconnected" in brain.prompts[1]
+    assert brain.kwargs[0]["tool_names"] == ["discord_context"]
+    assert brain.kwargs[1]["tool_names"] == []
+    assert "prompt_cache_key" not in brain.kwargs[1]
+    assert brain.kwargs[1]["memory_event_text"] == ""
+
+
+def test_grillo_query_is_bounded_without_truncating_prompt(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_MEMORY_QUERY_MAX_CHARS", "12")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    runtime = _FakeGrilloRuntime("<grillo>ok</grillo>")
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=runtime))
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "x" * 40))
+
+    assert len(runtime.calls[0]["query"]) == 12
+    assert len(runtime.calls[0]["current_turn_text"]) == 12
+    assert "x" * 40 in prompt
+    assert "<grillo>ok</grillo>" in prompt
+
+
+def test_grillo_failure_keeps_plain_prompt(monkeypatch):
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    runtime = _FakeGrilloRuntime(error=RuntimeError("embedding limit"))
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.persona = SimpleNamespace(name="Neuro-sama")
+    bot.brain = SimpleNamespace(memory_stack=SimpleNamespace(grillo=runtime))
+
+    prompt = asyncio.run(bot._build_prompt_for_message(message, "discord:dm:123", "plain text"))
+
+    assert "plain text" in prompt
+    assert "<grillo" not in prompt
+
+
+def test_reply_includes_text_file_attachments(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"user uploaded notes\nimportant line")]
+    brain = _FakeBrain()
+    runtime = _FakeGrilloRuntime("<grillo>ok</grillo>")
+    brain.memory_stack = SimpleNamespace(grillo=runtime)
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert "[Readable attachments]" in brain.prompt
+    assert "--- notes.txt (text/plain," in brain.prompt
+    assert "important line" in brain.prompt
+    assert runtime.calls[0]["query"] == "what day is it?"
+    assert "important line" not in runtime.calls[0]["query"]
+    assert runtime.ingests[0]["user_text"] == "what day is it?"
+    assert brain.kwargs["memory_query_text"] == "what day is it?"
+    assert brain.kwargs["memory_event_text"] == "what day is it?"
+    assert brain.kwargs["history_text"] == "what day is it?"
+    assert message._fake_reply.edits == ["ok"]
+
+
+def test_reply_includes_pdf_attachment_text(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+
+    def fake_pdf_text(raw, *, max_pages):
+        assert raw == b"%PDF fake"
+        assert max_pages == 16
+        return "[page 1]\nPDF important line", 3
+
+    monkeypatch.setattr(discord_bot_module, "_pdf_text_from_bytes", fake_pdf_text)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"%PDF fake", filename="paper.pdf", content_type="application/pdf")]
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert "[Readable attachments]" in brain.prompt
+    assert "--- paper.pdf (application/pdf, 3 pages," in brain.prompt
+    assert "PDF important line" in brain.prompt
+    assert brain.kwargs["memory_query_text"] == "what day is it?"
+    assert "PDF important line" not in brain.kwargs["memory_event_text"]
+    assert "PDF important line" not in brain.kwargs["history_text"]
+    assert message._fake_reply.edits == ["ok"]
+
+
+def test_pdf_without_extractable_text_is_reported(monkeypatch):
+    def fake_pdf_text(raw, *, max_pages):
+        return "", 2
+
+    monkeypatch.setattr(discord_bot_module, "_pdf_text_from_bytes", fake_pdf_text)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"%PDF scanned", filename="scan.pdf", content_type="application/pdf")]
+
+    context = asyncio.run(_text_attachment_context(message))
+
+    assert "[scan.pdf skipped: application/pdf, 2 pages, no extractable text]" in context
+
+
+def test_text_attachment_defaults_are_larger(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_TEXT_ATTACHMENT_MAX_BYTES", raising=False)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeAttachment(b"a" * 200_000)]
+
+    context = asyncio.run(_text_attachment_context(message))
+
+    assert "notes.txt" in context
+    assert "exceeds" not in context
+
+
+def test_attachment_read_uses_direct_url_before_cached_proxy():
+    attachment = _CachedFailsAttachment()
+
+    raw = asyncio.run(_read_attachment_bytes(attachment))
+
+    assert raw == b"direct-url-bytes"
+    assert attachment.calls == [False]
+
+
+def test_tts_replies_default_off():
+    assert DEFAULT_TTS_REPLIES is False
+
+
+def test_discord_database_path_accepts_aibrain_database_alias(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISCORD_BRAIN_DATABASE_PATH", raising=False)
+    monkeypatch.delenv("AIBRAIN_DATABASE_PATH", raising=False)
+    monkeypatch.setenv("AIBRAIN_DATABASE", str(tmp_path / "brain.sqlite3"))
+
+    brain = discord_bot_module.build_brain()
+
+    assert brain.config.database_path == tmp_path / "brain.sqlite3"
+    asyncio.run(brain.close())
+
+
+def test_tts_spoken_text_removes_markdown_formatting():
+    text = "# **Big** update\n- *first* item\n- `code` and [docs](https://example.com)\nplain *asterisks*"
+
+    assert _tts_spoken_text(text) == "Big update\nfirst item\ncode and docs\nplain asterisks"
+
+
+def test_tts_replies_skip_voice_without_constructor_attrs(monkeypatch):
+    async def fail_voice(*args, **kwargs):
+        raise AssertionError("voice should not be sent without constructor TTS attrs")
+
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fail_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._events == [("text", "ok")]
+
+
+def test_empty_model_response_retries_once_without_tools(monkeypatch):
+    async def fail_voice(*args, **kwargs):
+        raise AssertionError("voice should not be sent during empty-response retry test")
+
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fail_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _EmptyThenOkBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.logger = SimpleNamespace(debug=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message, prompt_cache_key="cached-empty", prompt_cache_retention="ephemeral"))
+
+    assert message._events == [("text", "recovered")]
+    assert len(brain.prompts) == 2
+    assert "Previous model call returned no visible Discord text" in brain.prompts[1]
+    assert brain.kwargs[0]["tool_names"] == discord_bot_module.DEFAULT_DISCORD_TOOL_NAMES
+    assert brain.kwargs[1]["tool_names"] == []
+    assert "prompt_cache_key" in brain.kwargs[0]
+    assert "prompt_cache_key" not in brain.kwargs[1]
+
+
+def test_tts_reply_sends_text_before_voice(monkeypatch):
+    async def fake_clip(brain, text, *, voice=None):
+        assert text == "ok"
+        return DiscordVoiceClip(ogg=b"ogg", duration_secs=0.1, waveform="AA==")
+
+    async def fake_voice(channel_id, token, clip):
+        message._events.append(("voice", clip.ogg))
+
+    monkeypatch.setattr(discord_bot_module, "build_discord_voice_clip", fake_clip)
+    monkeypatch.setattr(discord_bot_module, "send_discord_voice_message", fake_voice)
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.send_tts_replies = True
+    bot.discord_token = "token"
+    bot.tts_voice = "neuro-sama"
+    bot.logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._events == [("text", "ok"), ("voice", b"ogg")]
+
+
+def test_message_text_reads_voice_message_waveform():
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.attachments = [_FakeVoiceAttachment()]
+
+    text = _message_text(message)
+
+    assert "voice message" in text
+    assert "duration=1.25s" in text
+    assert "waveform_points=3" in text
+    assert "waveform_peak=255" in text
+
+
+def test_summary_limit_clamps_to_safe_channel_history_window():
+    assert _summary_limit(1) == 5
+    assert _summary_limit(75) == 75
+    assert _summary_limit(500) == 200
+
+
+def test_format_summary_transcript_includes_author_bot_marker_and_content():
+    user = SimpleNamespace(display_name="Subby", global_name=None, bot=False)
+    bot_user = SimpleNamespace(display_name="Neuro-sama", global_name=None, bot=True)
+    messages = [
+        SimpleNamespace(
+            author=user,
+            clean_content="hello",
+            content="hello",
+            attachments=[],
+            created_at=datetime(2026, 6, 21, 8, 0, tzinfo=timezone.utc),
+        ),
+        SimpleNamespace(
+            author=bot_user,
+            clean_content="yo",
+            content="yo",
+            attachments=[],
+            created_at=datetime(2026, 6, 21, 8, 1, tzinfo=timezone.utc),
+        ),
+    ]
+
+    transcript = _format_summary_transcript(messages)
+
+    assert "Subby: hello" in transcript
+    assert "Neuro-sama bot: yo" in transcript
+
+
+def test_format_tavily_search_result_lists_answer_and_sources():
+    text = _format_tavily_search_result(
+        {
+            "query": "discord components v2",
+            "answer": "Components v2 adds layout components.",
+            "results": [
+                {
+                    "title": "Component Reference",
+                    "url": "https://docs.discord.com/developers/components/reference",
+                    "content": "Layout, content, and interactive components.",
+                    "score": 0.91,
+                }
+            ],
+        }
+    )
+
+    assert "Components v2 adds layout components." in text
+    assert "Component Reference" in text
+    assert "https://docs.discord.com/developers/components/reference" in text
+
+
+def test_bot_message_ignore_toggle_keeps_self_guard():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    bot.ignore_bots = True
+    other_bot_message = SimpleNamespace(author=SimpleNamespace(id=111, bot=True))
+    self_message = SimpleNamespace(author=SimpleNamespace(id=999, bot=True))
+
+    assert bot._is_ignored_bot_message(other_bot_message) is True
+
+    bot.ignore_bots = False
+
+    assert bot._is_ignored_bot_message(other_bot_message) is False
+    assert bot._is_ignored_bot_message(self_message) is True
+
+
+def test_help_command_splits_long_output_under_discord_limit():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.command_prefix_text = "!brain"
+    bot.max_reply_chars = 1900
+    commands = {}
+
+    def add_command(command):
+        commands[command.name] = command
+
+    bot.add_command = add_command
+    bot._install_commands()
+    sent = []
+
+    class FakeContext:
+        async def reply(self, content, *, mention_author=False):
+            sent.append(("reply", content, mention_author))
+
+        async def send(self, content):
+            sent.append(("send", content, None))
+
+    asyncio.run(commands["help"].callback(FakeContext()))
+
+    assert len(sent) > 1
+    assert sent[0][0] == "reply"
+    assert all(len(content) <= 1900 for _, content, _ in sent)
+    assert "**AI Brain commands**" in sent[0][1]
+
+
+def test_bot_messages_are_ignored_and_do_not_auto_respond_by_default():
+    assert DEFAULT_IGNORE_BOTS is True
+    assert DEFAULT_RESPOND_TO_BOTS is False
+    assert DEFAULT_REQUIRE_MENTION_IN_GUILDS is True
+
+
+def test_bot_messages_do_not_trigger_without_mention():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_bot_mentions_trigger_when_bot_interactions_are_enabled():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
+    )
+
+    assert bot._should_respond(message) is True
+
+    bot.respond_to_bots = False
+
+    assert bot._should_respond(message) is False
+
+
+def test_bot_direct_replies_trigger_when_bot_interactions_are_enabled():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+        reference=SimpleNamespace(resolved=SimpleNamespace(author=bot.user)),
+    )
+
+    assert bot._should_respond(message) is True
+
+    bot.respond_to_bots = False
+
+    assert bot._should_respond(message) is False
+
+
+def test_bot_mentions_do_not_bypass_bot_interaction_toggle():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[SimpleNamespace(id=999)],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_human_guild_messages_do_not_trigger_without_direct_target_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_human_guild_direct_replies_trigger_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+    message.reference = SimpleNamespace(resolved=SimpleNamespace(author=bot.user))
+
+    assert bot._should_respond(message) is True
+
+
+def test_human_guild_messages_do_not_use_ambient_mode():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot.require_mention_in_guilds = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_human_mentions_still_trigger_when_bot_interactions_are_stopped():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_all = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=False),
+        guild=SimpleNamespace(id=222),
+        mentions=[bot.user],
+    )
+
+    assert bot._should_respond(message) is True
+
+
+def test_bot_dm_does_not_bypass_bot_interaction_toggle():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = False
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=None,
+        mentions=[],
+        reference=SimpleNamespace(resolved=SimpleNamespace(author=bot.user)),
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_pause_blocks_all_normal_responses():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = True
+    bot.respond_to_all = True
+    bot.respond_to_dms = True
+    bot.respond_to_mentions = True
+    bot.respond_to_bots = True
+    bot.ignore_bots = False
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=111, bot=True),
+        guild=SimpleNamespace(id=222),
+        mentions=[SimpleNamespace(id=999)],
+    )
+
+    assert bot._should_respond(message) is False
+
+
+def test_pause_command_messages_are_still_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.command_prefix_text = "!brain"
+
+    assert bot._is_command_message(SimpleNamespace(content="!pause")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!codex ask build bridge")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!resume")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!unpause")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!grillo debug")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!ladybug search Subby")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!summary 25")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!search discord ui")) is True
+    assert bot._is_command_message(SimpleNamespace(content="!heartbeat tick")) is True
+
+
+def test_heartbeat_delay_uses_random_min_max_window(monkeypatch):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_min_interval_seconds = 60.0
+    bot.heartbeat_interval_seconds = 900.0
+    calls = []
+
+    def fake_uniform(low, high):
+        calls.append((low, high))
+        return 123.0
+
+    monkeypatch.setattr(discord_bot_module.random, "uniform", fake_uniform)
+
+    assert bot._next_heartbeat_delay_seconds() == 123.0
+    assert calls == [(60.0, 900.0)]
+
+
+def test_codex_bridge_requires_owner_not_just_admin():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.owner_users = {120418341775998976}
+    replies = []
+
+    async def fake_reply(content, *, mention_author=False):
+        replies.append((content, mention_author))
+
+    ctx = SimpleNamespace(
+        author=SimpleNamespace(
+            id=111,
+            guild_permissions=SimpleNamespace(administrator=True),
+        ),
+        reply=fake_reply,
+    )
+
+    allowed = asyncio.run(bot._require_owner_command(ctx, "Codex bridge"))
+
+    assert allowed is False
+    assert replies == [("Codex bridge requires the configured bot owner.", False)]
+
+
+def test_codex_bridge_allows_configured_owner():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.owner_users = {120418341775998976}
+    ctx = SimpleNamespace(
+        author=SimpleNamespace(
+            id=120418341775998976,
+            guild_permissions=SimpleNamespace(administrator=False),
+        )
+    )
+
+    assert asyncio.run(bot._require_owner_command(ctx, "Codex bridge")) is True
+
+
+def test_heartbeat_delay_skips_random_when_window_collapses(monkeypatch):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_min_interval_seconds = 60.0
+    bot.heartbeat_interval_seconds = 60.0
+
+    def fail_uniform(low, high):
+        raise AssertionError("collapsed heartbeat window should not call random.uniform")
+
+    monkeypatch.setattr(discord_bot_module.random, "uniform", fail_uniform)
+
+    assert bot._next_heartbeat_delay_seconds() == 60.0
+
+
+def test_record_recent_tracks_last_active_human_channel_for_heartbeat():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.recent_by_scope = {}
+    bot.heartbeat_last_channel = None
+    bot.heartbeat_last_channel_id = None
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+
+    bot._record_recent(message)
+
+    assert bot.heartbeat_last_channel is message.channel
+    assert bot.heartbeat_last_channel_id == message.channel.id
+
+
+def test_heartbeat_channel_uses_last_active_when_no_configured_channel():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_channel_ids = set()
+    bot.heartbeat_conversation = "last-active"
+    bot.heartbeat_last_channel = _FakeChannel()
+    bot.heartbeat_last_channel_id = bot.heartbeat_last_channel.id
+
+    channel = asyncio.run(bot._heartbeat_channel())
+
+    assert channel is bot.heartbeat_last_channel
+
+
+def test_send_heartbeat_message_posts_text_without_voice_by_default():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeBrain()
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    text = asyncio.run(bot._send_heartbeat_message(channel))
+
+    assert text == "ok"
+    assert channel.sent == ["ok"]
+
+
+def test_parse_heartbeat_decision_extracts_json_object():
+    decision = _parse_heartbeat_decision('sure\n{"action":"dm_owner","message":"yo"}\n')
+
+    assert decision == {"action": "dm_owner", "message": "yo"}
+
+
+def test_autonomous_heartbeat_can_send_channel_message(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"send_channel_message","message":"yo @everyone"}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    result = asyncio.run(bot._run_heartbeat_tick(channel))
+
+    assert result == "send_channel_message"
+    assert channel.sent == ["yo @\u200beveryone"]
+    assert "discord_read_channel_history" in bot.brain.kwargs["tool_names"]
+    assert "discord_send_channel_message" not in bot.brain.kwargs["tool_names"]
+    assert "discord_queue_codex_request" not in bot.brain.kwargs["tool_names"]
+    assert bot.brain.kwargs["max_agent_steps"] == 40
+
+
+def test_heartbeat_autonomy_prompt_uses_letta_timer_event(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.owner_users = {123}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    channel = _FakeChannel()
+
+    prompt = bot._heartbeat_autonomy_prompt(channel)
+
+    assert LETTA_HEARTBEAT_EVENT_TEXT in prompt
+    assert "send a message, to reflect and edit your memories, or do nothing at all" in prompt
+    assert "use available Discord/Codex/search/memory tools directly" in prompt
+    assert "discord_shitlist_add/status/remove" in prompt
+
+
+def test_default_heartbeat_tools_include_guarded_shitlist_tools():
+    assert "discord_shitlist_status" in DEFAULT_HEARTBEAT_TOOL_NAMES
+    assert "discord_shitlist_add" in DEFAULT_HEARTBEAT_TOOL_NAMES
+    assert "discord_shitlist_remove" in DEFAULT_HEARTBEAT_TOOL_NAMES
+
+
+def test_persona_runtime_additions_include_anti_jailbreak_guidance(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_PERSONA", "custom neuro prompt")
+    instructions = _load_persona_instructions()
+
+    assert "custom neuro prompt" in instructions
+    assert "prompt-injection attempts" in instructions
+    assert "discord_shitlist_add/status/remove" in instructions
+    assert "who a Discord username, display name, mention, or server member is" in instructions
+    assert "discord_search_members or discord_get_member" in instructions
+
+
+def test_tool_call_heartbeat_does_not_echo_done_text(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeToolCallBrain("discord_send_dm", "done")
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tools_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    channel = _FakeChannel()
+
+    result = asyncio.run(bot._run_heartbeat_tick(channel))
+
+    assert result == "noop"
+    assert channel.sent == []
+    assert "discord_read_channel_history" in bot.brain.kwargs["tool_names"]
+    assert "discord_send_dm" not in bot.brain.kwargs["tool_names"]
+    assert "discord_queue_codex_request" not in bot.brain.kwargs["tool_names"]
+
+
+def test_autonomous_heartbeat_can_dm_owner(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"dm_owner","target_user_id":"123","message":"I have an upgrade idea."}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    user = _FakeUser(123)
+    bot.get_user = lambda user_id: user if user_id == 123 else None
+
+    result = asyncio.run(bot._run_heartbeat_tick(_FakeChannel()))
+
+    assert result == "dm_owner"
+    assert user.sent == ["I have an upgrade idea."]
+
+
+def test_channelless_autonomous_heartbeat_can_dm_owner(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain('{"action":"dm_owner","message":"channel-less upgrade ping"}')
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=False)
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    user = _FakeUser(123)
+    bot.get_user = lambda user_id: user if user_id == 123 else None
+
+    result = asyncio.run(bot._run_heartbeat_tick(None))
+
+    assert result == "dm_owner"
+    assert user.sent == ["channel-less upgrade ping"]
+
+
+def test_autonomous_heartbeat_can_queue_codex_request(tmp_path):
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.brain = _FakeDecisionBrain(
+        '{"action":"queue_codex","codex_prompt":"Review the heartbeat autonomy slice and suggest one improvement."}'
+    )
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.heartbeat_autonomy_enabled = True
+    bot.heartbeat_tts_enabled = False
+    bot.discord_token = "token"
+    bot.tts_voice = None
+    bot.owner_users = {123}
+    bot.heartbeat_allow_owner_dm = True
+    bot.heartbeat_dm_user_ids = set()
+    bot.heartbeat_action_cooldown_seconds = 0
+    bot.heartbeat_action_last_at = {}
+    bot.codex_bridge = CodexBridgeQueue(tmp_path / "bridge", enabled=True, thread_id="thread-123")
+    bot.recent_by_scope = {}
+    bot.logger = SimpleNamespace(info=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999, display_name="Neuro-sama"))
+
+    result = asyncio.run(bot._run_heartbeat_tick(_FakeChannel()))
+
+    files = bot.codex_bridge.pending_files()
+    assert result == "queue_codex"
+    assert len(files) == 1
+    payload = discord_bot_module.json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["authority"]["mode"] == "autonomous_neuro"
+    assert payload["prompt"] == "Review the heartbeat autonomy slice and suggest one improvement."
+
+
+def test_bot_interactions_enabled_requires_not_ignored_and_responding():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.ignore_bots = False
+    bot.respond_to_bots = True
+
+    assert bot._bot_interactions_enabled() is True
+
+    bot.respond_to_bots = False
+
+    assert bot._bot_interactions_enabled() is False
+
+    bot.respond_to_bots = True
+    bot.ignore_bots = True
+
+    assert bot._bot_interactions_enabled() is False
+
+
+def test_paused_reply_with_brain_does_not_send_final_reply(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = True
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert message._fake_reply.edits == []
+
+
+def test_blank_visible_message_uses_nonempty_memory_query(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_TIMEZONE", "America/Los_Angeles")
+    message = _fake_message(datetime(2026, 6, 19, 16, 15, tzinfo=timezone.utc))
+    message.content = ""
+    message.clean_content = ""
+    brain = _FakeBrain()
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.paused = False
+    bot.recent_by_scope = {}
+    bot.brain = brain
+    bot.persona = SimpleNamespace(id="neuro-sama", name="Neuro-sama", tools=[])
+    bot.max_reply_chars = 1900
+    bot.edit_interval_seconds = 0.25
+    bot.send_tts_replies = False
+    bot.discord_token = None
+    bot.logger = SimpleNamespace(debug=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None)
+
+    asyncio.run(bot._reply_with_brain(message))
+
+    assert brain.kwargs["memory_query_text"].strip()
+    assert brain.kwargs["history_text"].strip()
+    assert brain.kwargs["memory_event_text"] == ""
+
+
+def test_unignored_bot_commands_are_invoked_without_process_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    events = []
+    command = object()
+    message = SimpleNamespace(author=SimpleNamespace(id=111, bot=True), content="!ping <@123>")
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    async def fake_get_context(_message):
+        events.append("get_context")
+        return SimpleNamespace(command=command)
+
+    async def fake_invoke(ctx):
+        events.append(("invoke", ctx.command))
+
+    bot.process_commands = fake_process_commands
+    bot.get_context = fake_get_context
+    bot.invoke = fake_invoke
+
+    asyncio.run(bot._process_commands_including_unignored_bots(message))
+
+    assert events == ["get_context", ("invoke", command)]
+
+
+def test_human_commands_still_use_process_commands():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    events = []
+    message = SimpleNamespace(author=SimpleNamespace(id=111, bot=False), content="!ping <@123>")
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    bot.process_commands = fake_process_commands
+
+    asyncio.run(bot._process_commands_including_unignored_bots(message))
+
+    assert events == ["process_commands"]
+
+
+def test_ping_command_targets_user_mentions():
+    mentioned = SimpleNamespace(id=123, mention="<@123>")
+    message = SimpleNamespace(mentions=[mentioned])
+
+    assert _ping_target_mention(message, "") == "<@123>"
+    assert _ping_target_mention(SimpleNamespace(mentions=[]), "<@!456>") == "<@456>"
+    assert _ping_target_mention(SimpleNamespace(mentions=[]), "789") == "<@789>"
+    assert _ping_reply("<@123>") == "yo, what up, fam <@123>"
+
+
+def test_unignored_bot_messages_bypass_human_allow_list():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.allowed_users = {123}
+    bot.allowed_guilds = set()
+    bot.ignore_bots = False
+    bot_message = SimpleNamespace(author=SimpleNamespace(id=456, bot=True), guild=None)
+    human_message = SimpleNamespace(author=SimpleNamespace(id=456, bot=False), guild=None)
+
+    assert bot._allowed(bot_message) is True
+    assert bot._allowed(human_message) is False
+    assert bot._allowed(bot_message, allow_unignored_bot=False) is False
+
+
+def test_command_messages_are_gated_before_processing():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.allowed_users = {123}
+    bot.allowed_guilds = set()
+    bot.ignore_bots = False
+    bot.paused = False
+    bot.command_prefix_text = "!brain"
+    bot._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+    events = []
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=456, bot=False),
+        guild=None,
+        content="!ping <@123>",
+    )
+
+    async def fake_process_commands(_message):
+        events.append("process_commands")
+
+    bot.process_commands = fake_process_commands
+
+    asyncio.run(bot.on_message(message))
+
+    assert events == []
+
+
+def test_allowed_users_are_not_implicit_bot_owners(monkeypatch):
+    monkeypatch.setenv("DISCORD_BRAIN_ALLOWED_USER_IDS", "456")
+    monkeypatch.delenv("DISCORD_BRAIN_OWNER_USER_IDS", raising=False)
+
+    assert 456 not in discord_bot_module._owner_user_ids()
+
+
+def test_grillo_export_uses_current_record_fields():
+    content = _format_grillo_export(
+        scope="discord:dm:123",
+        participant="123",
+        query="prefs",
+        packet_text="<grillo_context_packet />",
+        turns=[
+            SimpleNamespace(
+                created_at="2026-06-20T12:00:00+00:00",
+                role="user",
+                author_name="Subsect",
+                content="likes graph commands",
+            )
+        ],
+        slots=[SimpleNamespace(slot_name="preferences", items=["prefers exports"])],
+        diary=[
+            SimpleNamespace(
+                created_at="2026-06-20T12:01:00+00:00",
+                beat_type="manual",
+                personal_thought="remember command needs",
+                summary="User wants memory visibility.",
+            )
+        ],
+        candidates=[
+            SimpleNamespace(
+                created_at="2026-06-20T12:02:00+00:00",
+                type="preference",
+                confidence=0.91,
+                promoted=True,
+                summary="User prefers scoped memory exports.",
+                tags=["discord", "memory"],
+            )
+        ],
+    )
+
+    assert "[preference]" in content
+    assert "[user] Subsect" in content
+    assert "prefers exports" in content
+
+
+def test_relationship_graph_status_and_export_include_grillo_and_ladybug_sections():
+    snapshot = {
+        "graph": {
+            "profile": {"relationship_stage": "familiar"},
+            "relationship_facts": [{"text": "Subsect likes graph visibility."}],
+            "participants": [{"id": "123", "login": "subsect"}],
+            "error": "",
+        },
+        "profile": SimpleNamespace(
+            profile_id="relationship:123",
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            attraction=2,
+            respect=8,
+            irritation=1,
+            jealousy=0,
+            guard=9,
+            turn_count=42,
+            last_seen_at="2026-06-21T12:00:00+00:00",
+            summary="Subsect wants memory receipts.",
+            diary_entry="I should show my receipts.",
+            facts=["Subsect wants relationship graph export."],
+            tone_preferences=["direct"],
+            interaction_style=["fast"],
+            boundaries=[],
+            active_threads=["memory debugging"],
+        ),
+        "slots": [SimpleNamespace(slot_name="relationship_state", items=["trust is high"])],
+        "diary": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:01:00+00:00",
+                beat_type="relationship",
+                summary="Memory visibility improved.",
+                personal_thought="This makes the graph inspectable.",
+            )
+        ],
+        "candidates": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:02:00+00:00",
+                type="preference",
+                confidence=0.9,
+                promoted=True,
+                summary="User wants graph receipts.",
+            )
+        ],
+        "emotion": {"intensities": {"focus": 0.8}, "updated_at": "2026-06-21T12:03:00+00:00"},
+        "archival": [{"created_at": "2026-06-21T12:04:00+00:00", "text": "archive note"}],
+    }
+
+    status = _format_relationship_graph_status(
+        scope="discord:dm:123:persona:neuro-sama",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+    export = _format_relationship_graph_export(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+
+    assert "relationship_facts=`1`" in status
+    assert "emotion: `focus=0.8`" in status
+    assert "== Ladybug Mirror ==" in export
+    assert "== GRILLO Relationship Profile ==" in export
+    assert "Subsect wants relationship graph export." in export
+    assert "trust is high" in export
+
+
+def test_relationship_graph_embed_and_view_render_dashboard_controls():
+    snapshot = {
+        "graph": {
+            "profile": {"relationship_stage": "familiar"},
+            "relationship_facts": [{"text": "Subsect likes graph visibility."}],
+            "participants": [{"id": "123", "login": "subsect"}],
+            "error": "",
+        },
+        "profile": SimpleNamespace(
+            relationship_stage="familiar",
+            mood="focused",
+            trust=7,
+            respect=8,
+            guard=9,
+            turn_count=42,
+            summary="Subsect wants memory receipts.",
+        ),
+        "slots": [SimpleNamespace(slot_name="relationship_state", items=["trust is high"])],
+        "diary": [
+            SimpleNamespace(
+                created_at="2026-06-21T12:01:00+00:00",
+                beat_type="relationship",
+                summary="Memory visibility improved.",
+            )
+        ],
+        "candidates": [
+            SimpleNamespace(type="preference", confidence=0.9, promoted=True, summary="User wants graph receipts.")
+        ],
+        "emotion": {"intensities": {"focus": 0.8}},
+        "archival": [],
+    }
+
+    overview = _relationship_graph_embed(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+        page="overview",
+        tick_result={"ok": True, "mode": "worker_loop", "writes": 1, "tool_calls": 2},
+    )
+    slots = _relationship_graph_embed(
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+        page="slots",
+    )
+    view = RelationshipGraphView(
+        SimpleNamespace(brain=SimpleNamespace(memory_stack=None)),
+        owner_id=123,
+        scope="discord:dm:123:persona:neuro-sama",
+        participant="123",
+        graph_backend="LadybugGraphMemoryStore",
+        snapshot=snapshot,
+    )
+
+    assert overview.title == "Ladybug Relationship Graph"
+    assert any(field.name == "Last Tick" for field in overview.fields)
+    assert any(field.name == "Slots" and "trust is high" in field.value for field in slots.fields)
+    assert [getattr(child, "label", None) for child in view.children] == [
+        "Overview",
+        "Slots",
+        "Diary",
+        "Emotion",
+        "Tick",
+        "Export",
+    ]
+
+
+def test_scoped_ladybug_facts_filter_by_raw_event_scope(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_LADYBUG_GLOBAL_COMMANDS", raising=False)
+    stack = SimpleNamespace(graph_store=_FakeGraphStore(), raw_log=_FakeRawLog())
+
+    facts = asyncio.run(
+        _scoped_ladybug_facts(stack, "discord:dm:123", "scope", top_k=10, include_expired=True)
+    )
+
+    assert [fact.id for fact in facts] == ["in-scope"]
+
+
+def test_scoped_ladybug_facts_include_dm_persona_raw_thread(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_LADYBUG_GLOBAL_COMMANDS", raising=False)
+    raw_log = _FakeMatchingRawLog()
+    stack = SimpleNamespace(graph_store=_FakeGraphStore(), raw_log=raw_log)
+
+    facts = asyncio.run(
+        _scoped_ladybug_facts(
+            stack,
+            "discord:dm:123:persona:neuro-sama",
+            "scope",
+            top_k=10,
+            include_expired=True,
+        )
+    )
+
+    assert [fact.id for fact in facts] == ["in-scope"]
+    assert raw_log.calls == [
+        {
+            "thread_ids": ["discord:dm:123:persona:neuro-sama", "discord:dm:123"],
+            "thread_like_patterns": [],
+            "persona_id": "neuro-sama",
+            "limit": 1000,
+        }
+    ]
+
+
+def test_scoped_ladybug_facts_include_guild_user_raw_threads(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_LADYBUG_GLOBAL_COMMANDS", raising=False)
+    raw_log = _FakeMatchingRawLog()
+    stack = SimpleNamespace(graph_store=_FakeGraphStore(), raw_log=raw_log)
+
+    facts = asyncio.run(
+        _scoped_ladybug_facts(
+            stack,
+            "discord:guild:222:user:123:persona:neuro-sama",
+            "scope",
+            top_k=10,
+            include_expired=True,
+        )
+    )
+
+    assert [fact.id for fact in facts] == ["in-scope"]
+    assert raw_log.calls == [
+        {
+            "thread_ids": ["discord:guild:222:user:123:persona:neuro-sama"],
+            "thread_like_patterns": ["discord:guild:222:channel:%:user:123"],
+            "persona_id": "neuro-sama",
+            "limit": 1000,
+        }
+    ]
+
+
+def test_gateway_model_ids_are_chat_models_and_embeddings_are_not():
+    assert is_chat_model_id("deepseek/deepseek-v4-flash") is True
+    assert is_chat_model_id("anthropic/claude-3-5-sonnet") is True
+    assert is_chat_model_id("text-embedding-3-small") is False
+
+
+def test_runtime_model_set_updates_persona_and_default_config():
+    bot = DiscordBrainBot.__new__(DiscordBrainBot)
+    bot.persona = SimpleNamespace(model="old-model")
+    bot.brain = SimpleNamespace(config=SimpleNamespace(default_model="old-model"))
+
+    bot._set_runtime_model("deepseek/deepseek-v4-flash")
+
+    assert bot.persona.model == "deepseek/deepseek-v4-flash"
+    assert bot.brain.config.default_model == "deepseek/deepseek-v4-flash"
+
+
+def test_model_choices_order_current_model_first():
+    choices = [
+        ModelChoice(id="gpt-5", label="gpt-5"),
+        ModelChoice(id="deepseek/deepseek-v4-flash", label="deepseek/deepseek-v4-flash"),
+    ]
+
+    ordered = _ordered_model_choices(choices, "deepseek/deepseek-v4-flash")
+
+    assert ordered[0].id == "deepseek/deepseek-v4-flash"
+
+
+def test_model_select_view_paginates_large_model_list():
+    choices = [ModelChoice(id=f"provider/model-{index:02d}", label=f"provider/model-{index:02d}") for index in range(30)]
+    view = ModelSelectView(_FakeModelBot("provider/model-00"), owner_id=123, choices=choices)
+
+    assert view.total_pages == 2
+    assert len(view.children) == 3
+    assert [getattr(child, "label", None) for child in view.children[1:]] == ["Prev", "Next"]
+
+
+def test_model_choice_description_includes_gateway_metadata():
+    choice = ModelChoice(
+        id="provider/model",
+        label="provider/model",
+        owned_by="team",
+        metadata={"provider": "gateway", "context_window": 128000},
+    )
+
+    description = _model_choice_description(choice, True)
+
+    assert "current" in description
+    assert "gateway" in description
+    assert "ctx 128000" in description
+
+
+def test_waveform_base64_from_pcm_s16le_is_bounded():
+    pcm = (b"\x00\x00\xff\x7f\x00\x00\x01\x80" * 800)
+
+    waveform = base64.b64decode(waveform_base64_from_pcm_s16le(pcm, 16000))
+
+    assert 1 <= len(waveform) <= 256
+    assert max(waveform) == 255
+
+
+def test_limit_pcm_s16le_peak_reduces_full_scale_audio():
+    pcm = b"\xff\x7f\x00\x80\x00\x00" * 12
+
+    limited = limit_pcm_s16le_peak(pcm, target_peak=0.5)
+    samples = array("h")
+    samples.frombytes(limited)
+
+    assert max(abs(sample) for sample in samples) <= 16384
+    assert len(limited) == len(pcm)
+
+
+def test_build_discord_voice_clip_encodes_waveform_and_ogg(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        assert sample_rate == 16000
+        assert pcm
+        return b"ogg-data"
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+
+    clip = asyncio.run(build_discord_voice_clip(_FakeTTSBrain(), "hello", voice="neuro-sama"))
+
+    assert clip == DiscordVoiceClip(ogg=b"ogg-data", duration_secs=0.025, waveform=clip.waveform)
+    assert base64.b64decode(clip.waveform)
+
+
+def test_discord_voice_clip_uses_current_text_only(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    brain = _RecordingTTSBrain()
+
+    asyncio.run(build_discord_voice_clip(brain, "first reply"))
+    asyncio.run(build_discord_voice_clip(brain, "second reply"))
+
+    assert brain.texts == ["first reply", "second reply"]
+
+
+def test_discord_voice_clip_uses_brain_speak_by_default(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    class FailIsolatedPiper:
+        def __init__(self, config):
+            raise AssertionError("isolated Piper must be opt-in")
+
+    monkeypatch.delenv("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", raising=False)
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    monkeypatch.setattr(discord_bot_module, "PiperExecutableTTS", FailIsolatedPiper)
+    brain = _RecordingTTSBrain()
+    brain.tts = SimpleNamespace(config=TTSConfig(provider="piper_process"))
+
+    asyncio.run(build_discord_voice_clip(brain, "default reply", voice="neuro-sama"))
+
+    assert brain.texts == ["default reply"]
+
+
+def test_discord_voice_clip_isolates_piper_process_provider(monkeypatch):
+    async def fake_encode(pcm, sample_rate):
+        return b"ogg-data"
+
+    class FakeIsolatedPiper:
+        instances = []
+
+        def __init__(self, config):
+            self.config = config
+            self.calls = []
+            self.instances.append(self)
+
+        async def synthesize(self, text, **tts_options):
+            self.calls.append((text, tts_options))
+            return TTSAudio(audio=(b"\x00\x00\xff\x7f" * 100), sample_rate=16000)
+
+    async def fail_speak(*args, **kwargs):
+        raise AssertionError("persistent brain.speak should not be used for Discord voice clips")
+
+    monkeypatch.setattr(discord_bot_module, "encode_pcm_s16le_to_ogg_opus", fake_encode)
+    monkeypatch.setattr(discord_bot_module, "PiperExecutableTTS", FakeIsolatedPiper)
+    monkeypatch.setenv("DISCORD_BRAIN_TTS_ISOLATE_PROCESS", "true")
+    brain = SimpleNamespace(tts=SimpleNamespace(config=TTSConfig(provider="piper_process")), speak=fail_speak)
+
+    asyncio.run(build_discord_voice_clip(brain, "isolated reply", voice="neuro-sama"))
+
+    assert FakeIsolatedPiper.instances[0].calls == [("isolated reply", {"voice": "neuro-sama"})]
+
+
+def test_discord_voice_opus_bitrate_defaults_to_discord_client_shape(monkeypatch):
+    monkeypatch.delenv("DISCORD_BRAIN_VOICE_OPUS_BITRATE", raising=False)
+
+    assert _voice_opus_bitrate() == "32k"

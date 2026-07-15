@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import logging
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +17,7 @@ from .autonomy import AutonomyAction, HeartbeatConfig
 from .config import BrainConfig, Persona
 from .core import Brain
 from .inputs import ImageInput
+from .model_catalog import FALLBACK_MODELS, is_chat_model_id, list_model_choices, model_choice_ids
 from .policy import MemoryPolicy
 from .stt import AudioEncoding, VADConfig, decode_audio_base64
 
@@ -88,23 +88,16 @@ class HeartbeatRequest(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
-FALLBACK_MODELS = [
-    "gpt-5-nano",
-    "gpt-5-mini",
-    "gpt-5",
-    "gpt-4.1-mini",
-    "gpt-4.1",
-]
-
-
 def create_app(brain: Brain | None = None, config: BrainConfig | None = None) -> FastAPI:
     brain_instance = brain or Brain(config=config)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.brain = brain_instance
-        if app.state.brain.config.tts_config.warmup_on_start:
-            await app.state.brain.warmup()
+        warm_tts = app.state.brain.config.tts_config.warmup_on_start
+        warm_openai = app.state.brain.config.openai_stream_transport == "websocket"
+        if warm_tts or warm_openai:
+            await app.state.brain.warmup(openai=warm_openai, tts=warm_tts)
         try:
             yield
         finally:
@@ -242,7 +235,14 @@ def create_app(brain: Brain | None = None, config: BrainConfig | None = None) ->
                         discover_piper_voices,
                         refresh=refresh,
                     )
-                    app.state.tts_voice_cache = [voice.model_dump() for voice in voices]
+                    default_model = getattr(app.state.brain.tts.config, "piper_model_path", None)
+                    app.state.tts_voice_cache = [
+                        {
+                            **voice.model_dump(),
+                            "default": default_model is not None and voice.onnx == default_model,
+                        }
+                        for voice in voices
+                    ]
         return list(app.state.tts_voice_cache)
 
     @app.websocket("/stream")
@@ -308,38 +308,19 @@ async def _list_openai_models(
     cache_lock: asyncio.Lock | None = None,
     ttl_seconds: int = 300,
 ) -> list[str]:
-    now = time.monotonic()
-    if cache is not None and cache.get("ids") is not None and cache.get("expires_at", 0) > now:
-        return list(cache["ids"])
-    if cache_lock is not None:
-        async with cache_lock:
-            return await _list_openai_models(
-                brain,
-                cache=cache,
-                cache_lock=None,
-                ttl_seconds=ttl_seconds,
-            )
-    try:
-        result = await brain.client.models.list()
-        ids = sorted(
-            {
-                str(getattr(model, "id", ""))
-                for model in getattr(result, "data", [])
-                if _is_chat_model(str(getattr(model, "id", "")))
-            }
-        )
-        model_ids = ids or list(FALLBACK_MODELS)
-    except Exception:
-        logger.warning("Failed to list OpenAI models, using fallback list", exc_info=True)
-        model_ids = list(FALLBACK_MODELS)
-    if cache is not None:
-        cache["ids"] = list(model_ids)
-        cache["expires_at"] = now + max(0, ttl_seconds)
-    return model_ids
+    choices = await list_model_choices(
+        brain,
+        cache=cache,
+        cache_lock=cache_lock,
+        ttl_seconds=ttl_seconds,
+        default_models=(brain.config.default_model,),
+        log=logger,
+    )
+    return model_choice_ids(choices)
 
 
 def _is_chat_model(model_id: str) -> bool:
-    return model_id.startswith(("gpt-", "o", "chatgpt-"))
+    return is_chat_model_id(model_id)
 
 
 async def _brain_socket(brain: Brain, websocket: WebSocket, *, default_tts: bool) -> None:

@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .embeddings import EmbeddingProvider, HashEmbeddingProvider
+from .numeric import safe_float
 from .thread_store import utc_now
 from .types import MemoryRecord
 
@@ -284,7 +285,8 @@ class SQLiteMemoryStore:
             else:
                 embedding = json.loads(row["embedding_json"])
                 semantic_score = cosine_similarity(query_embedding, embedding)
-            score = semantic_score * (0.5 + float(row["importance"]))
+            importance = safe_float(row["importance"], 0.5)
+            score = semantic_score * (0.5 + importance)
             if score < min_score:
                 continue
             scored.append(
@@ -295,7 +297,7 @@ class SQLiteMemoryStore:
                     persona_id=row["persona_id"],
                     content=row["content"],
                     metadata=metadata,
-                    importance=float(row["importance"]),
+                    importance=importance,
                     score=score,
                     created_at=row["created_at"],
                 )
@@ -328,7 +330,8 @@ class SQLiteMemoryStore:
                 continue
             embedding = json.loads(row["embedding_json"])
             semantic_score = cosine_similarity(query_embedding, embedding)
-            score = semantic_score * (0.5 + float(row["importance"]))
+            importance = safe_float(row["importance"], 0.5)
+            score = semantic_score * (0.5 + importance)
             if score < min_score:
                 continue
             scored.append(
@@ -339,7 +342,7 @@ class SQLiteMemoryStore:
                     persona_id=row["persona_id"],
                     content=row["content"],
                     metadata=metadata,
-                    importance=float(row["importance"]),
+                    importance=importance,
                     score=score,
                     created_at=row["created_at"],
                 )

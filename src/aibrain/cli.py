@@ -3,23 +3,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 
 from .config import BrainConfig
 from .core import Brain
+from .env import load_env_file
 from .playback import AudioPlaybackWorker, create_audio_player
 from .server import create_app
 
 
-FAST_CHAT_MODEL = "gpt-4.1-mini"
+FAST_CHAT_MODEL = "deepseek/deepseek-v4-flash"
 
 
 async def chat(args: argparse.Namespace) -> None:
+    load_env_file(args.env_file)
     brain = Brain(BrainConfig(**_chat_config_kwargs(args)))
     thread_id = args.thread
     audio_worker: AudioPlaybackWorker | None = None
@@ -128,6 +132,7 @@ async def chat(args: argparse.Namespace) -> None:
 
 
 async def tts(args: argparse.Namespace) -> None:
+    load_env_file(args.env_file)
     brain = Brain(
         BrainConfig(
             database_path=args.database,
@@ -168,6 +173,7 @@ class BenchmarkTurn:
 
 
 async def bench(args: argparse.Namespace) -> None:
+    load_env_file(args.env_file)
     if not args.prompt:
         args.prompt = ["hey"]
     transports = ["http", "websocket"] if args.transport == "both" else [args.transport]
@@ -311,17 +317,39 @@ def _format_benchmark_turn(stats: BenchmarkTurn) -> str:
 
 
 def serve(args: argparse.Namespace) -> None:
+    load_env_file(args.env_file)
     kwargs: dict[str, Any] = {
         "database_path": args.database,
         "env_file": args.env_file,
+        "openai_stream_transport": args.stream_transport
+        or os.environ.get("AIBRAIN_OPENAI_STREAM_TRANSPORT", "http"),
     }
     if args.model:
         kwargs["default_model"] = args.model
-    if args.stream_transport:
-        kwargs["openai_stream_transport"] = args.stream_transport
     config = BrainConfig(**kwargs)
     app = create_app(config=config)
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+def piper_models(args: argparse.Namespace) -> None:
+    from .tts import discover_piper_voices
+
+    voices = discover_piper_voices(
+        manifest_paths=[Path(path) for path in args.manifest] if args.manifest else None,
+        search_roots=[Path(path) for path in args.root] if args.root else None,
+        refresh=args.refresh,
+    )
+    if args.json:
+        print(json.dumps([voice.model_dump() for voice in voices], indent=2))
+        return
+    if not voices:
+        print("No Piper models found.")
+        return
+    for voice in voices:
+        fields = [voice.slug, voice.label, str(voice.onnx)]
+        if voice.config:
+            fields.append(str(voice.config))
+        print("\t".join(fields))
 
 
 def main() -> None:
@@ -391,6 +419,27 @@ def main() -> None:
     tts_parser.add_argument("--env-file", default=None)
     tts_parser.set_defaults(func=lambda args: asyncio.run(tts(args)))
 
+    piper_models_parser = subparsers.add_parser(
+        "piper-models",
+        aliases=["voices"],
+        help="List discovered Piper voice models.",
+    )
+    piper_models_parser.add_argument(
+        "--root",
+        action="append",
+        default=None,
+        help="Voice search root. Pass more than once for multiple roots.",
+    )
+    piper_models_parser.add_argument(
+        "--manifest",
+        action="append",
+        default=None,
+        help="Voice manifest JSON path. Pass more than once for multiple manifests.",
+    )
+    piper_models_parser.add_argument("--refresh", action="store_true")
+    piper_models_parser.add_argument("--json", action="store_true")
+    piper_models_parser.set_defaults(func=piper_models)
+
     bench_parser = subparsers.add_parser("bench")
     bench_parser.add_argument("--database", default="brain.sqlite3")
     bench_parser.add_argument("--model", default=None)
@@ -451,7 +500,8 @@ def _chat_config_kwargs(args: argparse.Namespace) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "database_path": args.database,
         "env_file": args.env_file,
-        "openai_stream_transport": args.stream_transport or "websocket",
+        "openai_stream_transport": args.stream_transport
+        or os.environ.get("AIBRAIN_OPENAI_STREAM_TRANSPORT", "http"),
     }
     model = args.model or (FAST_CHAT_MODEL if args.fast else None)
     if model:

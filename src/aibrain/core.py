@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import threading
 from collections import OrderedDict, deque
@@ -26,12 +27,14 @@ from .autonomy import (
     strip_heartbeat_ack,
     within_active_hours,
 )
+from .chat_store import SQLiteChatHistoryStore
 from .config import BrainConfig, Persona
 from .embeddings import EmbeddingProvider, default_embedding_provider
 from .env import load_env_file
 from .gateway import OpenAIGateway
 from .inputs import FileInput, ImageInput, build_user_message
 from .memory import SQLiteMemoryStore
+from .memory_stack import HybridMemoryStack
 from .policy import MemoryPolicy
 from .stt import (
     AudioEncoding,
@@ -53,6 +56,201 @@ _HELD_THREAD_LOCKS: ContextVar[frozenset[str]] = ContextVar(
     "aibrain_held_thread_locks",
     default=frozenset(),
 )
+DEFAULT_MEMORY_QUERY_MAX_CHARS = 6000
+
+_GRILLO_REFLECTION_INSTRUCTIONS = "\n".join(
+    [
+        "You are the background sleep-time memory agent for this AI companion.",
+        "You are not writing a user-facing chat reply.",
+        "Read the JSON payload and return only JSON matching the schema.",
+        "Write durable memory candidates for explicit preferences, facts, goals, boundaries, bond signals, and ongoing threads.",
+        "Write relationship memory when the turn changes trust, tone, attachment, recurring context, or how the assistant should understand the participant.",
+        "Use relationship_profile for grounded stage, mood, numeric relationship scores, summary, diary, and known facts.",
+        "Use profile_patches for grounded tone_preferences, interaction_style, boundaries, and active_threads.",
+        "Write diary entries only when the turn meaningfully changes relationship, mood, goals, or stream/server context.",
+        "Diary entries are private first-person reflections from the avatar perspective, not receipts or summaries of every reply.",
+        "A good diary personal_thought says how the speaker or chat made the avatar feel, what changed, and what to remember next time.",
+        "Do not write mechanical diary text like 'Processed N turns' or 'I noticed X and answered as Y'.",
+        "Use slots for consolidated grounded memory, not every transient message.",
+        "Prefer concise, clean memory text. Remove wrapper labels like Preference signal or Durable fact signal.",
+    ]
+)
+
+_GRILLO_REFLECTION_SCHEMA: dict[str, Any] = {
+    "name": "grillo_reflection",
+    "strict": False,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "done": {"type": "boolean"},
+            "notes": {"type": "string"},
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["preference", "fact", "goal", "boundary", "bond_signal", "thread"],
+                        },
+                        "content": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "source_turn_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["type", "content", "summary", "confidence", "tags"],
+                },
+            },
+            "diary": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "beat_type": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "personal_thought": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                            "source_turn_ids": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["summary", "personal_thought", "tags"],
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "slots": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "slot_name": {
+                            "type": "string",
+                            "enum": [
+                                "core_identity",
+                                "relationship_state",
+                                "user_facts",
+                                "preferences",
+                                "boundaries",
+                                "ongoing_threads",
+                                "open_threads",
+                                "verified_facts",
+                                "tone_preferences",
+                                "working_scratchpad",
+                            ],
+                        },
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "operation": {"type": "string", "enum": ["merge", "replace"]},
+                        "source_candidate_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["slot_name", "items", "operation"],
+                },
+            },
+            "relationship_profile": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "relationship_stage": {"type": "string"},
+                            "mood": {"type": "string"},
+                            "trust": {"type": "number"},
+                            "attraction": {"type": "number"},
+                            "respect": {"type": "number"},
+                            "irritation": {"type": "number"},
+                            "jealousy": {"type": "number"},
+                            "guard": {"type": "number"},
+                            "summary": {"type": "string"},
+                            "diary_entry": {"type": "string"},
+                            "facts": {"type": "array", "items": {"type": "string"}},
+                            "tone_preferences": {"type": "array", "items": {"type": "string"}},
+                            "interaction_style": {"type": "array", "items": {"type": "string"}},
+                            "boundaries": {"type": "array", "items": {"type": "string"}},
+                            "active_threads": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "profile_patches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "enum": [
+                                "tone_preferences",
+                                "interaction_style",
+                                "boundaries",
+                                "active_threads",
+                            ],
+                        },
+                        "operation": {"type": "string", "enum": ["add", "remove"]},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["field", "operation", "value"],
+                },
+            },
+        },
+        "required": [
+            "done",
+            "notes",
+            "candidates",
+            "diary",
+            "slots",
+            "relationship_profile",
+            "profile_patches",
+        ],
+    },
+}
+
+_GRILLO_WORKER_RESPONSE_SCHEMA: dict[str, Any] = {
+    "name": "grillo_worker_response",
+    "strict": False,
+    "schema": {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {
+            "done": {"type": "boolean"},
+            "notes": {"type": "string"},
+            "toolCalls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "enum": [
+                                "core.worker_memory_read",
+                                "core.worker_memory_search",
+                                "core.worker_candidate_list",
+                                "core.worker_candidate_write",
+                                "core.worker_diary_write",
+                                "core.worker_memory_write",
+                                "core.worker_profile_patch",
+                                "core.worker_emotion_read",
+                                "core.worker_emotion_update",
+                                "core.worker_memory_insert_archival",
+                            ],
+                        },
+                        "args": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["name", "args"],
+                },
+            },
+            "candidate": {"type": "object", "additionalProperties": True},
+            "diary": {"type": "object", "additionalProperties": True},
+            "memory": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["done", "notes", "toolCalls"],
+    },
+}
 
 _CONTINUATION_PARAM_KEYS = frozenset(
     {
@@ -86,6 +284,26 @@ class _StreamQueueOverflow(RuntimeError):
     pass
 
 
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = value.strip("`").strip()
+        if value.lower().startswith("json"):
+            value = value[4:].strip()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(value[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 class Brain:
     def __init__(
         self,
@@ -93,7 +311,9 @@ class Brain:
         *,
         client: Any | None = None,
         thread_store: SQLiteThreadStore | None = None,
+        chat_store: SQLiteChatHistoryStore | None = None,
         memory_store: SQLiteMemoryStore | None = None,
+        memory_stack: HybridMemoryStack | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         tools: ToolRegistry | None = None,
         openai_gateway: OpenAIGateway | None = None,
@@ -108,6 +328,7 @@ class Brain:
         self._client_lock = threading.Lock()
         self._openai_lock = threading.Lock()
         self.thread_store = thread_store or SQLiteThreadStore(self.config.database_path)
+        self.chat_store = chat_store or SQLiteChatHistoryStore(self.config.database_path)
         provider = embedding_provider or default_embedding_provider(
             self._get_client,
             self.config.embedding_model,
@@ -119,6 +340,17 @@ class Brain:
             dimensions=self.config.embedding_dimensions,
             vec_overfetch=self.config.memory_vec_overfetch,
         )
+        self.memory_stack = memory_stack
+        if self.memory_stack is None and self.config.memory_stack.enabled:
+            self.memory_stack = HybridMemoryStack.sqlite_paths(
+                raw_log_path=self.config.memory_stack.raw_log_path or self.config.database_path,
+                graph_path=self.config.memory_stack.graph_path or self.config.database_path,
+                vector_path=self.config.memory_stack.vector_path or self.config.database_path,
+                embedding_provider=provider,
+                embedding_dimensions=self.config.embedding_dimensions,
+                graph_backend=self.config.memory_stack.graph_backend,
+                vector_backend=self.config.memory_stack.vector_backend,
+            )
         self.tools = tools or ToolRegistry()
         self.stt = stt_provider or create_stt_provider(self.config.stt_config)
         self.vad = vad_detector
@@ -128,13 +360,27 @@ class Brain:
         if self.config.auto_memory_tools:
             self._register_memory_tools()
             self._register_context_tools()
+        self._wire_grillo_reflector()
 
     def _get_client(self) -> Any:
         if self._client is None:
             with self._client_lock:
                 if self._client is None:
-                    self._client = AsyncOpenAI()
+                    kwargs: dict[str, Any] = {}
+                    if self.config.api_key:
+                        kwargs["api_key"] = self.config.api_key
+                    base_url = self._client_base_url()
+                    if base_url:
+                        kwargs["base_url"] = base_url
+                    self._client = AsyncOpenAI(**kwargs)
         return self._client
+
+    def _client_base_url(self) -> str | None:
+        if self.config.base_url:
+            return self.config.base_url
+        if self.config.provider == "vercel":
+            return "https://ai-gateway.vercel.sh/v1"
+        return None
 
     @property
     def client(self) -> Any:
@@ -157,8 +403,12 @@ class Brain:
         await self.tts.close()
         if hasattr(self.memory, "close"):
             self.memory.close()
+        if self.memory_stack is not None:
+            self.memory_stack.close()
         if hasattr(self.thread_store, "close"):
             self.thread_store.close()
+        if hasattr(self.chat_store, "close"):
+            self.chat_store.close()
         if self._openai is not None:
             await self._openai.close()
         client = self._client
@@ -166,6 +416,100 @@ class Brain:
             result = client.close()
             if hasattr(result, "__await__"):
                 await result
+
+    def _wire_grillo_reflector(self) -> None:
+        if self.memory_stack is None or self.memory_stack.grillo is None:
+            return
+        enabled = os.environ.get("AIBRAIN_GRILLO_LLM_REFLECTOR", "true").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return
+        self.memory_stack.grillo.worker_completion = self._complete_grillo_worker
+        self.memory_stack.grillo.reflector = self._reflect_grillo_memory
+
+    async def _complete_grillo_worker(self, request: dict[str, Any]) -> dict[str, Any]:
+        messages = request.get("messages") if isinstance(request.get("messages"), list) else []
+        system_prompt = ""
+        conversation: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            content = str(message.get("content") or "")
+            if role == "system" and not system_prompt:
+                system_prompt = content
+            else:
+                conversation.append({"role": role or "user", "content": content})
+        persona = Persona(
+            id="grillo-backend-worker",
+            name="GRILLO Backend Worker",
+            instructions=system_prompt or _GRILLO_REFLECTION_INSTRUCTIONS,
+            model=self.config.default_model,
+            prompt_cache_key="aibrain:grillo-backend-worker",
+            tools=[],
+        )
+        payload = {
+            "messages": conversation,
+            "response_format": request.get("responseFormat") or {"type": "json_object"},
+            "state_key": request.get("stateKey"),
+            "state_scope": request.get("stateScope"),
+            "tool_choice_mode": request.get("toolChoiceMode"),
+        }
+        response = await self.structured(
+            json.dumps(payload, ensure_ascii=False),
+            json_schema=_GRILLO_WORKER_RESPONSE_SCHEMA,
+            persona=persona,
+            use_memory=False,
+            tool_names=[],
+            stateless=True,
+            memory_event_text="",
+            memory_stack_record=False,
+            temperature=float(request.get("temperature") or 0.25),
+            max_output_tokens=int(request.get("maxTokens") or 900),
+        )
+        return {
+            "text": response.text,
+            "meta": {
+                "model": self.config.default_model,
+                "provider": self.config.provider,
+            },
+        }
+
+    async def _reflect_grillo_memory(self, context: dict[str, Any]) -> dict[str, Any]:
+        persona = Persona(
+            id="grillo-memory-worker",
+            name="GRILLO Memory Worker",
+            instructions=_GRILLO_REFLECTION_INSTRUCTIONS,
+            model=self.config.default_model,
+            prompt_cache_key="aibrain:grillo-memory-worker",
+            tools=[],
+        )
+        payload = {
+            "scope_key": context.get("scope_key"),
+            "participant_key": context.get("participant_key"),
+            "beat_type": context.get("beat_type"),
+            "current_time_iso": context.get("current_time_iso"),
+            "turns": context.get("turns") or [],
+            "memory_slots": context.get("memory_slots") or [],
+            "recent_diary": context.get("recent_diary") or [],
+            "recent_candidates": context.get("recent_candidates") or [],
+            "relationship_profile": context.get("relationship_profile"),
+        }
+        response = await self.structured(
+            json.dumps(payload, ensure_ascii=False),
+            json_schema=_GRILLO_REFLECTION_SCHEMA,
+            persona=persona,
+            use_memory=False,
+            tool_names=[],
+            stateless=True,
+            memory_event_text="",
+            memory_stack_record=False,
+            temperature=0.25,
+            max_output_tokens=1800,
+        )
+        parsed = _parse_json_object(response.text)
+        if parsed is None:
+            raise ValueError("GRILLO reflector returned invalid JSON")
+        return parsed
 
     async def warmup(
         self,
@@ -371,7 +715,8 @@ class Brain:
         openai_tools: list[dict[str, Any]] | None = None,
         max_agent_steps: int | None = None,
         **response_options: Any,
-    ) -> BrainResponse:
+        ) -> BrainResponse:
+        memory_stack_record = response_options.pop("memory_stack_record", True)
         async with self._thread_turn(thread_id, response_options):
             params, state, resolved, memory_hits = await self._build_response_params(
                 text,
@@ -385,13 +730,17 @@ class Brain:
                 response_options=response_options,
             )
             context = ToolContext(brain=self, thread=state, persona_id=resolved.id)
-            return await self._run_agent_loop(
+            response = await self._run_agent_loop(
                 params,
                 state=state,
                 context=context,
                 memory_hits=memory_hits,
                 max_agent_steps=max_agent_steps or self.config.max_agent_steps,
             )
+            self._append_local_chat_response(state, response.text, response.response_id)
+            if memory_stack_record:
+                await self._append_memory_stack_response_event(response, state, resolved.id)
+            return response
 
     async def vision(
         self,
@@ -414,6 +763,7 @@ class Brain:
         files: list[FileInput | dict[str, Any] | str] | None = None,
         **response_options: Any,
     ) -> BrainResponse:
+        response_options.pop("memory_stack_record", True)
         if output_model is None and json_schema is None:
             raise ValueError("structured() requires output_model or json_schema")
         if json_schema is not None:
@@ -500,6 +850,7 @@ class Brain:
         max_agent_steps: int | None = None,
         **response_options: Any,
     ) -> AsyncIterator[BrainEvent]:
+        memory_stack_record = response_options.pop("memory_stack_record", True)
         params, state, resolved, memory_hits = await self._build_response_params(
             text,
             thread_id=thread_id,
@@ -535,6 +886,13 @@ class Brain:
             self._update_thread_after_response(state, response)
             calls = self._extract_function_calls(response)
             if not calls:
+                self._append_local_chat_response(
+                    state,
+                    self._extract_text(response),
+                    getattr(response, "id", None),
+                )
+                if memory_stack_record:
+                    await self._append_memory_stack_raw_response_event(response, state, resolved.id)
                 yield BrainEvent(
                     "response.done",
                     {
@@ -893,7 +1251,11 @@ class Brain:
             kwargs["input"] = input
         if instructions is not None:
             kwargs["instructions"] = instructions
-        if state and state.last_response_id:
+        if (
+            state
+            and state.last_response_id
+            and self.config.state_mode == "previous_response_id"
+        ):
             kwargs.setdefault("previous_response_id", state.last_response_id)
         result = await self.openai.compact_response(**kwargs)
         if state and save_to_memory:
@@ -1114,23 +1476,60 @@ class Brain:
         state = None if force_stateless else await self._ensure_thread(thread_id, resolved)
         memory_hits: list[MemoryRecord] = []
         input_items: list[dict[str, Any]] = []
+        memory_query_source = response_options.pop("memory_query_text", text)
+        memory_event_text = response_options.pop("memory_event_text", text)
+        history_text = response_options.pop("history_text", text)
         memory_policy = self._resolve_memory_policy(
             use_memory,
             response_options.pop("memory_policy", None),
         )
         if memory_policy.enabled and state is not None:
+            memory_query = _memory_query_text(memory_query_source)
             memory_hits = await memory_policy.retrieve(
                 self.memory,
-                text,
+                memory_query,
                 thread=state,
                 persona_id=resolved.id,
             )
+            if self.memory_stack is not None and self.config.memory_stack.retrieve:
+                stack_hits = await self.memory_stack.retrieve_records(
+                    memory_query,
+                    top_k=memory_policy.top_k,
+                    thread=state,
+                    persona_id=resolved.id,
+                    filters=memory_policy.metadata_filter,
+                )
+                memory_hits = _dedupe_memory_records([*memory_hits, *stack_hits])[
+                    : memory_policy.top_k
+                ]
             memory_message = memory_policy.build_injection_message(memory_hits)
             if memory_message:
                 input_items.append(memory_message)
-        input_items.append(
-            await asyncio.to_thread(build_user_message, text, images=images, files=files)
-        )
+        if self.memory_stack is not None and state is not None and str(memory_event_text or "").strip():
+            await self.memory_stack.append_event(
+                event_type="message",
+                actor="user",
+                content=str(memory_event_text),
+                thread=state,
+                persona_id=resolved.id,
+                metadata={"source": "brain.ask"},
+                extract=self.config.memory_stack.extract_user_events,
+            )
+        user_message = await asyncio.to_thread(build_user_message, text, images=images, files=files)
+        if state is not None and self.config.state_mode == "local":
+            input_items.extend(self._local_history_input(state))
+            history_message = (
+                user_message
+                if history_text == text
+                else await asyncio.to_thread(build_user_message, str(history_text), images=images, files=files)
+            )
+            self.chat_store.append(
+                state.thread_id,
+                "user",
+                self._history_content_from_user_message(history_message),
+                metadata={"source": "brain.user"},
+            )
+        input_items.append(user_message)
 
         params: dict[str, Any] = {
             "model": response_options.pop("model", resolved.model or self.config.default_model),
@@ -1141,12 +1540,12 @@ class Brain:
             params["store"] = response_options.pop("store", self.config.store)
         if self.config.truncation is not None:
             params["truncation"] = response_options.pop("truncation", self.config.truncation)
-        if self.config.context_management is not None:
+        if self.config.context_management is not None and self.config.provider == "openai":
             params["context_management"] = response_options.pop(
                 "context_management",
                 self.config.context_management,
             )
-        if self.config.service_tier is not None:
+        if self.config.service_tier is not None and self.config.provider == "openai":
             params["service_tier"] = response_options.pop("service_tier", self.config.service_tier)
         if self.config.reasoning is not None:
             params["reasoning"] = response_options.pop("reasoning", self.config.reasoning)
@@ -1157,17 +1556,19 @@ class Brain:
             or self.config.default_prompt_cache_key
             or f"aibrain:{resolved.id}"
         )
-        if prompt_cache_key:
+        if prompt_cache_key and self.config.provider == "openai":
             params["prompt_cache_key"] = response_options.pop("prompt_cache_key", prompt_cache_key)
         retention = resolved.prompt_cache_retention or self.config.prompt_cache_retention
-        if retention:
+        if retention and self.config.provider == "openai":
             params["prompt_cache_retention"] = response_options.pop(
                 "prompt_cache_retention",
                 retention,
             )
 
         if state is not None:
-            if self.config.state_mode == "conversation":
+            if self.config.state_mode == "local":
+                params["store"] = response_options.pop("store", False)
+            elif self.config.state_mode == "conversation":
                 await self._ensure_remote_conversation(state)
                 params["conversation"] = response_options.pop(
                     "conversation",
@@ -1352,9 +1753,80 @@ class Brain:
         }
         params["input"] = outputs
         response_id = getattr(response, "id", None)
-        if response_id:
+        if self.config.state_mode == "local":
+            params["input"] = [
+                *list(previous_params.get("input") or []),
+                *self._response_output_items(response),
+                *outputs,
+            ]
+            params.pop("previous_response_id", None)
+            params.pop("conversation", None)
+            params.pop("prompt_cache_key", None)
+            params.pop("prompt_cache_retention", None)
+            params.pop("context_management", None)
+        elif response_id:
             params["previous_response_id"] = response_id
         return params
+
+    def _local_history_input(self, state: ThreadState) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "message",
+                "role": message["role"],
+                "content": self._normalize_local_history_content(message["content"]),
+            }
+            for message in self.chat_store.list(
+                state.thread_id,
+                limit=self.config.local_history_limit,
+            )
+        ]
+
+    def _append_local_chat_response(
+        self,
+        state: ThreadState | None,
+        text: str,
+        response_id: str | None,
+    ) -> None:
+        if state is None or self.config.state_mode != "local" or not text:
+            return
+        self.chat_store.append(
+            state.thread_id,
+            "assistant",
+            [{"type": "input_text", "text": text}],
+            metadata={"source": "brain.assistant", "response_id": response_id},
+        )
+
+    def _response_output_items(self, response: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for item in getattr(response, "output", None) or []:
+            if isinstance(item, dict):
+                items.append(item)
+                continue
+            item_type = self._field(item, "type")
+            if item_type == "function_call":
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": self._field(item, "call_id"),
+                        "name": self._field(item, "name"),
+                        "arguments": self._field(item, "arguments") or "{}",
+                    }
+                )
+        return items
+
+    def _normalize_local_history_content(self, content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if isinstance(content, list):
+            return content
+        return [{"type": "input_text", "text": str(content)}]
+
+    def _history_content_from_user_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in message.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "input_text"
+        ]
 
     def _extract_function_calls(self, response: Any) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
@@ -1409,6 +1881,53 @@ class Brain:
             state.last_response_id = response_id
         state.updated_at = updated_state.updated_at
 
+    async def _append_memory_stack_response_event(
+        self,
+        response: BrainResponse,
+        state: ThreadState | None,
+        persona_id: str,
+    ) -> None:
+        if self.memory_stack is None or state is None or not response.text:
+            return
+        await self.memory_stack.append_event(
+            event_type="response",
+            actor="assistant",
+            content=response.text,
+            thread=state,
+            persona_id=persona_id,
+            metadata={
+                "source": "brain.response",
+                "response_id": response.response_id,
+                "conversation_id": response.conversation_id,
+            },
+            extract=self.config.memory_stack.extract_response_events,
+        )
+
+    async def _append_memory_stack_raw_response_event(
+        self,
+        response: Any,
+        state: ThreadState | None,
+        persona_id: str,
+    ) -> None:
+        if self.memory_stack is None or state is None:
+            return
+        text = self._extract_text(response)
+        if not text:
+            return
+        await self.memory_stack.append_event(
+            event_type="response",
+            actor="assistant",
+            content=text,
+            thread=state,
+            persona_id=persona_id,
+            metadata={
+                "source": "brain.stream.response",
+                "response_id": getattr(response, "id", None),
+                "conversation_id": self._extract_conversation_id(response, state),
+            },
+            extract=self.config.memory_stack.extract_response_events,
+        )
+
     def _normalize_stream_event(self, event: Any) -> BrainEvent | None:
         event_type = getattr(event, "type", "")
         if event_type in {"response.output_text.delta", "response.text.delta"}:
@@ -1428,3 +1947,31 @@ class Brain:
         if isinstance(item, dict):
             return item.get(name)
         return getattr(item, name, None)
+
+
+def _memory_query_text(text: str) -> str:
+    limit = _env_int("AIBRAIN_MEMORY_QUERY_MAX_CHARS", DEFAULT_MEMORY_QUERY_MAX_CHARS)
+    return str(text or "").strip()[: max(1, limit)]
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _dedupe_memory_records(records: list[MemoryRecord]) -> list[MemoryRecord]:
+    deduped: dict[str, MemoryRecord] = {}
+    for record in sorted(records, key=lambda item: item.score, reverse=True):
+        key = str(
+            record.metadata.get("source_fact_id")
+            or record.metadata.get("source_event_id")
+            or record.id
+        )
+        if key not in deduped:
+            deduped[key] = record
+    return list(deduped.values())

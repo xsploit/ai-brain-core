@@ -8,12 +8,26 @@ from .autonomy import (
     HeartbeatResult,
     HeartbeatTask,
 )
-from .config import BrainConfig, Persona
+from .chat_store import SQLiteChatHistoryStore
+from .config import BrainConfig, MemoryStackConfig, Persona
 from .core import Brain
 from .embeddings import EmbeddingProvider, HashEmbeddingProvider, OpenAIEmbeddingProvider
 from .gateway import OpenAIGateway
 from .inputs import FileInput, ImageInput
 from .memory import SQLiteMemoryStore
+from .memory_stack import (
+    GRILLOMemoryWorker,
+    GraphQuery,
+    HybridMemoryStack,
+    HybridRetriever,
+    RawEvent,
+    RecallItem,
+    RetrievedContext,
+    SQLiteRawEventStore,
+    SQLiteTemporalGraphStore,
+    SQLiteVectorRecallStore,
+    TemporalFact,
+)
 from .policy import MemoryPolicy, ThreadPolicy
 from .stt import (
     BaseSTTProvider,
@@ -73,6 +87,7 @@ __all__ = [
     "ImageInput",
     "MemoryRecord",
     "MemoryPolicy",
+    "MemoryStackConfig",
     "NoVAD",
     "NullSTT",
     "NullTTS",
@@ -84,7 +99,11 @@ __all__ = [
     "PiperProcessTTS",
     "PiperVoice",
     "SentenceChunker",
+    "SQLiteChatHistoryStore",
     "SQLiteMemoryStore",
+    "SQLiteRawEventStore",
+    "SQLiteTemporalGraphStore",
+    "SQLiteVectorRecallStore",
     "STTConfig",
     "STTResult",
     "STTSegment",
@@ -96,6 +115,14 @@ __all__ = [
     "ThreadState",
     "ToolContext",
     "ToolRegistry",
+    "GRILLOMemoryWorker",
+    "GraphQuery",
+    "HybridMemoryStack",
+    "HybridRetriever",
+    "RawEvent",
+    "RecallItem",
+    "RetrievedContext",
+    "TemporalFact",
     "UtteranceBuffer",
     "VADConfig",
     "VADFrameResult",

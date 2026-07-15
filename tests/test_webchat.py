@@ -16,6 +16,7 @@ from aibrain import (
     TTSChunk,
     TTSConfig,
 )
+from aibrain.tts import PiperVoice
 from aibrain.server import _list_openai_models, create_app
 
 
@@ -91,11 +92,20 @@ def test_webchat_routes_are_served(tmp_path):
         page = client.get("/webchat")
         assert page.status_code == 200
         assert "AI Brain Core Console" in page.text
+        assert '<input id="memoryMode" type="checkbox" />' in page.text
+        assert '{"stateless":true}' in page.text
+        assert "voiceMeta" not in page.text
 
         script = client.get("/webchat/assets/app.js")
         assert script.status_code == 200
+        assert 'const FAST_CHAT_MODEL = "gpt-4.1-mini";' in script.text
+        assert "tool_names: tools" in script.text
         assert "voiceSocket" in script.text
+        assert 'wsUrl(useTts ? "/brain" : "/stream")' in script.text
         assert "loadModels" in script.text
+        assert "?refresh=true" in script.text
+        assert "voice.default" in script.text
+        assert "updateVoiceMeta" not in script.text
 
         worklet = client.get("/webchat/assets/mic-worklet.js")
         assert worklet.status_code == 200
@@ -105,6 +115,42 @@ def test_webchat_routes_are_served(tmp_path):
         styles = client.get("/webchat/assets/styles.css")
         assert styles.status_code == 200
         assert ".app-shell" in styles.text
+
+
+def test_tts_voices_marks_configured_default(tmp_path, monkeypatch):
+    default_model = tmp_path / "default.onnx"
+    other_model = tmp_path / "other.onnx"
+    default_config = tmp_path / "default.onnx.json"
+    other_config = tmp_path / "other.onnx.json"
+    default_model.write_bytes(b"default")
+    other_model.write_bytes(b"other")
+    default_config.write_text('{"audio":{"sample_rate":32000}}', encoding="utf-8")
+    other_config.write_text('{"audio":{"sample_rate":32000}}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "aibrain.tts.discover_piper_voices",
+        lambda refresh=False: [
+            PiperVoice(slug="default", label="Default", onnx=default_model, config=default_config),
+            PiperVoice(slug="other", label="Other", onnx=other_model, config=other_config),
+        ],
+    )
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        stt_provider=NullSTT(STTConfig(provider="null")),
+        tts_provider=NullTTS(
+            TTSConfig(
+                provider="null",
+                piper_model_path=default_model,
+                piper_config_path=default_config,
+            )
+        ),
+    )
+    app = create_app(brain=brain)
+
+    with TestClient(app) as client:
+        voices = client.get("/tts/voices?refresh=true").json()
+
+    assert [voice["slug"] for voice in voices if voice["default"]] == ["default"]
 
 
 def test_webchat_mic_prefers_audio_worklet_with_scriptprocessor_fallback():
@@ -178,7 +224,7 @@ async def test_model_list_fallback_logs_warning(tmp_path, caplog):
 
 def test_stream_websocket_cancel_stops_active_turn(tmp_path):
     brain = Brain(
-        BrainConfig(database_path=tmp_path / "brain.sqlite3"),
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", openai_stream_transport="http"),
         client=SlowStreamClient(),
         stt_provider=NullSTT(STTConfig(provider="null")),
         tts_provider=NullTTS(TTSConfig(provider="null")),

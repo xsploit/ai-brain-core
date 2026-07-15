@@ -71,6 +71,17 @@ async def test_openai_embedding_provider_passes_model_input_and_dimensions():
 
 
 @pytest.mark.asyncio
+async def test_openai_embedding_provider_bounds_model_input(monkeypatch):
+    monkeypatch.setenv("AIBRAIN_EMBEDDING_MAX_INPUT_CHARS", "8")
+    client = FakeClient()
+    provider = OpenAIEmbeddingProvider(client, model="text-embedding-test")
+
+    await provider.embed(" 123456789abcdef")
+
+    assert client.embeddings.calls[0]["input"] == "12345678"
+
+
+@pytest.mark.asyncio
 async def test_openai_embedding_provider_accepts_client_factory():
     client = FakeClient()
     provider = OpenAIEmbeddingProvider(lambda: client, model="text-embedding-test")

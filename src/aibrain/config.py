@@ -22,12 +22,48 @@ class Persona(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryStackConfig(BaseModel):
+    enabled: bool = Field(default_factory=lambda: _env_bool("AIBRAIN_MEMORY_STACK_ENABLED", False))
+    retrieve: bool = Field(default_factory=lambda: _env_bool("AIBRAIN_MEMORY_STACK_RETRIEVE", True))
+    extract_user_events: bool = Field(
+        default_factory=lambda: _env_bool("AIBRAIN_MEMORY_STACK_EXTRACT_USER_EVENTS", False)
+    )
+    extract_response_events: bool = Field(
+        default_factory=lambda: _env_bool("AIBRAIN_MEMORY_STACK_EXTRACT_RESPONSE_EVENTS", False)
+    )
+    raw_log_path: Path | None = None
+    graph_path: Path | None = None
+    vector_path: Path | None = None
+    graph_backend: Literal["auto", "sqlite", "ladybug"] = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_MEMORY_GRAPH_BACKEND", "auto")  # type: ignore[arg-type]
+    )
+    vector_backend: Literal["auto", "sqlite", "turbovec"] = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_MEMORY_VECTOR_BACKEND", "auto")  # type: ignore[arg-type]
+    )
+
+
 class BrainConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     env_file: Path | None = Field(default_factory=lambda: _default_env_file())
     database_path: Path = Field(default_factory=lambda: Path("brain.sqlite3"))
-    default_model: str = Field(default_factory=lambda: os.environ.get("AI_BRAIN_MODEL", "gpt-5-nano"))
+    provider: Literal["vercel", "openai"] = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_PROVIDER", "vercel")  # type: ignore[arg-type]
+    )
+    api_key: str | None = Field(
+        default_factory=lambda: os.environ.get("AI_GATEWAY_API_KEY")
+        or os.environ.get("VERCEL_OIDC_TOKEN")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    base_url: str | None = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_BASE_URL")
+        or os.environ.get("AIBRAIN_OPENAI_BASE_URL")
+    )
+    default_model: str = Field(
+        default_factory=lambda: os.environ.get("AI_BRAIN_MODEL")
+        or os.environ.get("AIBRAIN_MODEL")
+        or "deepseek/deepseek-v4-flash"
+    )
     openai_stream_transport: Literal["http", "websocket"] = Field(
         default_factory=lambda: os.environ.get("AIBRAIN_OPENAI_STREAM_TRANSPORT", "http")  # type: ignore[arg-type]
     )
@@ -43,8 +79,13 @@ class BrainConfig(BaseModel):
     models_cache_ttl_seconds: int = Field(
         default_factory=lambda: _env_int("AIBRAIN_MODELS_CACHE_TTL_SECONDS", 300)
     )
-    state_mode: Literal["conversation", "previous_response_id", "stateless"] = "conversation"
-    store: bool | None = True
+    state_mode: Literal["local", "conversation", "previous_response_id", "stateless"] = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_STATE_MODE", "local")  # type: ignore[arg-type]
+    )
+    local_history_limit: int = Field(
+        default_factory=lambda: _env_int("AIBRAIN_LOCAL_HISTORY_LIMIT", 24)
+    )
+    store: bool | None = False
     truncation: Literal["auto", "disabled"] | None = "auto"
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     reasoning: dict[str, Any] | None = None
@@ -63,11 +104,14 @@ class BrainConfig(BaseModel):
         default_factory=lambda: _env_int("AIBRAIN_VOICE_SOCKET_MAX_MESSAGE_BYTES", 1 << 20)
     )
     memory_policy: MemoryPolicy = Field(default_factory=MemoryPolicy)
+    memory_stack: MemoryStackConfig = Field(default_factory=MemoryStackConfig)
     auto_memory_tools: bool = True
     default_persona: Persona = Field(default_factory=Persona)
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = Field(
+        default_factory=lambda: os.environ.get("AIBRAIN_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    )
     embedding_dimensions: int = 256
-    max_agent_steps: int = 8
+    max_agent_steps: int = Field(default_factory=lambda: _env_int("AIBRAIN_MAX_AGENT_STEPS", 40))
     tool_timeout_seconds: float = 30.0
     stt_config: STTConfig = Field(default_factory=STTConfig)
     tts_config: TTSConfig = Field(default_factory=TTSConfig)
@@ -86,3 +130,10 @@ def _env_int(name: str, fallback: int) -> int:
         return int(value)
     except ValueError:
         return fallback
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return fallback
+    return value.strip().lower() in {"1", "true", "yes", "on"}

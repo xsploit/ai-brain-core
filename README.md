@@ -3,14 +3,16 @@
 Reusable Python brain for bots, avatars, desktop agents, voice apps, and local tools.
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)](https://www.python.org/)
-[![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20%2B%20Conversations-111111)](https://platform.openai.com/docs)
+[![Vercel AI Gateway](https://img.shields.io/badge/Vercel%20AI%20Gateway-Responses%20API-111111)](https://vercel.com/docs/ai-gateway)
 [![FastAPI](https://img.shields.io/badge/FastAPI-HTTP%20%2B%20WebSocket-009688)](https://fastapi.tiangolo.com/)
 [![CI](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml/badge.svg)](https://github.com/xsploit/ai-brain-core/actions/workflows/tests.yml)
-[![Tests](https://img.shields.io/badge/tests-102%20passing-2E7D32)](#development)
+[![Tests](https://img.shields.io/badge/tests-116%20passing-2E7D32)](#development)
 
-AI Brain Core is a framework layer around the OpenAI Responses and
-Conversations APIs. It gives you one importable "brain" that can be dropped into
-a Discord bot, Twitch bot, VRM app, web chat, desktop assistant, or voice loop.
+AI Brain Core is a provider-routed brain framework. By default it uses Vercel
+AI Gateway with the OpenAI-compatible Responses API, but the framework owns
+conversation state locally instead of depending on a provider Conversations API.
+It gives you one importable "brain" that can be dropped into a Discord bot,
+Twitch bot, VRM app, web chat, desktop assistant, or voice loop.
 
 Repository: https://github.com/xsploit/ai-brain-core
 
@@ -22,10 +24,10 @@ zero.
 
 | Area | Built in |
 | --- | --- |
-| OpenAI | Responses API, Conversations API, `previous_response_id`, prompt caching, compaction, structured output, vision input, streaming, WebSocket transport |
+| Model gateway | Vercel AI Gateway by default, OpenAI-compatible Responses API, structured output, vision input, streaming, optional legacy OpenAI mode |
 | Agent loop | Python tool registry, function calling, parallel tool execution, max-step guard, streaming tool events |
-| State | SQLite thread store, per-thread turn locks, Discord/Twitch-friendly thread policies |
-| Memory | SQLite memory, optional `sqlite-vec`, hash/OpenAI embeddings, Python cosine fallback, configurable memory policy |
+| State | Local SQLite conversation history, SQLite thread store, per-thread turn locks, Discord/Twitch-friendly thread policies |
+| Memory | GRILLO, Ladybug/TurboVec auto backends, AI Gateway embeddings, SQLite/hash fallback, configurable memory policy |
 | Voice out | Piper executable, hot Piper process mode, Piper HTTP, ordered TTS playlist events |
 | Voice in | PCM/WAV/FLAC decode, Silero or energy VAD, faster-whisper STT provider |
 | Server | FastAPI HTTP routes, WebSocket `/stream`, `/brain`, `/tts`, `/voice`, built-in web test console |
@@ -33,7 +35,7 @@ zero.
 
 ## Latency Snapshot
 
-Local benchmark from the current fast path, using OpenAI Responses streaming,
+Local benchmark from the current fast path, using Responses streaming,
 Piper process TTS, memory off, tools off, and no speaker playback:
 
 ```text
@@ -272,6 +274,106 @@ hits = await brain.search_memory(
 )
 ```
 
+### Hybrid Memory Stack
+
+For richer agents, enable the v2 memory stack:
+
+```python
+from aibrain import Brain, BrainConfig, MemoryStackConfig
+
+brain = Brain(
+    BrainConfig(
+        memory_stack=MemoryStackConfig(
+            enabled=True,
+            extract_user_events=True,
+        )
+    )
+)
+```
+
+The stack is layered so each part has one job:
+
+| Layer | Role |
+| --- | --- |
+| Raw log | Append-only event history for messages, responses, tools, and summaries |
+| GRILLO worker | Extracts durable facts, scores importance, and prepares recall text |
+| Temporal graph | Stores entities/facts with `valid_from`, `valid_until`, confidence, source IDs, and supersession metadata |
+| Vector recall | Finds semantically similar memories and links them back to raw events/facts |
+| Hybrid retriever | Fuses graph facts, vector hits, importance, confidence, and recency into `MemoryRecord` results |
+
+The built-in implementation uses SQLite so the framework works without extra
+services. Optional adapters are exposed for LadybugDB graph memory and TurboVec
+compressed vector recall when those packages are installed.
+
+### Discord Brain Bot
+
+The Brain-native Discord runtime is a thin demo bot that uses:
+
+- one Brain thread per DM, channel, or Discord thread
+- local SQLite conversation history
+- hybrid memory stack event extraction and retrieval
+- GRILLO scoped memory packets with candidates, diary thoughts, slots, and recall
+- backend auto-selection: Ladybug graph + TurboVec recall when installed, SQLite fallback
+- streaming Discord replies by editing a live message
+- vision input from image attachments
+- readable text and PDF attachments
+- agentic Discord tools for guild/channel/member/message/thread/role/moderation actions
+- Brain tools: `discord_context`, `remember`, `search_memory`, `current_time`, `brain_context`, Tavily tools, and Discord tools
+
+```powershell
+uv run --extra discord aibrain-discord
+```
+
+Useful env values:
+
+```env
+DISCORD_BRAIN_BOT_TOKEN=
+DISCORD_BRAIN_DATABASE_PATH=discord_brain.sqlite3
+DISCORD_BRAIN_MODEL=deepseek/deepseek-v4-flash
+DISCORD_BRAIN_RESPOND_TO_DMS=true
+DISCORD_BRAIN_RESPOND_TO_MENTIONS=true
+DISCORD_BRAIN_RESPOND_TO_ALL=false
+DISCORD_BRAIN_COMMAND_PREFIX=!brain
+DISCORD_BRAIN_ALLOWED_USER_IDS=120418341775998976
+DISCORD_BRAIN_OWNER_USER_IDS=120418341775998976
+DISCORD_BRAIN_MEMBERS_INTENT=true
+DISCORD_BRAIN_TOOL_CHANNEL_IDS=
+DISCORD_BRAIN_TOOL_AUDIT_CHANNEL_ID=
+DISCORD_BRAIN_TEXT_ATTACHMENT_MAX_BYTES=300000
+DISCORD_BRAIN_PDF_ATTACHMENT_MAX_PAGES=16
+DISCORD_BRAIN_MEMORY_TOP_K=8
+DISCORD_BRAIN_GRAPH_BACKEND=auto
+DISCORD_BRAIN_VECTOR_BACKEND=auto
+```
+
+Enable the Discord Developer Portal privileged Members Intent when using member
+list/search tools. `DISCORD_BRAIN_OWNER_USER_IDS` controls owner-only Discord
+tools such as guild list, channel/role structure changes, invites, and webhooks.
+Discord admins can use lower-risk model/admin commands, but owner-only tools
+stay restricted to the configured owner IDs.
+
+Discord commands:
+
+- `!brain status`
+- `!brain remember <durable fact>`
+- `!brain recall <query>`
+- `!brain grillo`
+- `!brain grillo tick [beat_type]`
+- `!brain grillo context [query]`
+- `!model`, `!model set <model-id>`, `!model refresh`, `!model info [model-id]`, `!model export`
+
+The model-facing Discord tool suite includes guild discovery, channel and role
+inventory, member list/search, permissions inspection, bounded channel history
+search, sending/editing/deleting/pinning messages, reactions, thread management,
+timeouts/kicks/bans/unbans, member role assignment, and owner-only server
+structure tools. Tools still check the bot's actual Discord permissions before
+mutating anything.
+
+GRILLO uses the same Discord scope as the Brain thread. Before each turn, the bot
+builds a compact context packet for that DM/channel/thread and prepends it to the
+model input; after the reply, the completed user/assistant pair is queued into
+the background memory tick.
+
 ## Tools
 
 Register Python functions directly. The framework exposes them to the model as
@@ -365,8 +467,16 @@ Important Piper knobs:
 | `PIPER_SENTENCE_SILENCE` | `0.05` | Silence inserted by Piper between sentences. |
 
 `GET /tts/voices` lists voices discovered from `AIBRAIN_TTS_VOICE_ROOTS` and
-`AIBRAIN_TTS_MANIFESTS`. Discovery is cached; call `/tts/voices?refresh=true`
+`AIBRAIN_TTS_MANIFESTS`, plus bundled Piper voices shipped under
+`src/aibrain/voices/piper`. Discovery is cached; call `/tts/voices?refresh=true`
 after changing files.
+
+List discovered Piper voices from the CLI:
+
+```powershell
+uv run aibrain piper-models
+uv run aibrain piper-models --json
+```
 
 ## Speech Input
 
@@ -402,7 +512,12 @@ $env:AIBRAIN_VAD_THRESHOLD="0.5"
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `AI_BRAIN_MODEL` | `gpt-5-nano` | Default OpenAI model |
+| `AIBRAIN_PROVIDER` | `vercel` | `vercel` or legacy `openai` |
+| `AI_GATEWAY_API_KEY` | unset | Vercel AI Gateway key |
+| `AIBRAIN_BASE_URL` | Vercel AI Gateway URL | Override OpenAI-compatible base URL |
+| `AI_BRAIN_MODEL` / `AIBRAIN_MODEL` | `deepseek/deepseek-v4-flash` | Default model id |
+| `AIBRAIN_STATE_MODE` | `local` | `local`, `stateless`, legacy `conversation`, or legacy `previous_response_id` |
+| `AIBRAIN_LOCAL_HISTORY_LIMIT` | `24` | Number of local chat messages replayed per turn |
 | `AIBRAIN_OPENAI_STREAM_TRANSPORT` | `http` | `http` or `websocket` |
 | `AIBRAIN_OPENAI_WS_POOL_SIZE` | `4` | Responses WebSocket pool size |
 | `AIBRAIN_STREAM_EVENT_QUEUE_MAX` | `256` | Backpressure bound for streaming events |
@@ -429,7 +544,7 @@ package behavior and are covered by the base test suite.
 Current verification:
 
 ```text
-102 passed
+106 passed
 ```
 
 ## Project Shape

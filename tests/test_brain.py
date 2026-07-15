@@ -82,6 +82,8 @@ async def test_ask_passes_responses_state_options(tmp_path):
     brain = Brain(
         BrainConfig(
             database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="conversation",
             default_model="gpt-5-nano",
             default_prompt_cache_key="persona:test",
         ),
@@ -106,6 +108,97 @@ async def test_ask_passes_responses_state_options(tmp_path):
     assert call["prompt_cache_retention"] == "24h"
     assert call["context_management"] == [{"type": "compaction"}]
     assert call["service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_default_vercel_mode_uses_local_state_without_remote_conversation(tmp_path):
+    client = FakeOpenAI()
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", default_model="anthropic/test"),
+        client=client,
+    )
+
+    first = await brain.ask("remember this", thread_id="local-thread", tool_names=[])
+    second = await brain.ask("what did I say?", thread_id="local-thread", tool_names=[])
+
+    assert first.text == "ok"
+    assert second.text == "ok"
+    assert client.conversations.calls == []
+    first_call, second_call = client.responses.calls
+    assert "conversation" not in first_call
+    assert "previous_response_id" not in second_call
+    assert first_call["store"] is False
+    assert first_call["model"] == "anthropic/test"
+    assert second_call["input"][0]["role"] == "user"
+    assert second_call["input"][0]["content"][0]["text"] == "remember this"
+    assert second_call["input"][1]["role"] == "assistant"
+    assert second_call["input"][1]["content"][0]["text"] == "ok"
+    assert second_call["input"][-1]["content"][0]["text"] == "what did I say?"
+
+
+@pytest.mark.asyncio
+async def test_structured_consumes_memory_stack_record_option(tmp_path):
+    client = FakeOpenAI()
+    brain = Brain(
+        BrainConfig(database_path=tmp_path / "brain.sqlite3", default_model="openai/test"),
+        client=client,
+    )
+
+    response = await brain.structured(
+        "extract json",
+        json_schema={"name": "test_schema", "schema": {"type": "object"}, "strict": False},
+        memory_stack_record=False,
+    )
+
+    assert response.text == "ok"
+    call = client.responses.calls[0]
+    assert "memory_stack_record" not in call
+
+
+@pytest.mark.asyncio
+async def test_local_tool_loop_continuation_does_not_use_previous_response_id(tmp_path):
+    client = FakeOpenAI()
+
+    async def create(**kwargs):
+        client.responses.calls.append(kwargs)
+        if len(client.responses.calls) == 1:
+            return SimpleNamespace(
+                id="resp_tool",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="ping",
+                        call_id="call_1",
+                        arguments="{}",
+                    )
+                ],
+                output_text="",
+                conversation=kwargs.get("conversation"),
+                usage=None,
+            )
+        return SimpleNamespace(
+            id="resp_final",
+            output=[],
+            output_text="done",
+            conversation=kwargs.get("conversation"),
+            usage=None,
+        )
+
+    client.responses.create = create
+    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+
+    @brain.tools.register
+    def ping() -> str:
+        return "pong"
+
+    response = await brain.ask("call ping", thread_id="local-tools", tool_names=["ping"])
+
+    assert response.text == "done"
+    continuation = client.responses.calls[1]
+    assert "previous_response_id" not in continuation
+    assert "conversation" not in continuation
+    assert continuation["input"][-2]["type"] == "function_call"
+    assert continuation["input"][-1]["type"] == "function_call_output"
 
 
 @pytest.mark.asyncio
@@ -155,7 +248,14 @@ async def test_tool_loop_continues_with_function_output(tmp_path):
         )
 
     client.responses.create = create
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="previous_response_id",
+        ),
+        client=client,
+    )
 
     @brain.tools.register
     def ping() -> str:
@@ -180,7 +280,14 @@ async def test_same_thread_turns_serialize_remote_conversation_creation(tmp_path
         return SimpleNamespace(id="conv_shared")
 
     client.conversations.create = create_conversation
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="conversation",
+        ),
+        client=client,
+    )
 
     responses = await asyncio.gather(
         brain.ask("one", thread_id="shared", tool_names=[]),
@@ -210,8 +317,27 @@ def test_update_thread_after_response_does_not_clobber_last_response_with_none(t
     assert brain.thread_store.get("thread-state").last_response_id == "resp_existing"
 
 
+def test_vercel_provider_builds_ai_gateway_client(tmp_path):
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="vercel",
+            api_key="test-key",
+        )
+    )
+
+    assert str(brain.client.base_url).rstrip("/") == "https://ai-gateway.vercel.sh/v1"
+
+
 def test_continuation_params_preserve_supported_fields(tmp_path):
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=FakeOpenAI())
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="previous_response_id",
+        ),
+        client=FakeOpenAI(),
+    )
     previous_params = {key: f"value:{key}" for key in _CONTINUATION_PARAM_KEYS}
     previous_params["input"] = [{"role": "user", "content": "old"}]
     previous_params["unsupported"] = "drop"
@@ -262,7 +388,14 @@ async def test_tool_calls_run_concurrently_and_preserve_output_order(tmp_path):
         )
 
     client.responses.create = create
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="previous_response_id",
+        ),
+        client=client,
+    )
     active = 0
     max_active = 0
     lock = asyncio.Lock()
@@ -304,7 +437,14 @@ async def test_tool_calls_run_concurrently_and_preserve_output_order(tmp_path):
 async def test_streaming_tool_calls_emit_calls_before_parallel_results(tmp_path):
     client = FakeOpenAI()
     client.responses = FakeStreamResponses()
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="previous_response_id",
+        ),
+        client=client,
+    )
 
     @brain.tools.register
     async def slow_a() -> str:
@@ -370,7 +510,14 @@ async def test_parallel_tool_failure_does_not_cancel_other_tool(tmp_path):
         )
 
     client.responses.create = create
-    brain = Brain(BrainConfig(database_path=tmp_path / "brain.sqlite3"), client=client)
+    brain = Brain(
+        BrainConfig(
+            database_path=tmp_path / "brain.sqlite3",
+            provider="openai",
+            state_mode="previous_response_id",
+        ),
+        client=client,
+    )
 
     @brain.tools.register
     async def fail_tool() -> str:
